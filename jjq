@@ -35,9 +35,12 @@ jjq_bookmark="jjq/_/_"
 check_jjq() {
     exec 1>>/tmp/jjq.log 2>/dev/null
     if [ -z "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name)" ]; then
-        local change_id="$(jj new --no-edit 'root()' 2>&1 | cut -f4 -d' ')"
+        local change_id
+        change_id="$(jj new --no-edit 'root()' 2>&1 | cut -f4 -d' ')"
         jj bookmark create -r "$change_id" "$jjq_bookmark"
-        local d=$(mktemp -d)
+        local d
+        d=$(mktemp -d)
+        # shellcheck disable=SC2064 # Intentional: capture $d now
         trap "rm -rf $d" EXIT
         jj workspace add -r "$jjq_bookmark" --name jjq "$d"
         pushd "$d"
@@ -52,12 +55,15 @@ check_jjq() {
 next_id() {
     exec 3>&1
     exec 1>>/tmp/jjq.log 2>/dev/null
-    local d=$(mktemp -d)
+    local d
+    d=$(mktemp -d)
+    # shellcheck disable=SC2064 # Intentional: capture $d now
     trap "rm -rf $d" EXIT
     local workspace_name="jjq$$"
     jj workspace add -r "$jjq_bookmark" --name "$workspace_name" "$d"
     pushd "$d"
-    local curr="$(head -1 < last_id)"
+    local curr
+    curr="$(head -1 < last_id)"
     local id=$((curr + 1))
     echo "$id" > last_id
     jj desc -m "$curr -> $id" -m "pid: $$"
@@ -82,8 +88,10 @@ cmd_push() {
 
     check_jjq
 
-    local id="$(next_id)"
-    local queue_bookmark="$(printf "jjq/queue/%06d" "$id")"
+    local id
+    id="$(next_id)"
+    local queue_bookmark
+    queue_bookmark="$(printf "jjq/queue/%06d" "$id")"
 
     jj bookmark create -r "$revset" "$queue_bookmark"
     prefout "revision '$revset' queued at $id" >&3
@@ -93,13 +101,15 @@ cmd_run() {
     #exec 3>&1
     #exec 1>>/tmp/jjq.log 2>&1
 
-    local id="$(jj bookmark list -r 'bookmarks(jjq/queue/*)' -T'name ++"\n"' | cut -f3 -d'/' | sort -n | head -1)"
+    local id
+    id="$(jj bookmark list -r 'bookmarks(jjq/queue/*)' -T'name ++"\n"' | cut -f3 -d'/' | sort -n | head -1)"
     if [ -z "$id" ]; then
         preferr "queue is empty"
         exit 0
     fi
 
-    local runner_workspace=$(mktemp -d)
+    local runner_workspace
+    runner_workspace=$(mktemp -d)
     local run_name="jjq/run/$id"
     local lock="jjq/lock/run"
 
