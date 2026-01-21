@@ -30,14 +30,16 @@ usage() {
 cmd="$1"
 shift
 
+jjq_bookmark="jjq/_/_"
+
 check_jjq() {
     exec 1>>/tmp/jjq.log 2>/dev/null
-    if [ -z "$(jj bookmark list -r 'bookmarks(exact:jjq)' -T name)" ]; then
+    if [ -z "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name)" ]; then
         local change_id="$(jj new --no-edit 'root()' 2>&1 | cut -f4 -d' ')"
-        jj bookmark create -r "$change_id" jjq
+        jj bookmark create -r "$change_id" "$jjq_bookmark"
         local d=$(mktemp -d)
         trap "rm -rf $d" EXIT
-        jj workspace add -r jjq --name jjq "$d"
+        jj workspace add -r "$jjq_bookmark" --name jjq "$d"
         pushd "$d"
         echo 0 > last_id
         jj desc -m "init jjq"
@@ -52,14 +54,15 @@ next_id() {
     exec 1>>/tmp/jjq.log 2>/dev/null
     local d=$(mktemp -d)
     trap "rm -rf $d" EXIT
-    jj workspace add -r jjq --name jjq "$d"
+    local workspace_name="jjq$$"
+    jj workspace add -r "$jjq_bookmark" --name "$workspace_name" "$d"
     pushd "$d"
     local curr="$(head -1 < last_id)"
     local id=$((curr + 1))
     echo "$id" > last_id
     jj desc -m "$curr -> $id" -m "pid: $$"
-    jj bookmark set jjq
-    jj workspace forget jjq
+    jj bookmark set "$jjq_bookmark"
+    jj workspace forget "$workspace_name"
     popd
     echo "$id" >&3
 }
@@ -68,6 +71,7 @@ cmd_push() {
     exec 3>&1
     exec 1>>/tmp/jjq.log 2>&1
 
+    # Revset of the candidate revision the user is pushing on to the merge queue
     local revset="$1"
     shift
 
@@ -90,20 +94,35 @@ cmd_run() {
     #exec 1>>/tmp/jjq.log 2>&1
 
     local id="$(jj bookmark list -r 'bookmarks(jjq/queue/*)' -T'name ++"\n"' | cut -f3 -d'/' | sort -n | head -1)"
-    if [ -z "$items" ]; then
+    if [ -z "$id" ]; then
         preferr "queue is empty"
         exit 0
     fi
 
     local runner_workspace=$(mktemp -d)
     local run_name="jjq/run/$id"
+    local lock="jjq/lock/run"
 
+    # We use jj bookmarks to take out a global run lock, since only one runner
+    # can process the queue at a time. This lets us avoid trying a cross-platform
+    # file locking mechanism and keep it contained to jj.
+    if ! jj bookmark create -r "$jjq_bookmark" "$lock" >/dev/null 2>&1; then
+        # TODO: try to get the lock holder's PID from metadata somehow
+        preferr "queue runner lock already held"
+        exit 1
+    fi
+
+    # TODO: record this PID as metadata for the run somehow
+
+    # Create a workspace to attempt the merge, with a new commit for the
+    # merge-to-be with two parents: the trunk and the candidate revision
     jj workspace add -r "bookmarks(exact:$TRUNK_BOOKMARK)" -r "bookmarks(exact:jjq/queue/$id)" --name "$run_name" "$runner_workspace"
     pushd "$runner_workspace"
 
-    if [ -n "$(jj log --no-graph -T'if(conflict, "has conflict(s)")')" ]; then
+    # Check for conflicts in the merge-to-be commit
+    if [ -n "$(jj log -r "${run_name}@" --no-graph -T'if(conflict, "has conflict(s)")')" ]; then
         jj bookmark delete "jjq/queue/$id"
-        jj bookmark create "jjq/failed/$id"
+        jj bookmark create -r "${run_name}@" "jjq/failed/$id"
         jj desc -m "Failed: merge $id (conflicts)"
         preferr "merge $id has conflicts, marked as failed"
         preferr "workspace remains: $runner_workspace"
@@ -115,7 +134,7 @@ cmd_run() {
 
     if ! $CHECK_COMMAND; then
         jj bookmark delete "jjq/queue/$id"
-        jj bookmark create "jjq/failed/$id"
+        jj bookmark create -r "${run_name}@" "jjq/failed/$id"
         jj desc -m "Failed: merge $id (check)"
         preferr "merge $id check failed"
         preferr "workspace remains: $runner_workspace"
@@ -123,13 +142,11 @@ cmd_run() {
         exit 1
     else
         jj bookmark delete "jjq/queue/$id"
-        jj bookmark create "jjq/passed/$id"
         jj desc -m "Success: merge $id"
         jj bookmark move "$TRUNK_BOOKMARK"
         popd
         jj workspace forget "$run_name"
         rm -rf "$runner_workspace"
-        jj bookmark delete "jjq/passed/$id"
     fi
 }
 
