@@ -1,0 +1,140 @@
+#!/bin/bash
+set -euo pipefail
+
+TRUNK_BOOKMARK=main
+CHECK_COMMAND="echo ok"
+
+err() {
+    echo "$*" >&2
+}
+
+preferr() {
+    err "jjq: $*"
+}
+
+prefout() {
+    echo "jjq: $*"
+}
+
+usage() {
+    err "usage: jjq <cmd>"
+    err ""
+    err "commands:"
+    err "   push <revset>           - push revision on merge queue"
+    err "   run                     - try to merge next candidate on queue"
+    exit 1
+}
+
+[ $# -gt 0 ] || usage
+
+cmd="$1"
+shift
+
+check_jjq() {
+    exec 1>>/tmp/jjq.log 2>/dev/null
+    if [ -z "$(jj bookmark list -r 'bookmarks(exact:jjq)' -T name)" ]; then
+        local change_id="$(jj new --no-edit 'root()' 2>&1 | cut -f4 -d' ')"
+        jj bookmark create -r "$change_id" jjq
+        local d=$(mktemp -d)
+        trap "rm -rf $d" EXIT
+        jj workspace add -r jjq --name jjq "$d"
+        pushd "$d"
+        echo 0 > last_id
+        jj desc -m "init jjq"
+        jj squash
+        popd
+        jj workspace forget jjq
+    fi
+}
+
+next_id() {
+    exec 3>&1
+    exec 1>>/tmp/jjq.log 2>/dev/null
+    local d=$(mktemp -d)
+    trap "rm -rf $d" EXIT
+    jj workspace add -r jjq --name jjq "$d"
+    pushd "$d"
+    local curr="$(head -1 < last_id)"
+    local id=$((curr + 1))
+    echo "$id" > last_id
+    jj desc -m "$curr -> $id" -m "pid: $$"
+    jj bookmark set jjq
+    jj workspace forget jjq
+    popd
+    echo "$id" >&3
+}
+
+cmd_push() {
+    exec 3>&1
+    exec 1>>/tmp/jjq.log 2>&1
+
+    local revset="$1"
+    shift
+
+    if ! jj log -r "$revset" --no-graph -T'change_id.short()++"\n"' >/dev/null 2>&1; then
+        preferr "revset '$revset' not found"
+        exit 1
+    fi
+
+    check_jjq
+
+    local id="$(next_id)"
+    local queue_bookmark="$(printf "jjq/queue/%06d" "$id")"
+
+    jj bookmark create -r "$revset" "$queue_bookmark"
+    prefout "revision '$revset' queued at $id" >&3
+}
+
+cmd_run() {
+    #exec 3>&1
+    #exec 1>>/tmp/jjq.log 2>&1
+
+    local id="$(jj bookmark list -r 'bookmarks(jjq/queue/*)' -T'name ++"\n"' | cut -f3 -d'/' | sort -n | head -1)"
+    if [ -z "$items" ]; then
+        preferr "queue is empty"
+        exit 0
+    fi
+
+    local runner_workspace=$(mktemp -d)
+    local run_name="jjq/run/$id"
+
+    jj workspace add -r "bookmarks(exact:$TRUNK_BOOKMARK)" -r "bookmarks(exact:jjq/queue/$id)" --name "$run_name" "$runner_workspace"
+    pushd "$runner_workspace"
+
+    if [ -n "$(jj log --no-graph -T'if(conflict, "has conflict(s)")')" ]; then
+        jj bookmark delete "jjq/queue/$id"
+        jj bookmark create "jjq/failed/$id"
+        jj desc -m "Failed: merge $id (conflicts)"
+        preferr "merge $id has conflicts, marked as failed"
+        preferr "workspace remains: $runner_workspace"
+        popd
+        exit 1
+    fi
+
+    jj desc -m "WIP: attempting merge $id"
+
+    if ! $CHECK_COMMAND; then
+        jj bookmark delete "jjq/queue/$id"
+        jj bookmark create "jjq/failed/$id"
+        jj desc -m "Failed: merge $id (check)"
+        preferr "merge $id check failed"
+        preferr "workspace remains: $runner_workspace"
+        popd
+        exit 1
+    else
+        jj bookmark delete "jjq/queue/$id"
+        jj bookmark create "jjq/passed/$id"
+        jj desc -m "Success: merge $id"
+        jj bookmark move "$TRUNK_BOOKMARK"
+        popd
+        jj workspace forget "$run_name"
+        rm -rf "$runner_workspace"
+        jj bookmark delete "jjq/passed/$id"
+    fi
+}
+
+case "$cmd" in
+    push) cmd_push "$@" ;;
+    run) cmd_run "$@" ;;
+    *) usage ;;
+esac
