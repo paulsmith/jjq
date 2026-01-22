@@ -2,7 +2,7 @@
 set -euo pipefail
 
 TRUNK_BOOKMARK=main
-CHECK_COMMAND="echo ok"
+CHECK_COMMAND="make"
 
 err() {
     echo "$*" >&2
@@ -33,7 +33,6 @@ shift
 jjq_bookmark="jjq/_/_"
 
 check_jjq() {
-    exec 1>>/tmp/jjq.log 2>/dev/null
     if [ -z "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name)" ]; then
         local change_id
         change_id="$(jj new --no-edit 'root()' 2>&1 | cut -f4 -d' ')"
@@ -49,19 +48,32 @@ check_jjq() {
         jj squash
         popd
         jj workspace forget jjq
+
+        if [ ! -f .jj/repo/config.toml ]; then
+            if [ -z "${NON_INTERACTIVE-}" ]; then
+                echo "Welcome to jjq"
+                echo -n "Configure \`jj log\` to hide jjq metadata? "
+                read -n1 -p '(y/N) ' -r answer
+                echo
+                if [[ $answer == [yY] ]]; then
+                    cat > .jj/repo/config.toml <<-EOF
+						[revsets]
+						log = '~ ::${jjq_bookmark}'
+					EOF
+                fi
+            fi
+        fi
     fi
 }
 
 next_id() {
-    exec 3>&1
-    exec 1>>/tmp/jjq.log 2>/dev/null
     local d
     d=$(mktemp -d)
     # shellcheck disable=SC2064 # Intentional: capture $d now
     trap "rm -rf $d" EXIT
     local workspace_name="jjq$$"
     jj workspace add -r "$jjq_bookmark" --name "$workspace_name" "$d"
-    pushd "$d"
+    pushd "$d" >/dev/null
     local curr
     curr="$(head -1 < last_id)"
     local id=$((curr + 1))
@@ -69,14 +81,11 @@ next_id() {
     jj desc -m "$curr -> $id" -m "pid: $$"
     jj bookmark set "$jjq_bookmark"
     jj workspace forget "$workspace_name"
-    popd
-    echo "$id" >&3
+    popd >/dev/null
+    echo "$id"
 }
 
 cmd_push() {
-    exec 3>&1
-    exec 1>>/tmp/jjq.log 2>&1
-
     # Revset of the candidate revision the user is pushing on to the merge queue
     local revset="$1"
     shift
@@ -94,19 +103,19 @@ cmd_push() {
     queue_bookmark="$(printf "jjq/queue/%06d" "$id")"
 
     jj bookmark create -r "$revset" "$queue_bookmark"
-    prefout "revision '$revset' queued at $id" >&3
+    prefout "revision '$revset' queued at $id"
 }
 
 cmd_run() {
-    #exec 3>&1
-    #exec 1>>/tmp/jjq.log 2>&1
-
     local id
-    id="$(jj bookmark list -r 'bookmarks(jjq/queue/*)' -T'name ++"\n"' | cut -f3 -d'/' | sort -n | head -1)"
+    id="$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' | grep -E '^jjq/queue/[0-9]{6}$' | cut -f3 -d'/' | sort -n | head -1)"
     if [ -z "$id" ]; then
         preferr "queue is empty"
         exit 0
     fi
+    prefout "processing queue item $id"
+
+    check_jjq
 
     local runner_workspace
     runner_workspace=$(mktemp -d)
@@ -121,6 +130,8 @@ cmd_run() {
         preferr "queue runner lock already held"
         exit 1
     fi
+
+    trap "jj bookmark delete $lock >/dev/null 2>&1" EXIT
 
     # TODO: record this PID as metadata for the run somehow
 
@@ -158,6 +169,8 @@ cmd_run() {
         jj workspace forget "$run_name"
         rm -rf "$runner_workspace"
     fi
+
+    jj bookmark delete "$lock"
 }
 
 case "$cmd" in
