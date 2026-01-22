@@ -23,6 +23,7 @@ usage() {
     err "   push <revset>           - push revision on merge queue"
     err "   run                     - try to merge next candidate on queue"
     err "   status                  - print the status of the queue"
+    err "   retry <id> [revset]     - retry a failed merge"
     exit 1
 }
 
@@ -226,9 +227,80 @@ cmd_status() {
     fi
 }
 
+cmd_retry() {
+    if [ $# -lt 1 ]; then
+        preferr "usage: jjq retry <id> [revset]"
+        exit 1
+    fi
+
+    local id="$1"
+    shift
+    local padded_id
+    padded_id=$(printf "%06d" "$id")
+    local failed_bookmark="jjq/failed/$padded_id"
+
+    # Check if the failed bookmark exists
+    if [ -z "$(jj bookmark list -r "bookmarks(exact:$failed_bookmark)" -T name 2>/dev/null)" ]; then
+        preferr "failed item $id not found"
+        exit 1
+    fi
+
+    local candidate_revset
+    if [ $# -gt 0 ]; then
+        # User provided an explicit revset
+        candidate_revset="$1"
+        if ! jj log -r "$candidate_revset" --no-graph -T'change_id.short()' >/dev/null 2>&1; then
+            preferr "revset '$candidate_revset' not found"
+            exit 1
+        fi
+        prefout "retrying failed item $id using '$candidate_revset'"
+    else
+        # Get the second parent (the original candidate) of the failed merge
+        local original_candidate
+        original_candidate=$(jj log -r "$failed_bookmark" --no-graph -T'parents.map(|p| p.change_id().short()).join(" ")' | cut -d' ' -f2)
+
+        if [ -z "$original_candidate" ]; then
+            preferr "could not find original candidate for failed item $id"
+            exit 1
+        fi
+
+        # Find user bookmarks that were on the original candidate
+        # (bookmarks that are not jjq-namespaced)
+        local user_bookmarks
+        user_bookmarks=$(jj log -r "$original_candidate" --no-graph -T'bookmarks' | tr ' ' '\n' | grep -v '^jjq/' | grep -v '^$' || true)
+
+        if [ -n "$user_bookmarks" ]; then
+            # Use the first user bookmark found
+            local bookmark
+            bookmark=$(echo "$user_bookmarks" | head -1)
+            candidate_revset="bookmarks(exact:$bookmark)"
+            prefout "retrying failed item $id using bookmark '$bookmark'"
+        else
+            # No user bookmark found, use the original candidate directly
+            candidate_revset="$original_candidate"
+            prefout "retrying failed item $id using original candidate $original_candidate"
+        fi
+    fi
+
+    # Delete the failed bookmark
+    jj bookmark delete "$failed_bookmark" >/dev/null 2>&1
+
+    # Push the candidate to the queue using next_id
+    check_jjq
+
+    local new_id
+    new_id="$(next_id)"
+    local queue_bookmark
+    queue_bookmark="$(printf "jjq/queue/%06d" "$new_id")"
+
+    jj bookmark create -r "$candidate_revset" "$queue_bookmark"
+    prefout "revision queued at $new_id"
+}
+
 case "$cmd" in
     push) cmd_push "$@" ;;
     run) cmd_run "$@" ;;
     status) cmd_status "$@" ;;
+    retry) cmd_retry "$@" ;;
     *) usage ;;
 esac
