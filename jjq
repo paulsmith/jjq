@@ -22,6 +22,7 @@ usage() {
     err "commands:"
     err "   push <revset>           - push revision on merge queue"
     err "   run                     - try to merge next candidate on queue"
+    err "   status                  - print the status of the queue"
     exit 1
 }
 
@@ -173,8 +174,61 @@ cmd_run() {
     jj bookmark delete "$lock"
 }
 
+cmd_status() {
+    local max_failures=3  # TODO: make configurable via jjq config
+
+    # Check if jjq is initialized
+    if [ -z "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name 2>/dev/null)" ]; then
+        prefout "jjq not initialized (push a revision on to the queue to initialize) "
+        return
+    fi
+
+    local queue_items
+    queue_items=$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/queue/[0-9]{6}$' | sort || true)
+
+    local failed_items
+    failed_items=$(jj bookmark list -r 'bookmarks(glob:"jjq/failed/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/failed/[0-9]{6}$' | sort -r | head -"$max_failures" || true)
+
+    # Check for active run
+    if jj bookmark list -r 'bookmarks(exact:"jjq/lock/run")' -T'name' 2>/dev/null | grep -q 'jjq/lock/run'; then
+        prefout "Run in progress"
+        echo
+    fi
+
+    if [ -z "$queue_items" ] && [ -z "$failed_items" ]; then
+        prefout "queue is empty"
+        return
+    fi
+
+    if [ -n "$queue_items" ]; then
+        prefout "Queued:"
+        while IFS= read -r bookmark; do
+            [ -n "$bookmark" ] || continue
+            local id="${bookmark##*/}"
+            local info
+            info=$(jj log -r "bookmarks(exact:$bookmark)" --no-graph -T'change_id.short() ++ " " ++ description.first_line()')
+            echo "  $((10#$id)): $info"
+        done <<< "$queue_items"
+    fi
+
+    if [ -n "$failed_items" ]; then
+        if [ -n "$queue_items" ]; then
+            echo
+        fi
+        prefout "Failed (recent):"
+        while IFS= read -r bookmark; do
+            [ -n "$bookmark" ] || continue
+            local id="${bookmark##*/}"
+            local info
+            info=$(jj log -r "bookmarks(exact:$bookmark)" --no-graph -T'change_id.short() ++ " " ++ description.first_line()')
+            echo "  $((10#$id)): $info"
+        done <<< "$failed_items"
+    fi
+}
+
 case "$cmd" in
     push) cmd_push "$@" ;;
     run) cmd_run "$@" ;;
+    status) cmd_status "$@" ;;
     *) usage ;;
 esac
