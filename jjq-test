@@ -1,0 +1,371 @@
+#!/bin/bash
+# ABOUTME: End-to-end test for jjq merge queue with deterministic conflict resolution.
+# ABOUTME: Generates test repo, queues PRs, and processes merges including conflict handling.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PATH="$SCRIPT_DIR:$PATH"
+export NON_INTERACTIVE=1
+
+#=============================================================================
+# Resolve jj conflict markers in a file using sed
+# Conflict format: <<<<<<< ... +++++++ (side1) ... %%%%%%% (diff) ... >>>>>>> ends
+# - Lines starting with just tab: side1 content (trunk) - KEEP
+# - Lines starting with space+tab: unchanged base context - DELETE
+# - Lines starting with +tab: additions from side2 - KEEP (remove + prefix)
+#=============================================================================
+resolve_jj_conflict() {
+    local file="$1"
+    sed -i '' '/^<<<<<<</d; /^+++++++/d; /^%%%%%%%/d; /^\\\\\\\\/d; /^>>>>>>>/d; /^ 	/d; s/^+	/	/' "$file"
+}
+
+#=============================================================================
+# PR Definitions: Each PR has create_* and resolve_* functions paired together.
+# This makes it clear what each PR does and how its conflicts get resolved.
+#=============================================================================
+
+# pr1: Add greeting package - uses say.Greet() instead of raw Println
+# Merges cleanly (first after main)
+pr1_create() {
+    mkdir -p say
+    cat > say/greet.go <<'EOF'
+package say
+
+func Greet(name string) string {
+    return "Hello, " + name + "!"
+}
+EOF
+    sed -i '' $'/import "fmt"/a\\\nimport "example\/jjdemo/say"' main.go
+    sed -i '' 's/fmt\.Println\(.*\)/fmt.Println(say.Greet("world"))/' main.go
+    go fmt ./...
+}
+pr1_resolve() { :; }  # No conflicts - merges cleanly
+
+# pr2: Add goodbye - adds say.Bye() call after the Println
+# CONFLICTS: pr1 changed Println to Greet(), pr2 expects original Println
+# Resolution: Standard jj conflict merge combines Greet() + Bye() correctly
+pr2_create() {
+    mkdir -p say
+    cat > say/bye.go <<'EOF'
+package say
+
+func Bye() string {
+    return "Goodbye."
+}
+EOF
+    sed -i '' $'/import "fmt"/a\\\nimport "example\/jjdemo/say"' main.go
+    sed -i '' $'/fmt\.Println/a\\\n\tfmt.Println(say.Bye())' main.go
+    sed -i '' 's/"Hello, world!\\n"/"Hello, world!\\nGoodbye.\\n"/' main_test.go
+    go fmt ./...
+}
+pr2_resolve() {
+    resolve_jj_conflict main.go
+}
+
+# pr3: Add comment before main() body
+# CONFLICTS: pr1 changed the Println line that pr3's diff references
+# Resolution: Take trunk's main.go, add the comment before first Println
+pr3_create() {
+    sed -i '' $'/func main/a\\\n\t\/\/ say hi' main.go
+    go fmt ./...
+}
+pr3_resolve() {
+    # pr3's intent: add "// say hi" before the print statements
+    # Take trunk's main.go and insert the comment - this handles any trunk state
+    jj file show main.go -r main > main.go
+    sed -i '' 's/fmt\.Println(say\.Greet/\/\/ say hi\'$'\n\tfmt.Println(say.Greet/' main.go
+}
+
+# pr4: Add readme - no code changes
+# Merges cleanly (no overlap with other PRs)
+pr4_create() {
+    echo '# jjq demo' > README.md
+}
+pr4_resolve() { :; }  # No conflicts - merges cleanly
+
+# List of all PRs in queue order
+ALL_PRS="pr1 pr2 pr3 pr4"
+
+#=============================================================================
+# Generate: Create the test repository with main + PR branches
+#=============================================================================
+cmd_generate() {
+    local dest_dir="${1:-.}"
+
+    if [ "$dest_dir" = "." ] && [ -d .jj ]; then
+        echo "Error: Current directory already has a jj repo"
+        exit 1
+    fi
+
+    if [ "$dest_dir" != "." ]; then
+        mkdir -p "$dest_dir"
+    fi
+
+    echo "=== Generating test repository ==="
+
+    # Initialize repo with main branch
+    jj git init "$dest_dir"
+    pushd "$dest_dir" >/dev/null
+
+    go mod init example/jjdemo
+    go mod edit -go=1.24
+
+    cat > main.go <<'EOF'
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello, world!")
+}
+EOF
+
+    cat > main_test.go <<'EOF'
+package main_test
+
+import (
+    "os/exec"
+    "testing"
+)
+
+func TestMain(t *testing.T) {
+    cmd := exec.Command("go", "run", ".")
+    out, err := cmd.CombinedOutput()
+    if err != nil {
+        t.Fatal(err)
+    }
+    want := "Hello, world!\n"
+    if string(out) != want {
+        t.Errorf("want %q, got %q", want, string(out))
+    }
+}
+EOF
+
+    cat > Makefile <<'EOF'
+all: test
+test:
+	go test -v ./...
+	golangci-lint run
+EOF
+
+    go fmt ./...
+    jj desc -m "initial"
+    jj bookmark create main
+
+    # Create each PR branch from main
+    for pr in $ALL_PRS; do
+        echo "  Creating $pr..."
+        jj new -m "$(pr_description "$pr")" main
+        "${pr}_create"
+        jj bookmark create "$pr"
+    done
+
+    # Return to main for working copy
+    jj new main
+    popd >/dev/null
+
+    echo "=== Test repository created in $dest_dir ==="
+    echo "Branches: main $ALL_PRS"
+}
+
+pr_description() {
+    case "$1" in
+        pr1) echo "add greeting pkg" ;;
+        pr2) echo "add goodbye" ;;
+        pr3) echo "add comment" ;;
+        pr4) echo "add readme" ;;
+    esac
+}
+
+#=============================================================================
+# Run: Process the merge queue, resolving conflicts as needed
+#=============================================================================
+cmd_run() {
+    echo "=== Configuring jjq ==="
+    jjq config check_command "make"
+
+    echo ""
+    echo "=== Pushing PRs onto the merge queue ==="
+    for pr in $ALL_PRS; do
+        jjq push "$pr"
+    done
+    jjq status
+
+    echo ""
+    echo "=== Processing the merge queue ==="
+
+    while true; do
+        next_id=$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/queue/[0-9]{6}$' | cut -f3 -d'/' | sort -n | head -1 || true)
+
+        if [ -z "$next_id" ]; then
+            echo "Queue is empty - all done!"
+            break
+        fi
+
+        echo "Processing queue item $((10#$next_id))..."
+
+        if jjq run; then
+            echo "  Merged successfully"
+        else
+            padded_id=$(printf "%06d" "$((10#$next_id))")
+            failed_rev="jjq/failed/$padded_id"
+
+            # Check if this is a conflict failure (vs check failure)
+            fail_reason=$(jj log -r "$failed_rev" --no-graph -T'description.first_line()' 2>/dev/null || true)
+            if [[ "$fail_reason" != *"(conflicts)"* ]]; then
+                echo "  Failed check (not conflicts) - cannot auto-resolve"
+                exit 1
+            fi
+
+            # Find which PR this was by checking bookmarks on the parents (second parent is the PR)
+            original_pr=$(jj log -r "parents($failed_rev)" --no-graph -T'bookmarks ++ "\n"' 2>/dev/null | tr ' ' '\n' | grep -E '^pr[0-9]+$' | head -1 || true)
+
+            echo "  Conflicts detected (was: $original_pr) - resolving..."
+            fix_dir=$(mktemp -d)
+            trap "rm -rf $fix_dir" EXIT
+
+            jj workspace add -r "$failed_rev" --name "jjq-fix-$$" "$fix_dir" >/dev/null 2>&1
+            pushd "$fix_dir" >/dev/null
+
+            # Call the PR's resolve function if we identified it
+            if [ -n "$original_pr" ] && declare -f "${original_pr}_resolve" >/dev/null 2>&1; then
+                "${original_pr}_resolve"
+            elif [ -f main.go ] && grep -q '<<<<<<' main.go 2>/dev/null; then
+                # Fallback: generic conflict resolution
+                resolve_jj_conflict main.go
+            fi
+
+            go fmt ./... >/dev/null 2>&1 || true
+            jj desc -m "Resolved conflict" >/dev/null 2>&1
+            popd >/dev/null
+
+            echo "  Retrying..."
+            jjq retry "$((10#$next_id))" "jjq-fix-$$@"
+
+            jj workspace forget "jjq-fix-$$" >/dev/null 2>&1
+            rm -rf "$fix_dir"
+            trap - EXIT
+        fi
+        echo ""
+    done
+
+    echo ""
+    echo "=== Final status ==="
+    jjq status
+}
+
+#=============================================================================
+# Verify: Check the final merged state is correct
+#=============================================================================
+cmd_verify() {
+    echo "=== Verifying final state ==="
+
+    local errors=0
+
+    # Check main.go has all expected content
+    local main_content
+    main_content=$(jj file show main.go -r main 2>/dev/null || cat main.go)
+
+    if ! echo "$main_content" | grep -q 'say.Greet'; then
+        echo "FAIL: missing say.Greet() from pr1"
+        ((errors++))
+    fi
+    if ! echo "$main_content" | grep -q 'say.Bye'; then
+        echo "FAIL: missing say.Bye() from pr2"
+        ((errors++))
+    fi
+    if ! echo "$main_content" | grep -q '// say hi'; then
+        echo "FAIL: missing comment from pr3"
+        ((errors++))
+    fi
+
+    # Check README exists
+    if ! jj file show README.md -r main >/dev/null 2>&1 && ! [ -f README.md ]; then
+        echo "FAIL: missing README.md from pr4"
+        ((errors++))
+    fi
+
+    # Check say/ directory has both files
+    for f in say/greet.go say/bye.go; do
+        if ! jj file show "$f" -r main >/dev/null 2>&1 && ! [ -f "$f" ]; then
+            echo "FAIL: missing $f"
+            ((errors++))
+        fi
+    done
+
+    # Run tests
+    echo "Running tests..."
+    if jj edit main >/dev/null 2>&1 || true; then
+        if make; then
+            echo "PASS: tests passed"
+        else
+            echo "FAIL: tests failed"
+            ((errors++))
+        fi
+    fi
+
+    if [ $errors -eq 0 ]; then
+        echo "=== All verifications passed ==="
+        return 0
+    else
+        echo "=== $errors verification(s) failed ==="
+        return 1
+    fi
+}
+
+#=============================================================================
+# Main
+#=============================================================================
+usage() {
+    cat <<EOF
+usage: jjq-test [command] [args]
+
+commands:
+    generate [dir]   Create test repository (default: current dir)
+    run              Process merge queue with conflict resolution
+    verify           Check final merged state is correct
+    (no command)     Run full e2e test: generate in temp dir, run, verify
+
+This script tests jjq by creating a repository with 4 PRs that have
+known conflicts, then processes the merge queue and resolves conflicts
+deterministically using the paired resolve functions.
+EOF
+    exit 1
+}
+
+case "${1:-}" in
+    generate)
+        shift
+        cmd_generate "${1:-.}"
+        ;;
+    run)
+        cmd_run
+        ;;
+    verify)
+        cmd_verify
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    "")
+        # Full e2e test
+        test_dir=$(mktemp -d)
+        trap "rm -rf $test_dir" EXIT
+
+        echo "Running full e2e test in $test_dir"
+        echo ""
+
+        cmd_generate "$test_dir"
+        echo ""
+
+        cd "$test_dir"
+        cmd_run
+        echo ""
+
+        cmd_verify
+        ;;
+    *)
+        echo "Unknown command: $1"
+        usage
+        ;;
+esac

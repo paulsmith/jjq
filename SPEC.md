@@ -115,6 +115,9 @@ proceed with the merge attempt. If it fails to create the bookmark, that means
 it already exists, and an existing runner process holds the lock (possibly
 already exited and failed to release the lock by deleting the bookmark).
 
+Similarly, the bookmark `jjq/lock/id` is used to protect concurrent access to
+the sequence ID store.
+
 ### Merge-to-be
 
 The "merge-to-be" in jjq is the name for the revision that is parented by both
@@ -179,10 +182,10 @@ from `jj log` by adding:
 
 ```
 [revsets]
-log = "~ ::jjq"
+log = "~ ::jjq/_/_"
 ```
 
-to the repo's local config.toml. Note that the bookmark `jjq` is a special
+to the repo's local config.toml. Note that the bookmark `jjq/_/_` is a special
 bookmark that points to the head of the isolated branch.
 
 ### Failed merge attempts
@@ -199,8 +202,14 @@ from the queue, or retry it.
 Retrying a queue item after it has failed is supported by the jjq CLI. The user,
 instead of pushing a revision, retries the sequence ID of the item.
 
+Retries receive a new sequence ID.
+
 Retries never happen automatically. The jjq tool will never retry an item on its
 own without a user's explicit intent.
+
+Retries default to pushing the revision pointed to by the failure bookmark. They
+can optionally take an explicit revset argument to push that revision instead
+and maintain the association with the original queued item.
 
 ### Status
 
@@ -216,19 +225,23 @@ command.
 
 ### The log
 
-jjq records all its actions in an append-only log. The log is stored in the jj
-repo alongside the sequence ID store. The log is meant to capture the sequence
-of logical actions jjq takes as it executes its commands, as well as to record
+jjq records all its actions in a log. The log is stored in the jj repo
+alongside the sequence ID store. The log is meant to capture the sequence of
+logical actions jjq takes as it executes its commands, as well as to record
 notable output and summaries for future analysis and debugging, especially of
 failures. For example, the output of the check command shall be recorded in the
 log.
 
-The log should help users reconstruct jjq histories, supporting additional
-tooling like timeline visualization.
+The log should help users reconstruct jjq operational histories, supporting
+additional tooling like timeline visualization.
 
-The format of the jjq log is a .jsonl file, i.e., a sequence of serialized JSON
-objects. Each object shall have a schema specific to its command, but commands
-may emit more than one object type during its execution.
+The storage format of the jjq log is left as a detail to conforming
+implementations.
+
+### Deleting queued and failed items.
+
+The jjq command `delete` take an ID argument and removes the item from the
+queue, or for a failed item, its bookmark.
 
 ### Cleaning up
 

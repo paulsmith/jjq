@@ -1,8 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-TRUNK_BOOKMARK=main
-CHECK_COMMAND="make"
+# Defaults per spec - can be overridden via jjq config
+DEFAULT_TRUNK_BOOKMARK="main"
+DEFAULT_CHECK_COMMAND="sh -c 'exit 1'"
+DEFAULT_MAX_FAILURES=3
 
 err() {
     echo "$*" >&2
@@ -61,6 +63,58 @@ timestamp() {
     date -u +%Y-%m-%dT%H:%M:%SZ
 }
 
+# Read a config value from the jjq metadata branch
+# Usage: get_config <key> <default>
+get_config() {
+    local key="$1"
+    local default="$2"
+    local value
+    value=$(jj file show "config/$key" -r "$jjq_bookmark" 2>/dev/null) || true
+    if [ -n "$value" ]; then
+        echo "$value"
+    else
+        echo "$default"
+    fi
+}
+
+# Write a config value to the jjq metadata branch
+# Usage: set_config <key> <value>
+set_config() {
+    local key="$1"
+    local value="$2"
+
+    local d
+    d=$(mktemp -d)
+    trap "rm -rf $d" EXIT
+
+    local workspace_name="jjq-config-$$"
+    run_quiet jj workspace add -r "$jjq_bookmark" --name "$workspace_name" "$d"
+    pushd "$d" >/dev/null
+
+    mkdir -p config
+    echo "$value" > "config/$key"
+    run_quiet jj desc -m "config: set $key"
+    run_quiet jj bookmark set "$jjq_bookmark"
+
+    popd >/dev/null
+    run_quiet jj workspace forget "$workspace_name"
+    rm -rf "$d"
+    trap - EXIT
+}
+
+# Get effective config values (with defaults)
+get_trunk_bookmark() {
+    get_config "trunk_bookmark" "$DEFAULT_TRUNK_BOOKMARK"
+}
+
+get_check_command() {
+    get_config "check_command" "$DEFAULT_CHECK_COMMAND"
+}
+
+get_max_failures() {
+    get_config "max_failures" "$DEFAULT_MAX_FAILURES"
+}
+
 usage() {
     err "usage: jjq <cmd>"
     err ""
@@ -69,7 +123,10 @@ usage() {
     err "   run                     - try to merge next candidate on queue"
     err "   status                  - print the status of the queue"
     err "   retry <id> [revset]     - retry a failed merge"
-    err "   delete <id>             - delete a queued item"
+    err "   delete <id>             - delete a queued or failed item"
+    err "   config [key] [value]    - get/set configuration"
+    err "   clean [id|all]          - clean up failed workspaces"
+    err "   log                     - show jjq operation history"
     exit 1
 }
 
@@ -183,12 +240,17 @@ cmd_run() {
     local id
     id="$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' | grep -E '^jjq/queue/[0-9]{6}$' | cut -f3 -d'/' | sort -n | head -1)"
     if [ -z "$id" ]; then
-        preferr "queue is empty"
+        prefout "queue is empty"
         exit 0
     fi
     prefout "processing queue item $id"
 
     check_jjq
+
+    # Get config values
+    local trunk_bookmark check_command
+    trunk_bookmark=$(get_trunk_bookmark)
+    check_command=$(get_check_command)
 
     local runner_workspace
     runner_workspace=$(mktemp -d)
@@ -208,7 +270,7 @@ cmd_run() {
 
     # Create a workspace to attempt the merge, with a new commit for the
     # merge-to-be with two parents: the trunk and the candidate revision
-    run_quiet jj workspace add -r "bookmarks(exact:$TRUNK_BOOKMARK)" -r "bookmarks(exact:jjq/queue/$id)" --name "$run_name" "$runner_workspace"
+    run_quiet jj workspace add -r "bookmarks(exact:$trunk_bookmark)" -r "bookmarks(exact:jjq/queue/$id)" --name "$run_name" "$runner_workspace"
     pushd "$runner_workspace" >/dev/null
 
     # Check for conflicts in the merge-to-be commit
@@ -217,11 +279,12 @@ cmd_run() {
         run_quiet jj bookmark create -r "${run_name}@" "jjq/failed/$id"
         run_quiet jj desc -m "Failed: merge $id (conflicts)"
         popd >/dev/null
-        # Log the failure
+        # Log the failure with workspace path for cleanup
         log_op "" "run: failed $id (conflicts)" \
             "Operation: run" \
             "Sequence-Id: $((10#$id))" \
             "Result: conflict" \
+            "Workspace: $runner_workspace" \
             "Timestamp: $(timestamp)"
         preferr "merge $id has conflicts, marked as failed"
         preferr "workspace remains: $runner_workspace"
@@ -236,19 +299,20 @@ cmd_run() {
     # Run check command - quiet on success, show output on failure
     local check_output
     local check_exit
-    check_output=$($CHECK_COMMAND 2>&1) && check_exit=0 || check_exit=$?
+    check_output=$(eval "$check_command" 2>&1) && check_exit=0 || check_exit=$?
     if [ $check_exit -ne 0 ]; then
         err "$check_output"
         run_quiet jj bookmark delete "jjq/queue/$id"
         run_quiet jj bookmark create -r "${run_name}@" "jjq/failed/$id"
         run_quiet jj desc -m "Failed: merge $id (check)"
         popd >/dev/null
-        # Log the failure
+        # Log the failure with workspace path for cleanup
         log_op "" "run: failed $id (check)" \
             "Operation: run" \
             "Sequence-Id: $((10#$id))" \
             "Result: check-failed" \
-            "Check-Command: $CHECK_COMMAND" \
+            "Check-Command: $check_command" \
+            "Workspace: $runner_workspace" \
             "Timestamp: $(timestamp)"
         preferr "merge $id check failed"
         preferr "workspace remains: $runner_workspace"
@@ -261,7 +325,7 @@ cmd_run() {
     # Success path
     run_quiet jj bookmark delete "jjq/queue/$id"
     run_quiet jj desc -m "Success: merge $id"
-    run_quiet jj bookmark move "$TRUNK_BOOKMARK"
+    run_quiet jj bookmark move "$trunk_bookmark"
     popd >/dev/null
     run_quiet jj workspace forget "$run_name"
 
@@ -270,7 +334,7 @@ cmd_run() {
         "Operation: run" \
         "Sequence-Id: $((10#$id))" \
         "Result: success" \
-        "Check-Command: $CHECK_COMMAND" \
+        "Check-Command: $check_command" \
         "Timestamp: $(timestamp)"
 
     # Explicit cleanup (trap is backup for unexpected exits)
@@ -280,13 +344,14 @@ cmd_run() {
 }
 
 cmd_status() {
-    local max_failures=3  # TODO: make configurable via jjq config
-
     # Check if jjq is initialized
     if [ -z "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name 2>/dev/null)" ]; then
-        prefout "jjq not initialized (push a revision on to the queue to initialize) "
+        prefout "jjq not initialized (push a revision on to the queue to initialize)"
         return
     fi
+
+    local max_failures
+    max_failures=$(get_max_failures)
 
     local queue_items
     queue_items=$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/queue/[0-9]{6}$' | sort || true)
@@ -449,11 +514,193 @@ cmd_delete() {
         "Timestamp: $(timestamp)"
 }
 
+cmd_config() {
+    check_jjq
+
+    if [ $# -eq 0 ]; then
+        # Show all config
+        echo "trunk_bookmark = $(get_trunk_bookmark)"
+        echo "check_command = $(get_check_command)"
+        echo "max_failures = $(get_max_failures)"
+        return
+    fi
+
+    local key="$1"
+    shift
+
+    # Validate key
+    case "$key" in
+        trunk_bookmark|check_command|max_failures) ;;
+        *)
+            preferr "unknown config key: $key"
+            preferr "valid keys: trunk_bookmark, check_command, max_failures"
+            exit 1
+            ;;
+    esac
+
+    if [ $# -eq 0 ]; then
+        # Get single value
+        case "$key" in
+            trunk_bookmark) get_trunk_bookmark ;;
+            check_command) get_check_command ;;
+            max_failures) get_max_failures ;;
+        esac
+    else
+        # Set value
+        local value="$1"
+
+        # Validate value
+        if [ "$key" = "max_failures" ]; then
+            if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+                preferr "max_failures must be a number"
+                exit 1
+            fi
+        fi
+
+        set_config "$key" "$value"
+        prefout "$key = $value"
+
+        # Log the config change
+        log_op "" "config: set $key" \
+            "Operation: config" \
+            "Key: $key" \
+            "Value: $value" \
+            "Timestamp: $(timestamp)"
+    fi
+}
+
+cmd_clean() {
+    check_jjq
+
+    if [ $# -eq 0 ]; then
+        # Show what would be cleaned
+        local failed_items
+        failed_items=$(jj bookmark list -r 'bookmarks(glob:"jjq/failed/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/failed/[0-9]{6}$' || true)
+
+        if [ -z "$failed_items" ]; then
+            prefout "no failed items to clean"
+            return
+        fi
+
+        prefout "failed workspaces:"
+        while IFS= read -r bookmark; do
+            [ -n "$bookmark" ] || continue
+            local id="${bookmark##*/}"
+            # Find workspace path from log (search commit messages on jjq branch)
+            local workspace
+            workspace=$(jj log -r "ancestors($jjq_bookmark)" --no-graph -T'description' 2>/dev/null | grep -A20 "Sequence-Id: $((10#$id))" | grep "^Workspace:" | head -1 | cut -d' ' -f2 || true)
+            if [ -n "$workspace" ] && [ -d "$workspace" ]; then
+                echo "  $((10#$id)): $workspace"
+            else
+                echo "  $((10#$id)): (workspace not found or already cleaned)"
+            fi
+        done <<< "$failed_items"
+        echo ""
+        prefout "use 'jjq clean <id>' or 'jjq clean all' to remove"
+        return
+    fi
+
+    local target="$1"
+
+    if [ "$target" = "all" ]; then
+        # Clean all failed workspaces
+        local failed_items
+        failed_items=$(jj bookmark list -r 'bookmarks(glob:"jjq/failed/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/failed/[0-9]{6}$' || true)
+
+        if [ -z "$failed_items" ]; then
+            prefout "no failed items to clean"
+            return
+        fi
+
+        local cleaned=0
+        while IFS= read -r bookmark; do
+            [ -n "$bookmark" ] || continue
+            local id="${bookmark##*/}"
+            local workspace
+            workspace=$(jj log -r "ancestors($jjq_bookmark)" --no-graph -T'description' 2>/dev/null | grep -A20 "Sequence-Id: $((10#$id))" | grep "^Workspace:" | head -1 | cut -d' ' -f2 || true)
+            if [ -n "$workspace" ] && [ -d "$workspace" ]; then
+                rm -rf "$workspace"
+                prefout "cleaned workspace for $((10#$id)): $workspace"
+                ((cleaned++))
+            fi
+        done <<< "$failed_items"
+
+        if [ $cleaned -eq 0 ]; then
+            prefout "no workspaces found to clean"
+        else
+            prefout "cleaned $cleaned workspace(s)"
+        fi
+    else
+        # Clean specific ID
+        local id="$target"
+        local padded_id
+        padded_id=$(printf "%06d" "$id")
+        local failed_bookmark="jjq/failed/$padded_id"
+
+        if [ -z "$(jj bookmark list -r "bookmarks(exact:$failed_bookmark)" -T name 2>/dev/null)" ]; then
+            preferr "failed item $id not found"
+            exit 1
+        fi
+
+        # Find workspace path from log
+        local workspace
+        workspace=$(jj log -r "ancestors($jjq_bookmark)" --no-graph -T'description' 2>/dev/null | grep -A20 "Sequence-Id: $((10#$id))" | grep "^Workspace:" | head -1 | cut -d' ' -f2 || true)
+
+        if [ -z "$workspace" ]; then
+            preferr "workspace path not found for item $id"
+            exit 1
+        fi
+
+        if [ ! -d "$workspace" ]; then
+            prefout "workspace already cleaned: $workspace"
+            return
+        fi
+
+        rm -rf "$workspace"
+        prefout "cleaned workspace: $workspace"
+
+        # Log the cleanup
+        log_op "" "clean: removed workspace for $id" \
+            "Operation: clean" \
+            "Sequence-Id: $id" \
+            "Workspace: $workspace" \
+            "Timestamp: $(timestamp)"
+    fi
+}
+
+cmd_log() {
+    # Check if jjq is initialized
+    if [ -z "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name 2>/dev/null)" ]; then
+        prefout "jjq not initialized"
+        return
+    fi
+
+    local limit=20
+    if [ $# -gt 0 ]; then
+        limit="$1"
+    fi
+
+    # Show log entries from the jjq branch
+    # Each commit on the jjq branch represents an operation
+    prefout "operation log (most recent first):"
+    echo ""
+
+    jj log -r "ancestors($jjq_bookmark, $limit)" --no-graph -T'
+        if(description.first_line().starts_with("init") || description.first_line().starts_with("push:") || description.first_line().starts_with("run:") || description.first_line().starts_with("retry:") || description.first_line().starts_with("delete:") || description.first_line().starts_with("config:") || description.first_line().starts_with("clean:"),
+            description.first_line() ++ "\n" ++
+            "  " ++ format_timestamp(committer.timestamp()) ++ "\n\n"
+        )
+    ' 2>/dev/null || true
+}
+
 case "$cmd" in
     push) cmd_push "$@" ;;
     run) cmd_run "$@" ;;
     status) cmd_status "$@" ;;
     retry) cmd_retry "$@" ;;
     delete) cmd_delete "$@" ;;
+    config) cmd_config "$@" ;;
+    clean) cmd_clean "$@" ;;
+    log) cmd_log "$@" ;;
     *) usage ;;
 esac
