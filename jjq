@@ -16,6 +16,17 @@ prefout() {
     echo "jjq: $*"
 }
 
+# Run a command quietly - only show output on failure
+run_quiet() {
+    local output
+    local exit_code
+    output=$("$@" 2>&1) && exit_code=0 || exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        err "$output"
+    fi
+    return $exit_code
+}
+
 usage() {
     err "usage: jjq <cmd>"
     err ""
@@ -39,18 +50,18 @@ check_jjq() {
     if [ -z "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name)" ]; then
         local change_id
         change_id="$(jj new --no-edit 'root()' 2>&1 | cut -f4 -d' ')"
-        jj bookmark create -r "$change_id" "$jjq_bookmark"
+        run_quiet jj bookmark create -r "$change_id" "$jjq_bookmark"
         local d
         d=$(mktemp -d)
         # shellcheck disable=SC2064 # Intentional: capture $d now
         trap "rm -rf $d" EXIT
-        jj workspace add -r "$jjq_bookmark" --name jjq "$d"
-        pushd "$d"
+        run_quiet jj workspace add -r "$jjq_bookmark" --name jjq "$d"
+        pushd "$d" >/dev/null
         echo 0 > last_id
-        jj desc -m "init jjq"
-        jj squash
-        popd
-        jj workspace forget jjq
+        run_quiet jj desc -m "init jjq"
+        run_quiet jj squash
+        popd >/dev/null
+        run_quiet jj workspace forget jjq
 
         if [ ! -f .jj/repo/config.toml ]; then
             if [ -z "${NON_INTERACTIVE-}" ]; then
@@ -84,15 +95,15 @@ next_id() {
     trap "rm -rf $d; jj bookmark delete $lock >/dev/null 2>&1" EXIT
 
     local workspace_name="jjq$$"
-    jj workspace add -r "$jjq_bookmark" --name "$workspace_name" "$d"
+    run_quiet jj workspace add -r "$jjq_bookmark" --name "$workspace_name" "$d"
     pushd "$d" >/dev/null
     local curr
     curr="$(head -1 < last_id)"
     local id=$((curr + 1))
     echo "$id" > last_id
-    jj desc -m "$curr -> $id" -m "pid: $$"
-    jj bookmark set "$jjq_bookmark"
-    jj workspace forget "$workspace_name"
+    run_quiet jj desc -m "$curr -> $id" -m "pid: $$"
+    run_quiet jj bookmark set "$jjq_bookmark"
+    run_quiet jj workspace forget "$workspace_name"
     popd >/dev/null
 
     # Release the lock explicitly (trap is backup)
@@ -120,7 +131,7 @@ cmd_push() {
     local queue_bookmark
     queue_bookmark="$(printf "jjq/queue/%06d" "$id")"
 
-    jj bookmark create -r "$revset" "$queue_bookmark"
+    run_quiet jj bookmark create -r "$revset" "$queue_bookmark"
     prefout "revision '$revset' queued at $id"
 }
 
@@ -153,32 +164,37 @@ cmd_run() {
 
     # Create a workspace to attempt the merge, with a new commit for the
     # merge-to-be with two parents: the trunk and the candidate revision
-    jj workspace add -r "bookmarks(exact:$TRUNK_BOOKMARK)" -r "bookmarks(exact:jjq/queue/$id)" --name "$run_name" "$runner_workspace"
-    pushd "$runner_workspace"
+    run_quiet jj workspace add -r "bookmarks(exact:$TRUNK_BOOKMARK)" -r "bookmarks(exact:jjq/queue/$id)" --name "$run_name" "$runner_workspace"
+    pushd "$runner_workspace" >/dev/null
 
     # Check for conflicts in the merge-to-be commit
     if [ -n "$(jj log -r "${run_name}@" --no-graph -T'if(conflict, "has conflict(s)")')" ]; then
-        jj bookmark delete "jjq/queue/$id"
-        jj bookmark create -r "${run_name}@" "jjq/failed/$id"
-        jj desc -m "Failed: merge $id (conflicts)"
+        run_quiet jj bookmark delete "jjq/queue/$id"
+        run_quiet jj bookmark create -r "${run_name}@" "jjq/failed/$id"
+        run_quiet jj desc -m "Failed: merge $id (conflicts)"
         preferr "merge $id has conflicts, marked as failed"
         preferr "workspace remains: $runner_workspace"
-        popd
+        popd >/dev/null
         # Keep workspace for debugging, but release lock
         trap - EXIT
         jj bookmark delete "$lock" >/dev/null 2>&1
         exit 1
     fi
 
-    jj desc -m "WIP: attempting merge $id"
+    run_quiet jj desc -m "WIP: attempting merge $id"
 
-    if ! $CHECK_COMMAND; then
-        jj bookmark delete "jjq/queue/$id"
-        jj bookmark create -r "${run_name}@" "jjq/failed/$id"
-        jj desc -m "Failed: merge $id (check)"
+    # Run check command - quiet on success, show output on failure
+    local check_output
+    local check_exit
+    check_output=$($CHECK_COMMAND 2>&1) && check_exit=0 || check_exit=$?
+    if [ $check_exit -ne 0 ]; then
+        err "$check_output"
+        run_quiet jj bookmark delete "jjq/queue/$id"
+        run_quiet jj bookmark create -r "${run_name}@" "jjq/failed/$id"
+        run_quiet jj desc -m "Failed: merge $id (check)"
         preferr "merge $id check failed"
         preferr "workspace remains: $runner_workspace"
-        popd
+        popd >/dev/null
         # Keep workspace for debugging, but release lock
         trap - EXIT
         jj bookmark delete "$lock" >/dev/null 2>&1
@@ -186,11 +202,11 @@ cmd_run() {
     fi
 
     # Success path
-    jj bookmark delete "jjq/queue/$id"
-    jj desc -m "Success: merge $id"
-    jj bookmark move "$TRUNK_BOOKMARK"
-    popd
-    jj workspace forget "$run_name"
+    run_quiet jj bookmark delete "jjq/queue/$id"
+    run_quiet jj desc -m "Success: merge $id"
+    run_quiet jj bookmark move "$TRUNK_BOOKMARK"
+    popd >/dev/null
+    run_quiet jj workspace forget "$run_name"
 
     # Explicit cleanup (trap is backup for unexpected exits)
     jj bookmark delete "$lock" >/dev/null 2>&1
@@ -306,7 +322,7 @@ cmd_retry() {
     fi
 
     # Delete the failed bookmark
-    jj bookmark delete "$failed_bookmark" >/dev/null 2>&1
+    run_quiet jj bookmark delete "$failed_bookmark"
 
     # Push the candidate to the queue using next_id
     check_jjq
@@ -316,7 +332,7 @@ cmd_retry() {
     local queue_bookmark
     queue_bookmark="$(printf "jjq/queue/%06d" "$new_id")"
 
-    jj bookmark create -r "$candidate_revset" "$queue_bookmark"
+    run_quiet jj bookmark create -r "$candidate_revset" "$queue_bookmark"
     prefout "revision queued at $new_id"
 }
 
@@ -335,10 +351,10 @@ cmd_delete() {
 
     # Check queue first, then failed
     if [ -n "$(jj bookmark list -r "bookmarks(exact:$queue_bookmark)" -T name 2>/dev/null)" ]; then
-        jj bookmark delete "$queue_bookmark"
+        run_quiet jj bookmark delete "$queue_bookmark"
         prefout "deleted queued item $id"
     elif [ -n "$(jj bookmark list -r "bookmarks(exact:$failed_bookmark)" -T name 2>/dev/null)" ]; then
-        jj bookmark delete "$failed_bookmark"
+        run_quiet jj bookmark delete "$failed_bookmark"
         prefout "deleted failed item $id"
     else
         preferr "item $id not found in queue or failed"
