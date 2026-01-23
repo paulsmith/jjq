@@ -24,6 +24,7 @@ usage() {
     err "   run                     - try to merge next candidate on queue"
     err "   status                  - print the status of the queue"
     err "   retry <id> [revset]     - retry a failed merge"
+    err "   delete <id>             - delete a queued item"
     exit 1
 }
 
@@ -297,10 +298,37 @@ cmd_retry() {
     prefout "revision queued at $new_id"
 }
 
+cmd_delete() {
+    if [ $# -lt 1 ]; then
+        preferr "usage: jjq delete <id>"
+        exit 1
+    fi
+
+    local id="$1"
+    local padded_id
+    padded_id=$(printf "%06d" "$id")
+
+    local queue_bookmark="jjq/queue/$padded_id"
+    local failed_bookmark="jjq/failed/$padded_id"
+
+    # Check queue first, then failed
+    if [ -n "$(jj bookmark list -r "bookmarks(exact:$queue_bookmark)" -T name 2>/dev/null)" ]; then
+        jj bookmark delete "$queue_bookmark"
+        prefout "deleted queued item $id"
+    elif [ -n "$(jj bookmark list -r "bookmarks(exact:$failed_bookmark)" -T name 2>/dev/null)" ]; then
+        jj bookmark delete "$failed_bookmark"
+        prefout "deleted failed item $id"
+    else
+        preferr "item $id not found in queue or failed"
+        exit 1
+    fi
+}
+
 case "$cmd" in
     push) cmd_push "$@" ;;
     run) cmd_run "$@" ;;
     status) cmd_status "$@" ;;
     retry) cmd_retry "$@" ;;
+    delete) cmd_delete "$@" ;;
     *) usage ;;
 esac
