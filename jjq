@@ -70,10 +70,19 @@ check_jjq() {
 }
 
 next_id() {
+    local lock="jjq/lock/id"
+
+    # Take the lock
+    if ! jj bookmark create -r "$jjq_bookmark" "$lock" >/dev/null 2>&1; then
+        preferr "could not acquire sequence ID lock (another process may be pushing)"
+        return 1
+    fi
+
     local d
     d=$(mktemp -d)
-    # shellcheck disable=SC2064 # Intentional: capture $d now
-    trap "rm -rf $d" EXIT
+    # shellcheck disable=SC2064 # Intentional: capture $d and $lock now
+    trap "rm -rf $d; jj bookmark delete $lock >/dev/null 2>&1" EXIT
+
     local workspace_name="jjq$$"
     jj workspace add -r "$jjq_bookmark" --name "$workspace_name" "$d"
     pushd "$d" >/dev/null
@@ -85,6 +94,12 @@ next_id() {
     jj bookmark set "$jjq_bookmark"
     jj workspace forget "$workspace_name"
     popd >/dev/null
+
+    # Release the lock explicitly (trap is backup)
+    jj bookmark delete "$lock" >/dev/null 2>&1
+    trap - EXIT
+    rm -rf "$d"
+
     echo "$id"
 }
 
