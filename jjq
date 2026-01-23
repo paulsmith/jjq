@@ -27,6 +27,40 @@ run_quiet() {
     return $exit_code
 }
 
+# Log an operation to the jjq branch by editing/creating a commit
+# Usage: log_op <revision> <summary> [trailer1] [trailer2] ...
+# If revision is empty, creates a new commit on jjq branch
+log_op() {
+    local rev="$1"
+    shift
+    local summary="$1"
+    shift
+
+    # Build message with trailers
+    local msg="$summary"
+    if [ $# -gt 0 ]; then
+        msg="$msg"$'\n'
+        for trailer in "$@"; do
+            msg="$msg"$'\n'"$trailer"
+        done
+    fi
+
+    if [ -n "$rev" ]; then
+        # Edit existing commit
+        run_quiet jj desc -r "$rev" -m "$msg"
+    else
+        # Create new commit on jjq branch (no workspace needed)
+        local change_id
+        change_id=$(jj new --no-edit -r "$jjq_bookmark" 2>&1 | head -1 | cut -f4 -d' ')
+        run_quiet jj desc -r "$change_id" -m "$msg"
+        run_quiet jj bookmark set -r "$change_id" "$jjq_bookmark"
+    fi
+}
+
+timestamp() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
 usage() {
     err "usage: jjq <cmd>"
     err ""
@@ -119,10 +153,11 @@ cmd_push() {
     local revset="$1"
     shift
 
-    if ! jj log -r "$revset" --no-graph -T'change_id.short()++"\n"' >/dev/null 2>&1; then
+    local change_id
+    change_id=$(jj log -r "$revset" --no-graph -T'change_id.short()' 2>/dev/null) || {
         preferr "revset '$revset' not found"
         exit 1
-    fi
+    }
 
     check_jjq
 
@@ -132,6 +167,15 @@ cmd_push() {
     queue_bookmark="$(printf "jjq/queue/%06d" "$id")"
 
     run_quiet jj bookmark create -r "$revset" "$queue_bookmark"
+
+    # Log the operation (edit the commit created by next_id)
+    log_op "$jjq_bookmark" "push: queued $revset at $id" \
+        "Operation: push" \
+        "Sequence-Id: $id" \
+        "Revset: $revset" \
+        "Change-Id: $change_id" \
+        "Timestamp: $(timestamp)"
+
     prefout "revision '$revset' queued at $id"
 }
 
@@ -172,9 +216,15 @@ cmd_run() {
         run_quiet jj bookmark delete "jjq/queue/$id"
         run_quiet jj bookmark create -r "${run_name}@" "jjq/failed/$id"
         run_quiet jj desc -m "Failed: merge $id (conflicts)"
+        popd >/dev/null
+        # Log the failure
+        log_op "" "run: failed $id (conflicts)" \
+            "Operation: run" \
+            "Sequence-Id: $((10#$id))" \
+            "Result: conflict" \
+            "Timestamp: $(timestamp)"
         preferr "merge $id has conflicts, marked as failed"
         preferr "workspace remains: $runner_workspace"
-        popd >/dev/null
         # Keep workspace for debugging, but release lock
         trap - EXIT
         jj bookmark delete "$lock" >/dev/null 2>&1
@@ -192,9 +242,16 @@ cmd_run() {
         run_quiet jj bookmark delete "jjq/queue/$id"
         run_quiet jj bookmark create -r "${run_name}@" "jjq/failed/$id"
         run_quiet jj desc -m "Failed: merge $id (check)"
+        popd >/dev/null
+        # Log the failure
+        log_op "" "run: failed $id (check)" \
+            "Operation: run" \
+            "Sequence-Id: $((10#$id))" \
+            "Result: check-failed" \
+            "Check-Command: $CHECK_COMMAND" \
+            "Timestamp: $(timestamp)"
         preferr "merge $id check failed"
         preferr "workspace remains: $runner_workspace"
-        popd >/dev/null
         # Keep workspace for debugging, but release lock
         trap - EXIT
         jj bookmark delete "$lock" >/dev/null 2>&1
@@ -207,6 +264,14 @@ cmd_run() {
     run_quiet jj bookmark move "$TRUNK_BOOKMARK"
     popd >/dev/null
     run_quiet jj workspace forget "$run_name"
+
+    # Log the success
+    log_op "" "run: success $id" \
+        "Operation: run" \
+        "Sequence-Id: $((10#$id))" \
+        "Result: success" \
+        "Check-Command: $CHECK_COMMAND" \
+        "Timestamp: $(timestamp)"
 
     # Explicit cleanup (trap is backup for unexpected exits)
     jj bookmark delete "$lock" >/dev/null 2>&1
@@ -333,6 +398,18 @@ cmd_retry() {
     queue_bookmark="$(printf "jjq/queue/%06d" "$new_id")"
 
     run_quiet jj bookmark create -r "$candidate_revset" "$queue_bookmark"
+
+    # Log the operation (edit the commit created by next_id)
+    local change_id
+    change_id=$(jj log -r "$candidate_revset" --no-graph -T'change_id.short()' 2>/dev/null) || true
+    log_op "$jjq_bookmark" "retry: requeued $id as $new_id" \
+        "Operation: retry" \
+        "Original-Id: $id" \
+        "Sequence-Id: $new_id" \
+        "Revset: $candidate_revset" \
+        "Change-Id: $change_id" \
+        "Timestamp: $(timestamp)"
+
     prefout "revision queued at $new_id"
 }
 
@@ -348,18 +425,28 @@ cmd_delete() {
 
     local queue_bookmark="jjq/queue/$padded_id"
     local failed_bookmark="jjq/failed/$padded_id"
+    local item_type=""
 
     # Check queue first, then failed
     if [ -n "$(jj bookmark list -r "bookmarks(exact:$queue_bookmark)" -T name 2>/dev/null)" ]; then
         run_quiet jj bookmark delete "$queue_bookmark"
+        item_type="queued"
         prefout "deleted queued item $id"
     elif [ -n "$(jj bookmark list -r "bookmarks(exact:$failed_bookmark)" -T name 2>/dev/null)" ]; then
         run_quiet jj bookmark delete "$failed_bookmark"
+        item_type="failed"
         prefout "deleted failed item $id"
     else
         preferr "item $id not found in queue or failed"
         exit 1
     fi
+
+    # Log the operation
+    log_op "" "delete: removed $item_type item $id" \
+        "Operation: delete" \
+        "Sequence-Id: $id" \
+        "Item-Type: $item_type" \
+        "Timestamp: $(timestamp)"
 }
 
 case "$cmd" in
