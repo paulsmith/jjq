@@ -144,14 +144,12 @@ cmd_run() {
     # can process the queue at a time. This lets us avoid trying a cross-platform
     # file locking mechanism and keep it contained to jj.
     if ! jj bookmark create -r "$jjq_bookmark" "$lock" >/dev/null 2>&1; then
-        # TODO: try to get the lock holder's PID from metadata somehow
         preferr "queue runner lock already held"
         exit 1
     fi
 
-    trap "jj bookmark delete $lock >/dev/null 2>&1" EXIT
-
-    # TODO: record this PID as metadata for the run somehow
+    # shellcheck disable=SC2064 # Intentional: capture vars now
+    trap "jj bookmark delete $lock >/dev/null 2>&1; rm -rf $runner_workspace" EXIT
 
     # Create a workspace to attempt the merge, with a new commit for the
     # merge-to-be with two parents: the trunk and the candidate revision
@@ -166,6 +164,9 @@ cmd_run() {
         preferr "merge $id has conflicts, marked as failed"
         preferr "workspace remains: $runner_workspace"
         popd
+        # Keep workspace for debugging, but release lock
+        trap - EXIT
+        jj bookmark delete "$lock" >/dev/null 2>&1
         exit 1
     fi
 
@@ -178,17 +179,23 @@ cmd_run() {
         preferr "merge $id check failed"
         preferr "workspace remains: $runner_workspace"
         popd
+        # Keep workspace for debugging, but release lock
+        trap - EXIT
+        jj bookmark delete "$lock" >/dev/null 2>&1
         exit 1
-    else
-        jj bookmark delete "jjq/queue/$id"
-        jj desc -m "Success: merge $id"
-        jj bookmark move "$TRUNK_BOOKMARK"
-        popd
-        jj workspace forget "$run_name"
-        rm -rf "$runner_workspace"
     fi
 
-    jj bookmark delete "$lock"
+    # Success path
+    jj bookmark delete "jjq/queue/$id"
+    jj desc -m "Success: merge $id"
+    jj bookmark move "$TRUNK_BOOKMARK"
+    popd
+    jj workspace forget "$run_name"
+
+    # Explicit cleanup (trap is backup for unexpected exits)
+    jj bookmark delete "$lock" >/dev/null 2>&1
+    trap - EXIT
+    rm -rf "$runner_workspace"
 }
 
 cmd_status() {
