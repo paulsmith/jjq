@@ -137,37 +137,50 @@ shift
 
 jjq_bookmark="jjq/_/_"
 
-check_jjq() {
-    if [ -z "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name)" ]; then
-        local change_id
-        change_id="$(jj new --no-edit 'root()' 2>&1 | cut -f4 -d' ')"
-        run_quiet jj bookmark create -r "$change_id" "$jjq_bookmark"
-        local d
-        d=$(mktemp -d)
-        # shellcheck disable=SC2064 # Intentional: capture $d now
-        trap "rm -rf $d" EXIT
-        run_quiet jj workspace add -r "$jjq_bookmark" --name jjq "$d"
-        pushd "$d" >/dev/null
-        echo 0 > last_id
-        run_quiet jj desc -m "init jjq"
-        run_quiet jj squash
-        popd >/dev/null
-        run_quiet jj workspace forget jjq
+# Pure check - returns 0 if initialized, 1 if not
+# No side effects, safe to call anywhere
+jjq_is_initialized() {
+    [ -n "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name 2>/dev/null)" ]
+}
 
-        if [ ! -f .jj/repo/config.toml ]; then
-            if [ -z "${NON_INTERACTIVE-}" ]; then
-                echo "Welcome to jjq"
-                echo -n "Configure \`jj log\` to hide jjq metadata? "
-                read -n1 -p '(y/N) ' -r answer
-                echo
-                if [[ $answer == [yY] ]]; then
-                    cat > .jj/repo/config.toml <<-EOF
-						[revsets]
-						log = '~ ::${jjq_bookmark}'
-					EOF
-                fi
-            fi
-        fi
+# Idempotent initialization - safe to call multiple times
+# Creates jjq branch structure if missing
+ensure_jjq() {
+    jjq_is_initialized && return 0
+
+    local change_id
+    change_id="$(jj new --no-edit 'root()' 2>&1 | cut -f4 -d' ')"
+    run_quiet jj bookmark create -r "$change_id" "$jjq_bookmark"
+
+    local d
+    d=$(mktemp -d)
+    # shellcheck disable=SC2064 # Intentional: capture $d now
+    trap "rm -rf $d" EXIT
+    run_quiet jj workspace add -r "$jjq_bookmark" --name jjq "$d"
+    pushd "$d" >/dev/null
+    echo 0 > last_id
+    run_quiet jj desc -m "init jjq"
+    run_quiet jj squash
+    popd >/dev/null
+    run_quiet jj workspace forget jjq
+    rm -rf "$d"
+    trap - EXIT
+}
+
+# Prompt user to configure jj log filter (first-time setup)
+maybe_configure_log_filter() {
+    [ -f .jj/repo/config.toml ] && return
+    [ -n "${NON_INTERACTIVE-}" ] && return
+
+    echo "Welcome to jjq"
+    echo -n "Configure \`jj log\` to hide jjq metadata? "
+    read -n1 -p '(y/N) ' -r answer
+    echo
+    if [[ $answer == [yY] ]]; then
+        cat > .jj/repo/config.toml <<-EOF
+			[revsets]
+			log = '~ ::${jjq_bookmark}'
+		EOF
     fi
 }
 
@@ -216,7 +229,15 @@ cmd_push() {
         exit 1
     }
 
-    check_jjq
+    local was_initialized
+    jjq_is_initialized && was_initialized=true || was_initialized=false
+
+    ensure_jjq
+
+    # First-time setup prompt (only on initial push)
+    if [ "$was_initialized" = false ]; then
+        maybe_configure_log_filter
+    fi
 
     local id
     id="$(next_id)"
@@ -245,7 +266,7 @@ cmd_run() {
     fi
     prefout "processing queue item $id"
 
-    check_jjq
+    ensure_jjq
 
     # Get config values
     local trunk_bookmark check_command
@@ -344,9 +365,8 @@ cmd_run() {
 }
 
 cmd_status() {
-    # Check if jjq is initialized
-    if [ -z "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name 2>/dev/null)" ]; then
-        prefout "jjq not initialized (push a revision on to the queue to initialize)"
+    if ! jjq_is_initialized; then
+        prefout "jjq not initialized (run 'jjq push <revset>' to start)"
         return
     fi
 
@@ -455,7 +475,7 @@ cmd_retry() {
     run_quiet jj bookmark delete "$failed_bookmark"
 
     # Push the candidate to the queue using next_id
-    check_jjq
+    ensure_jjq
 
     local new_id
     new_id="$(next_id)"
@@ -515,7 +535,7 @@ cmd_delete() {
 }
 
 cmd_config() {
-    check_jjq
+    ensure_jjq
 
     if [ $# -eq 0 ]; then
         # Show all config
@@ -570,7 +590,7 @@ cmd_config() {
 }
 
 cmd_clean() {
-    check_jjq
+    ensure_jjq
 
     if [ $# -eq 0 ]; then
         # Show what would be cleaned
@@ -669,8 +689,7 @@ cmd_clean() {
 }
 
 cmd_log() {
-    # Check if jjq is initialized
-    if [ -z "$(jj bookmark list -r "bookmarks(exact:${jjq_bookmark})" -T name 2>/dev/null)" ]; then
+    if ! jjq_is_initialized; then
         prefout "jjq not initialized"
         return
     fi
