@@ -3,7 +3,6 @@ set -euo pipefail
 
 # Defaults per spec - can be overridden via jjq config
 DEFAULT_TRUNK_BOOKMARK="main"
-DEFAULT_CHECK_COMMAND="sh -c 'exit 1'"
 DEFAULT_MAX_FAILURES=3
 
 err() {
@@ -108,11 +107,41 @@ get_trunk_bookmark() {
 }
 
 get_check_command() {
-    get_config "check_command" "$DEFAULT_CHECK_COMMAND"
+    get_config "check_command" ""
 }
 
 get_max_failures() {
     get_config "max_failures" "$DEFAULT_MAX_FAILURES"
+}
+
+# Validate and normalize a sequence ID from user input
+# Returns the zero-padded ID on success, exits with error on failure
+validate_seq_id() {
+    local input="$1"
+
+    # Check for empty input
+    if [ -z "$input" ]; then
+        preferr "invalid sequence ID: empty"
+        return 1
+    fi
+
+    # Check for non-numeric characters (only digits allowed)
+    if ! [[ "$input" =~ ^[0-9]+$ ]]; then
+        preferr "invalid sequence ID: '$input' (must be numeric)"
+        return 1
+    fi
+
+    # Convert to integer (strips leading zeros)
+    local id=$((10#$input))
+
+    # Check range
+    if [ "$id" -lt 1 ] || [ "$id" -gt 999999 ]; then
+        preferr "invalid sequence ID: $id (must be 1-999999)"
+        return 1
+    fi
+
+    # Return zero-padded form
+    printf "%06d" "$id"
 }
 
 usage() {
@@ -267,9 +296,19 @@ cmd_run() {
     trunk_bookmark=$(get_trunk_bookmark)
     check_command=$(get_check_command)
 
+    if [ -z "$check_command" ]; then
+        preferr "check_command not configured (use 'jjq config check_command <cmd>')"
+        exit 1
+    fi
+
+    # Record trunk commit ID to detect if it moves during run
+    local trunk_commit_id
+    trunk_commit_id=$(jj log -r "bookmarks(exact:$trunk_bookmark)" --no-graph -T'commit_id')
+
     local runner_workspace
     runner_workspace=$(mktemp -d)
-    local run_name="jjq/run/$id"
+    local run_name
+    run_name=$(printf "jjq-run-%06d" "$((10#$id))")
     local lock="jjq/lock/run"
 
     # We use jj bookmarks to take out a global run lock, since only one runner
@@ -334,6 +373,22 @@ cmd_run() {
         # Keep workspace for debugging, but release lock
         trap - EXIT
         jj bookmark delete "$lock" >/dev/null 2>&1
+        exit 1
+    fi
+
+    # Verify trunk hasn't moved during the run
+    local current_trunk_commit_id
+    current_trunk_commit_id=$(jj log -r "bookmarks(exact:$trunk_bookmark)" --no-graph -T'commit_id')
+    if [ "$trunk_commit_id" != "$current_trunk_commit_id" ]; then
+        popd >/dev/null
+        # Clean up workspace (this isn't a failure to debug)
+        run_quiet jj workspace forget "$run_name"
+        rm -rf "$runner_workspace"
+        # Release lock
+        jj bookmark delete "$lock" >/dev/null 2>&1
+        trap - EXIT
+        # Leave queue item in place for retry
+        preferr "trunk bookmark moved during run; queue item left in place, re-run to retry"
         exit 1
     fi
 
@@ -419,7 +474,7 @@ cmd_retry() {
     local id="$1"
     shift
     local padded_id
-    padded_id=$(printf "%06d" "$id")
+    padded_id=$(validate_seq_id "$id") || exit 1
     local failed_bookmark="jjq/failed/$padded_id"
 
     # Check if the failed bookmark exists
@@ -438,35 +493,22 @@ cmd_retry() {
         fi
         prefout "retrying failed item $id using '$candidate_revset'"
     else
-        # Get the second parent (the original candidate) of the failed merge
+        # Find the original candidate: the parent of the failed merge that
+        # is not an ancestor of trunk. This is more robust than relying on
+        # parent ordering.
+        local trunk_bookmark
+        trunk_bookmark=$(get_trunk_bookmark)
         local original_candidate
-        original_candidate=$(jj log -r "$failed_bookmark" --no-graph -T'parents.map(|p| p.change_id().short()).join(" ")' | cut -d' ' -f2)
+        original_candidate=$(jj log -r "parents($failed_bookmark) ~ ::$trunk_bookmark" --no-graph -T'change_id.short()' 2>/dev/null | head -1)
 
         if [ -z "$original_candidate" ]; then
             preferr "could not find original candidate for failed item $id"
             exit 1
         fi
 
-        # Find user bookmarks that were on the original candidate
-        # (bookmarks that are not jjq-namespaced)
-        local user_bookmarks
-        user_bookmarks=$(jj log -r "$original_candidate" --no-graph -T'bookmarks' | tr ' ' '\n' | grep -v '^jjq/' | grep -v '^$' || true)
-
-        if [ -n "$user_bookmarks" ]; then
-            # Use the first user bookmark found
-            local bookmark
-            bookmark=$(echo "$user_bookmarks" | head -1)
-            candidate_revset="bookmarks(exact:$bookmark)"
-            prefout "retrying failed item $id using bookmark '$bookmark'"
-        else
-            # No user bookmark found, use the original candidate directly
-            candidate_revset="$original_candidate"
-            prefout "retrying failed item $id using original candidate $original_candidate"
-        fi
+        candidate_revset="$original_candidate"
+        prefout "retrying failed item $id using original candidate $original_candidate"
     fi
-
-    # Delete the failed bookmark
-    run_quiet jj bookmark delete "$failed_bookmark"
 
     # Push the candidate to the queue using next_id
     ensure_jjq
@@ -477,6 +519,9 @@ cmd_retry() {
     queue_bookmark="$(printf "jjq/queue/%06d" "$new_id")"
 
     run_quiet jj bookmark create -r "$candidate_revset" "$queue_bookmark"
+
+    # Delete the failed bookmark only after queue entry exists
+    run_quiet jj bookmark delete "$failed_bookmark"
 
     # Log the operation (edit the commit created by next_id)
     local change_id
@@ -502,7 +547,7 @@ cmd_delete() {
 
     local id="$1"
     local padded_id
-    padded_id=$(printf "%06d" "$id")
+    padded_id=$(validate_seq_id "$id") || exit 1
 
     local queue_bookmark="jjq/queue/$padded_id"
     local failed_bookmark="jjq/failed/$padded_id"
@@ -535,8 +580,10 @@ cmd_config() {
 
     if [ $# -eq 0 ]; then
         # Show all config
+        local cc
+        cc=$(get_check_command)
         echo "trunk_bookmark = $(get_trunk_bookmark)"
-        echo "check_command = $(get_check_command)"
+        echo "check_command = ${cc:-(not set)}"
         echo "max_failures = $(get_max_failures)"
         return
     fi

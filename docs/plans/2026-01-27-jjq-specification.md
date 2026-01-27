@@ -62,6 +62,8 @@ implementations rely on the following jj features:
 - Workspaces
 - The `-T` / `--template` option for machine-readable output
 - The `root()` revset function
+- First-class conflict objects (conflicts stored in tree, queryable
+  via the `conflict` template keyword)
 
 Implementations SHOULD verify that the available `jj` command supports
 these features and report an error if it does not.
@@ -86,9 +88,11 @@ Git branches), which treats `/` as directory separators.
 |----------|----------------------------------|--------------------------|
 | `queue`  | Queued merge candidates          | Zero-padded sequence ID  |
 | `failed` | Failed merge attempts            | Zero-padded sequence ID  |
-| `run`    | Active merge workspace           | Zero-padded sequence ID  |
 | `lock`   | Mutex-style locks                | Lock name                |
 | `_`      | Metadata branch head             | `_` (literal underscore) |
+
+Note: Workspace names use a different pattern (`jjq-run-<padded-id>`) to
+avoid confusion with bookmarks. See §Workspaces for details.
 
 #### Sequence ID Encoding
 
@@ -96,11 +100,33 @@ Sequence IDs in bookmark names MUST be zero-padded to exactly 6 digits.
 Valid range: `000001` to `999999`. The value `000000` is reserved and
 MUST NOT appear in bookmark names.
 
+#### Sequence ID Parsing
+
+When accepting sequence IDs as command arguments (e.g., `retry <id>`,
+`delete <id>`), implementations MUST:
+
+1. Accept only strings consisting entirely of ASCII decimal digits (`0-9`)
+2. Reject empty strings, negative numbers, and non-numeric input
+3. Interpret the value as a decimal integer (leading zeros are permitted
+   and ignored, so `000001`, `01`, and `1` all refer to ID 1)
+4. Reject values outside the valid range (less than 1 or greater than 999999)
+
+On parse failure, implementations MUST exit with code 1 and output an
+error message indicating the invalid ID.
+
+#### Sequence ID Display
+
+When displaying sequence IDs to users (e.g., in status output, confirmation
+messages), implementations SHOULD use the unpadded decimal form (e.g., `1`
+not `000001`) for readability. The zero-padded form is only required in
+bookmark names.
+
 Examples of valid bookmarks:
 - `jjq/queue/000001` - First queued item
 - `jjq/failed/000042` - Failed item 42
-- `jjq/run/000007` - Active run for item 7
 - `jjq/lock/run` - Queue runner lock
+- `jjq/lock/id` - Sequence ID lock
+- `jjq/lock/config` - Configuration lock
 - `jjq/_/_` - Metadata branch head
 
 ### Metadata Branch
@@ -150,13 +176,26 @@ Configuration values are stored as individual files under `config/`.
 Each file contains the configuration value as plain text (single line,
 no trailing newline required but permitted).
 
+Initialization MUST NOT create config files. A missing config file means
+the default value applies. Implementations MUST NOT pre-populate config
+files with default values; files are only created when the user explicitly
+sets a value via the `config` command.
+
+When reading configuration, implementations MUST:
+1. Attempt to read `config/<key>` from the metadata branch
+2. If the file exists, use its contents as the value
+3. If the file does not exist, use the default value (if any)
+
 Defined configuration keys:
 
-| Key              | Default          | Description                        |
-|------------------|------------------|------------------------------------|
-| `trunk_bookmark` | `main`           | Bookmark designating trunk         |
-| `check_command`  | `sh -c 'exit 1'` | Command to validate merge-to-be    |
-| `max_failures`   | `3`              | Recent failures shown in status    |
+| Key              | Default   | Description                        |
+|------------------|-----------|-------------------------------------|
+| `trunk_bookmark` | `main`    | Bookmark designating trunk          |
+| `check_command`  | (none)    | Command to validate merge-to-be     |
+| `max_failures`   | `3`       | Recent failures shown in status     |
+
+The `check_command` key has no default. If unconfigured, the `run` command
+MUST fail with an error indicating that configuration is required.
 
 ---
 
@@ -317,27 +356,45 @@ Process the next item in the queue.
 3. Acquire the run lock. If unavailable, MUST fail with exit code 1.
 4. Acquire the config lock, read `trunk_bookmark` and `check_command`,
    then release the config lock.
-5. Create a temporary workspace outside the repository working copy.
-6. Create a merge revision in the workspace with two parents:
-   - Parent 1: The revision at the trunk bookmark
-   - Parent 2: The queued revision (`jjq/queue/<id>`)
-7. Check for conflicts in the merge revision. If conflicts exist:
+5. Create a temporary workspace directory outside the repository working copy.
+6. Record the current trunk revision (commit ID) for later verification.
+7. Create a jj workspace named `jjq-run-<padded-id>` at that directory,
+   with a new merge revision having two parents in this order:
+   - Parent 1 (first): The revision at the trunk bookmark
+   - Parent 2 (second): The queued revision (`jjq/queue/<id>`)
+
+   This parent ordering is REQUIRED; the `retry` command depends on it
+   to identify the original candidate revision from a failed merge.
+
+   The merge revision is the working copy of this workspace and can be
+   referenced as `jjq-run-<padded-id>@` in revsets.
+8. Check for conflicts in the merge revision. A revision has conflicts
+   if its tree contains conflict objects (in jj terms, the `conflict`
+   template keyword evaluates to true). If conflicts exist:
    - Delete `jjq/queue/<id>`
    - Create `jjq/failed/<id>` pointing to the merge revision
    - Output error message including workspace path
    - Release run lock
    - Exit with code 1 (workspace is NOT deleted)
-8. Execute the configured check command in the workspace.
-9. If check exits non-zero:
-   - Delete `jjq/queue/<id>`
-   - Create `jjq/failed/<id>` pointing to the merge revision
-   - Output check failure message and workspace path
-   - Release run lock
-   - Exit with code 1 (workspace is NOT deleted)
-10. On success:
+9. Execute the configured check command in the workspace.
+10. If check exits non-zero:
     - Delete `jjq/queue/<id>`
-    - Move trunk bookmark to the merge revision
-    - Delete the temporary workspace
+    - Create `jjq/failed/<id>` pointing to the merge revision
+    - Output check failure message and workspace path
+    - Release run lock
+    - Exit with code 1 (workspace is NOT deleted)
+11. Verify trunk bookmark still points to the same revision recorded in
+    step 6. If trunk has moved:
+    - Leave `jjq/queue/<id>` in place (do NOT delete it)
+    - Forget the workspace and delete the workspace directory
+    - Release run lock
+    - Output error message indicating trunk moved during run
+    - Exit with code 1
+12. On success:
+    - Delete `jjq/queue/<id>`
+    - Move trunk bookmark to the merge revision (`jjq-run-<padded-id>@`)
+    - Forget the workspace (`jj workspace forget jjq-run-<padded-id>`)
+    - Delete the temporary workspace directory
     - Release run lock
     - Exit with code 0
 
@@ -345,10 +402,12 @@ Process the next item in the queue.
 
 | Condition                          | Exit Code |
 |------------------------------------|-----------|
+| check_command not configured       | 1         |
 | Run lock unavailable               | 1         |
 | Config lock unavailable            | 1         |
 | Merge has conflicts                | 1         |
 | Check command exits non-zero       | 1         |
+| Trunk moved during run             | 1         |
 
 #### Workspace Behavior
 
@@ -371,6 +430,24 @@ On success, the workspace MUST be removed.
   and displayed on failure.
 - The trunk bookmark is only moved after successful completion of
   all steps. A failure at any point leaves trunk unchanged.
+- If trunk moves during a run (e.g., user manually advances it), the
+  queue item is left in place and the user can simply re-run. This
+  avoids discarding commits that were added to trunk during the run.
+
+#### Merge Revision Lifecycle
+
+The merge revision created in step 7 is a proper merge commit with two
+parents (trunk and candidate). This parentage applies regardless of
+whether the run succeeds or fails:
+
+- **On success**: The merge revision becomes the new trunk head.
+- **On failure**: The merge revision remains in the DAG as a side branch.
+  The `jjq/failed/<id>` bookmark pointing to it prevents garbage collection,
+  allowing users to inspect it for debugging.
+
+The merge revision is NOT parented to `root()` - it is part of the
+repository's normal commit history, just not reachable from trunk
+until/unless it succeeds.
 
 ---
 
@@ -443,14 +520,12 @@ Retry a failed merge attempt by re-queuing it.
 3. If `[revset]` is omitted:
    - Examine the failed merge revision's parents.
    - The second parent is the original candidate revision.
-   - If a user bookmark (non-jjq-namespaced) exists on that revision,
-     use the bookmark as the revset.
-   - Otherwise, use the change ID directly.
-4. Delete `jjq/failed/<padded-id>`.
-5. Acquire the sequence ID lock.
-6. Obtain the next sequence ID.
-7. Release the sequence ID lock.
-8. Create bookmark `jjq/queue/<new-padded-id>` pointing to the candidate.
+   - Use this as the candidate revision.
+4. Acquire the sequence ID lock.
+5. Obtain the next sequence ID.
+6. Release the sequence ID lock.
+7. Create bookmark `jjq/queue/<new-padded-id>` pointing to the candidate.
+8. Delete `jjq/failed/<padded-id>` (only after queue entry exists).
 9. Output confirmation including the new sequence ID.
 10. Exit with code 0.
 
@@ -469,6 +544,10 @@ Retry a failed merge attempt by re-queuing it.
 - Retries always receive a new sequence ID, placing them at the end of
   the queue.
 - Retries never happen automatically; user intent is always required.
+- The retry logic depends on the parent ordering established by the `run`
+  command (trunk is parent 1, candidate is parent 2). Implementations MAY
+  alternatively identify the candidate as the parent not reachable from
+  trunk using a revset like `parents(<failed>) ~ ::<trunk>`.
 
 ---
 
@@ -590,6 +669,11 @@ TK TK
 jjq uses jj workspaces for operations that require a working copy:
 modifying the metadata branch and executing merge checks.
 
+Note that the workspace name in a jj sense is a bookmark-like identification of
+a working copy and its revisions. This is different than the directory name in
+the file path of the working copy in a filesystem. Take care to distinguish the
+two.
+
 ### Temporary Workspaces
 
 Workspaces created by jjq MUST be located outside the repository's
@@ -603,8 +687,9 @@ workspace directories.
 ### Workspace Naming
 
 Workspaces created for queue runs MUST use the naming pattern
-`jjq/run/<padded-id>` where the ID corresponds to the queue item
-being processed.
+`jjq-run-<padded-id>` where the ID corresponds to the queue item
+being processed. This pattern uses hyphens rather than slashes to
+distinguish workspace names from jjq bookmark names.
 
 Workspaces for other operations (config changes, sequence ID updates)
 SHOULD use names that include the process ID or other unique identifier
@@ -614,18 +699,24 @@ to avoid collisions with concurrent operations.
 
 | Operation      | On Success          | On Failure                    |
 |----------------|---------------------|-------------------------------|
-| Queue run      | Delete workspace    | Preserve for debugging        |
-| Config change  | Delete workspace    | Delete workspace              |
-| Sequence ID    | Delete workspace    | Delete workspace              |
+| Queue run      | Forget and delete   | Preserve (keep registered)    |
+| Config change  | Forget and delete   | Forget and delete             |
+| Sequence ID    | Forget and delete   | Forget and delete             |
 
 When a workspace is preserved on failure, its path MUST be communicated
 to the user via stderr.
 
 ### Workspace Cleanup
 
-Implementations MUST call `jj workspace forget` for temporary workspaces
+For workspaces being removed, implementations MUST call `jj workspace forget`
 before or after removing the filesystem directory, to prevent stale
 workspace entries in jj's workspace list.
+
+For preserved workspaces (failed queue runs), implementations MUST NOT call
+`jj workspace forget`. Keeping the workspace registered allows users to
+inspect the failed merge using jj commands (e.g., `jj log -r 'jjq-run-000001@'`
+or `jj diff -r 'jjq-run-000001@'`). Users can manually forget and remove
+the workspace after debugging.
 
 ---
 
