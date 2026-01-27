@@ -492,7 +492,6 @@ An uninitialized repository is not an error.
 
 - Status is read-only except for the config lock acquisition.
 - Status is intended as a quick overview, not a comprehensive history.
-  Users requiring full history should use the `log` command.
 
 ---
 
@@ -583,7 +582,7 @@ Remove an item from the queue or failed list.
 - Delete checks the queue first, then failed. An ID cannot exist in
   both simultaneously under normal operation.
 - Deleting a failed item does NOT clean up its associated workspace
-  (if any). Use `clean` for that.
+  (if any).
 - Delete does not require any locks; bookmark deletion is atomic in jj.
 
 ---
@@ -775,12 +774,10 @@ in this document.
 - `run` command
 - `status` command
 - `delete` command
+- `config` command
+- `retry` command
 - All bookmark conventions
 - All locking requirements
-
-Minimally conforming implementations MAY omit `retry`, `config`, `clean`,
-and `log` commands, using hardcoded defaults where configuration would
-otherwise apply.
 
 ### Interoperability Requirements
 
