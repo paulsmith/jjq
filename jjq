@@ -580,8 +580,8 @@ cmd_config() {
         set_config "$key" "$value"
         prefout "$key = $value"
 
-        # Log the config change
-        log_op "" "config: set $key" \
+        # Log the config change (edit existing commit, don't create new one)
+        log_op "$jjq_bookmark" "config: set $key" \
             "Operation: config" \
             "Key: $key" \
             "Value: $value" \

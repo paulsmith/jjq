@@ -304,3 +304,13 @@ for information, jjq commands use the templating option that most `jj`
 subcommands support, especially `jj log -T'...'`. This allows jjq to control
 the "shape" of the output for textual processing and not be broken by small
 version-to-version formatting changes in `jj`'s default human-friendly outputs.
+
+### Conforming implementation behaviors
+
+The following behaviors are required for conforming jjq implementations:
+
+  - When an operation modifies the jjq metadata branch (e.g., config changes,
+    push, etc.), the implementation must not create empty commits. If a
+    workspace operation creates a commit with actual file changes, subsequent
+    log operations should edit that existing commit rather than creating a new
+    empty child commit.
