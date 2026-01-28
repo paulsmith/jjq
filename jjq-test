@@ -334,6 +334,112 @@ cmd_verify() {
         ((errors++))
     fi
 
+    # Test push conflict rejection with correct exit code
+    # Branch from root() so the revision diverges from main on main.go
+    echo "Testing push conflict rejection..."
+    jj new 'root()' -m "conflicting change" >/dev/null 2>&1
+    echo 'package main; func main() {}' > main.go
+    local conflict_rev
+    conflict_rev=$(jj log -r @ --no-graph -T'change_id.short()')
+    local push_exit=0
+    jjq push "$conflict_rev" 2>/dev/null || push_exit=$?
+    if [ $push_exit -eq 1 ]; then
+        echo "PASS: push rejects conflicting revision with exit code 1"
+    else
+        echo "FAIL: push conflict returned exit code $push_exit, expected 1"
+        ((errors++))
+    fi
+    jj abandon >/dev/null 2>&1
+    jj new main >/dev/null 2>&1
+
+    # Test retry conflict rejection
+    echo "Testing retry conflict rejection..."
+    # Create a clean revision, push it, manually fail it, then try to retry with a conflicting rev
+    jj new main -m "will-fail item" >/dev/null 2>&1
+    echo '# test' >> README.md
+    local test_rev
+    test_rev=$(jj log -r @ --no-graph -T'change_id.short()')
+    jjq push "$test_rev" >/dev/null 2>&1
+    local test_id
+    test_id=$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/queue/[0-9]{6}$' | cut -f3 -d'/' | sort -n | tail -1)
+    # Manually move from queue to failed
+    jj bookmark create -r "bookmarks(exact:jjq/queue/$test_id)" "jjq/failed/$test_id" >/dev/null 2>&1
+    jj bookmark delete "jjq/queue/$test_id" >/dev/null 2>&1
+
+    # Create a conflicting revision branched from root() (diverges from main)
+    jj new 'root()' -m "retry-conflict" >/dev/null 2>&1
+    echo 'package main; func main() {}' > main.go
+    local retry_conflict_rev
+    retry_conflict_rev=$(jj log -r @ --no-graph -T'change_id.short()')
+    local retry_exit=0
+    jjq retry "$((10#$test_id))" "$retry_conflict_rev" 2>/dev/null || retry_exit=$?
+    if [ $retry_exit -eq 1 ]; then
+        echo "PASS: retry rejects conflicting revision with exit code 1"
+    else
+        echo "FAIL: retry conflict returned exit code $retry_exit, expected 1"
+        ((errors++))
+    fi
+    # Clean up: delete the failed item and abandon the conflicting rev
+    jj abandon >/dev/null 2>&1
+    jjq delete "$((10#$test_id))" >/dev/null 2>&1
+    jj new main >/dev/null 2>&1
+
+    # Test run --all continues past check failures
+    echo "Testing run --all continues past failures..."
+    # Push two clean revisions
+    jj new main -m "batch-item-1" >/dev/null 2>&1
+    echo '# batch1' >> README.md
+    local batch1_rev
+    batch1_rev=$(jj log -r @ --no-graph -T'change_id.short()')
+    jjq push "$batch1_rev" >/dev/null 2>&1
+
+    jj new main -m "batch-item-2" >/dev/null 2>&1
+    echo '# batch2' >> README.md
+    local batch2_rev
+    batch2_rev=$(jj log -r @ --no-graph -T'change_id.short()')
+    jjq push "$batch2_rev" >/dev/null 2>&1
+
+    # Set check to always fail and verify both items get processed
+    jjq config check_command "sh -c 'exit 1'" >/dev/null 2>&1
+    local batch_output
+    batch_output=$(jjq run --all 2>&1) || true
+
+    # Restore check command
+    jjq config check_command "make" >/dev/null 2>&1
+
+    # Both items should have been attempted (run --all continues past failures)
+    # Count how many "failed check" messages appear
+    local fail_count
+    fail_count=$(echo "$batch_output" | grep -c "failed check" || true)
+    if [ "$fail_count" -ge 2 ]; then
+        echo "PASS: run --all processed both items despite failures ($fail_count failed)"
+    else
+        echo "FAIL: run --all should process both items, but only $fail_count failure(s) reported"
+        echo "  output: $batch_output"
+        ((errors++))
+    fi
+
+    # Clean up failed items
+    jjq clean >/dev/null 2>&1
+    local remaining_failed
+    remaining_failed=$(jj bookmark list -r 'bookmarks(glob:"jjq/failed/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/failed/[0-9]{6}$' || true)
+    for fb in $remaining_failed; do
+        local fid="${fb##*/}"
+        jjq delete "$((10#$fid))" >/dev/null 2>&1
+    done
+    jj new main >/dev/null 2>&1
+
+    # Test usage error exit code
+    echo "Testing usage error exit code..."
+    local usage_exit=0
+    jjq push "nonexistent-revset-xyz" 2>/dev/null || usage_exit=$?
+    if [ $usage_exit -eq 10 ]; then
+        echo "PASS: usage error returns exit code 10"
+    else
+        echo "FAIL: usage error returned exit code $usage_exit, expected 10"
+        ((errors++))
+    fi
+
     # Run tests
     echo "Running tests..."
     if jj edit main >/dev/null 2>&1 || true; then

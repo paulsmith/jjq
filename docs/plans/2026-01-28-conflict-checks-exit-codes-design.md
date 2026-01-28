@@ -1,6 +1,7 @@
 # Pre-flight conflict checks, run --all resilience, and exit codes
 
 Date: 2026-01-28
+Status: Implemented
 
 ## Context
 
@@ -75,19 +76,14 @@ Applied across commands:
 - `cmd_run --all`: exits 0 for full success, uses the first failure code
   encountered if any items failed. Bails immediately on code 3 (lock held).
 
-### 4. Spec updates
+## Implementation notes
 
-SPEC.md must be updated to document:
+Implemented across 4 commits:
 
-- Pre-flight conflict checks on both push and retry.
-- `run --all` continue-past-failure behavior.
-- The exit code table.
-
-## Implementation order
-
-1. Pre-flight conflict check on retry (extract shared helper from push).
-2. Distinct exit codes (define constants, update all return/exit sites).
-3. `run --all` continue past failures (depends on exit codes to distinguish
-   lock-held from merge failures).
-4. Update SPEC.md with all three changes.
-5. Update tests to cover new behavior.
+1. Extracted `preflight_conflict_check` helper from `cmd_push`, called from
+   both `cmd_push` and `cmd_retry`.
+2. Defined exit code constants (`EXIT_CONFLICT`, `EXIT_CHECK_FAILED`,
+   `EXIT_LOCK_HELD`, `EXIT_TRUNK_MOVED`, `EXIT_USAGE`, `_EXIT_QUEUE_EMPTY`)
+   and updated all exit/return sites.
+3. Rewrote `cmd_run --all` to continue past conflict/check failures, bail
+   immediately on lock held, and report summary with merged/failed counts.
