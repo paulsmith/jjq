@@ -336,13 +336,21 @@ Queue a revision for merging to trunk.
 
 1. Resolve `<revset>` to a revision. If it does not resolve to exactly
    one revision, the command MUST fail with exit code 1.
-2. Ensure jjq is initialized.
-3. Acquire the sequence ID lock.
-4. Obtain the next sequence ID.
-5. Release the sequence ID lock.
-6. Create bookmark `jjq/queue/<padded-id>` pointing to the resolved revision.
-7. Output confirmation including the assigned sequence ID.
-8. Exit with code 0.
+2. Perform a pre-flight conflict check:
+   - Create a temporary workspace outside the repository working copy
+   - Create a merge revision with the trunk bookmark and the candidate
+     revision as parents
+   - Check if the merge revision has conflicts
+   - Clean up the temporary workspace (forget and delete)
+   - If conflicts exist, MUST fail with exit code 1 and output an error
+     message indicating the revision conflicts with trunk
+3. Ensure jjq is initialized.
+4. Acquire the sequence ID lock.
+5. Obtain the next sequence ID.
+6. Release the sequence ID lock.
+7. Create bookmark `jjq/queue/<padded-id>` pointing to the resolved revision.
+8. Output confirmation including the assigned sequence ID.
+9. Exit with code 0.
 
 #### Errors
 
@@ -350,6 +358,8 @@ Queue a revision for merging to trunk.
 |------------------------------------|-----------|
 | Revset does not resolve            | 1         |
 | Revset resolves to multiple revs   | 1         |
+| Trunk bookmark does not exist      | 1         |
+| Revision conflicts with trunk      | 1         |
 | Cannot acquire sequence ID lock    | 1         |
 | Sequence ID exhausted (at 999999)  | 1         |
 
@@ -360,6 +370,10 @@ Queue a revision for merging to trunk.
   (jj bookmarks follow change IDs, not commit IDs).
 - Pushing the same revision multiple times is permitted; each push
   receives a distinct sequence ID.
+- The conflict check verifies merge-ability at push time. However, trunk
+  may advance between push and run, so a clean push does not guarantee
+  a clean merge at run time. The check catches conflicts that exist at
+  the moment of pushing.
 
 ---
 

@@ -306,6 +306,36 @@ cmd_push() {
         exit 1
     }
 
+    # Pre-flight conflict check: verify revision merges cleanly with trunk
+    local trunk_bookmark
+    trunk_bookmark=$(get_trunk_bookmark)
+
+    # Verify trunk bookmark exists
+    if ! jj log -r "bookmarks(exact:$trunk_bookmark)" --no-graph -T'""' >/dev/null 2>&1; then
+        preferr "trunk bookmark '$trunk_bookmark' not found"
+        exit 1
+    fi
+
+    local check_workspace check_workspace_name
+    check_workspace=$(mktemp -d)
+    check_workspace_name="jjq-check-$$"
+
+    # Create temporary workspace with merge commit to check for conflicts
+    run_quiet jj workspace add -r "$trunk_bookmark" -r "$revset" --name "$check_workspace_name" "$check_workspace"
+
+    local has_conflicts
+    has_conflicts=$(jj log -r "${check_workspace_name}@" --no-graph -T'if(conflict, "yes")')
+
+    # Clean up temporary workspace
+    run_quiet jj workspace forget "$check_workspace_name"
+    rm -rf "$check_workspace"
+
+    if [ -n "$has_conflicts" ]; then
+        preferr "revision '$revset' conflicts with $trunk_bookmark"
+        preferr "rebase onto $trunk_bookmark and resolve conflicts before pushing"
+        exit 1
+    fi
+
     ensure_jjq
 
     local id
