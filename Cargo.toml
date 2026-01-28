@@ -12,3 +12,8 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tempfile = "3"
 regex = "1"
+
+[dev-dependencies]
+insta = { version = "1", features = ["filters"] }
+assert_cmd = "2"
+predicates = "3"
