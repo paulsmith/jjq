@@ -5,6 +5,16 @@ set -euo pipefail
 DEFAULT_TRUNK_BOOKMARK="main"
 DEFAULT_MAX_FAILURES=3
 
+# Exit codes
+EXIT_SUCCESS=0
+EXIT_CONFLICT=1
+EXIT_CHECK_FAILED=2
+EXIT_LOCK_HELD=3
+EXIT_TRUNK_MOVED=4
+EXIT_USAGE=10
+# Internal sentinel (not returned to user)
+_EXIT_QUEUE_EMPTY=99
+
 err() {
     echo "$*" >&2
 }
@@ -25,7 +35,7 @@ init_lock_dir() {
     local repo_root
     repo_root=$(jj root 2>/dev/null) || {
         preferr "not in a jj repository"
-        exit 1
+        exit $EXIT_USAGE
     }
     JJQ_LOCK_DIR="${repo_root}/.jj/jjq-locks"
     mkdir -p "$JJQ_LOCK_DIR"
@@ -33,7 +43,7 @@ init_lock_dir() {
 
 # Acquire a named lock using mkdir atomicity
 # Usage: acquire_lock <name>
-# Returns 0 if lock acquired, 1 if already held
+# Returns 0 if lock acquired, EXIT_LOCK_HELD if already held
 acquire_lock() {
     local name="$1"
     local lockdir="${JJQ_LOCK_DIR}/${name}"
@@ -43,7 +53,7 @@ acquire_lock() {
         echo $$ > "$lockdir/pid"
         return 0
     fi
-    return 1
+    return $EXIT_LOCK_HELD
 }
 
 # Release a named lock
@@ -178,7 +188,7 @@ preflight_conflict_check() {
     # Verify trunk bookmark exists
     if ! jj log -r "bookmarks(exact:$trunk_bookmark)" --no-graph -T'""' >/dev/null 2>&1; then
         preferr "trunk bookmark '$trunk_bookmark' not found"
-        return 1
+        return $EXIT_USAGE
     fi
 
     # Create temporary merge commit in-repo only, no working copy
@@ -194,7 +204,7 @@ preflight_conflict_check() {
     if [ -n "$has_conflicts" ]; then
         preferr "revision '$revset' conflicts with $trunk_bookmark"
         preferr "rebase onto $trunk_bookmark and resolve conflicts before pushing"
-        return 1
+        return $EXIT_CONFLICT
     fi
     return 0
 }
@@ -207,13 +217,13 @@ validate_seq_id() {
     # Check for empty input
     if [ -z "$input" ]; then
         preferr "invalid sequence ID: empty"
-        return 1
+        return $EXIT_USAGE
     fi
 
     # Check for non-numeric characters (only digits allowed)
     if ! [[ "$input" =~ ^[0-9]+$ ]]; then
         preferr "invalid sequence ID: '$input' (must be numeric)"
-        return 1
+        return $EXIT_USAGE
     fi
 
     # Convert to integer (strips leading zeros)
@@ -222,7 +232,7 @@ validate_seq_id() {
     # Check range
     if [ "$id" -lt 1 ] || [ "$id" -gt 999999 ]; then
         preferr "invalid sequence ID: $id (must be 1-999999)"
-        return 1
+        return $EXIT_USAGE
     fi
 
     # Return zero-padded form
@@ -240,7 +250,7 @@ usage() {
     err "   delete <id>             - delete a queued or failed item"
     err "   config [key] [value]    - get/set configuration"
     err "   clean                  - remove failed workspaces"
-    exit 1
+    exit $EXIT_USAGE
 }
 
 [ $# -gt 0 ] || usage
@@ -330,7 +340,7 @@ next_id() {
     # Take the lock using mkdir atomicity
     if ! acquire_lock "id"; then
         preferr "could not acquire sequence ID lock (another process may be pushing)"
-        return 1
+        return $EXIT_LOCK_HELD
     fi
 
     local d
@@ -367,13 +377,13 @@ cmd_push() {
     local change_id
     change_id=$(jj log -r "$revset" --no-graph -T'change_id.short()' 2>/dev/null) || {
         preferr "revset '$revset' not found"
-        exit 1
+        exit $EXIT_USAGE
     }
 
     # Pre-flight conflict check: verify revision could merge cleanly with trunk
     local trunk_bookmark
     trunk_bookmark=$(get_trunk_bookmark)
-    preflight_conflict_check "$revset" "$trunk_bookmark" || exit 1
+    preflight_conflict_check "$revset" "$trunk_bookmark" || exit $?
 
     ensure_jjq
 
@@ -396,15 +406,19 @@ cmd_push() {
 }
 
 # Process one queue item. Returns:
-#   0 = success (item merged)
-#   1 = failure (conflict, check failed, etc.)
-#   2 = queue empty
+#   EXIT_SUCCESS (0) = item merged
+#   EXIT_CONFLICT (1) = merge conflicts
+#   EXIT_CHECK_FAILED (2) = check command failed
+#   EXIT_LOCK_HELD (3) = runner lock already held
+#   EXIT_TRUNK_MOVED (4) = trunk bookmark moved during run
+#   EXIT_USAGE (10) = check_command not configured
+#   _EXIT_QUEUE_EMPTY (99) = queue empty
 run_one_item() {
     local id
     id="$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' | grep -E '^jjq/queue/[0-9]{6}$' | cut -f3 -d'/' | sort -n | head -1 || true)"
     if [ -z "$id" ]; then
         prefout "queue is empty"
-        return 2
+        return $_EXIT_QUEUE_EMPTY
     fi
     prefout "processing queue item $id"
 
@@ -417,7 +431,7 @@ run_one_item() {
 
     if [ -z "$check_command" ]; then
         preferr "check_command not configured (use 'jjq config check_command <cmd>')"
-        return 1
+        return $EXIT_USAGE
     fi
 
     # Record trunk commit ID to detect if it moves during run
@@ -432,7 +446,7 @@ run_one_item() {
     # Take the run lock using mkdir atomicity
     if ! acquire_lock "run"; then
         preferr "queue runner lock already held"
-        return 1
+        return $EXIT_LOCK_HELD
     fi
 
     # shellcheck disable=SC2064 # Intentional: capture vars now
@@ -470,7 +484,7 @@ run_one_item() {
         # Keep workspace for debugging, but release lock
         trap - RETURN
         release_lock "run"
-        return 1
+        return $EXIT_CONFLICT
     fi
 
     run_quiet jj desc -m "WIP: attempting merge $id"
@@ -502,7 +516,7 @@ run_one_item() {
         # Keep workspace for debugging, but release lock
         trap - RETURN
         release_lock "run"
-        return 1
+        return $EXIT_CHECK_FAILED
     fi
 
     # Verify trunk hasn't moved during the run
@@ -518,7 +532,7 @@ run_one_item() {
         trap - RETURN
         # Leave queue item in place for retry
         preferr "trunk bookmark moved during run; queue item left in place, re-run to retry"
-        return 1
+        return $EXIT_TRUNK_MOVED
     fi
 
     # Success path
@@ -578,7 +592,7 @@ cmd_run() {
                 ;;
             *)
                 preferr "unknown option: $1"
-                exit 1
+                exit $EXIT_USAGE
                 ;;
         esac
     done
@@ -592,7 +606,7 @@ cmd_run() {
             if [ $result -eq 0 ]; then
                 # Success, continue processing
                 merged_count=$((merged_count + 1))
-            elif [ $result -eq 2 ]; then
+            elif [ $result -eq $_EXIT_QUEUE_EMPTY ]; then
                 # Queue empty
                 if [ $merged_count -gt 0 ]; then
                     prefout "processed $merged_count item(s)"
@@ -610,7 +624,7 @@ cmd_run() {
         # Process single item
         local result
         run_one_item && result=0 || result=$?
-        if [ $result -eq 2 ]; then
+        if [ $result -eq $_EXIT_QUEUE_EMPTY ]; then
             exit 0  # Queue empty is success for single run
         fi
         exit $result
@@ -704,19 +718,19 @@ cmd_status() {
 cmd_retry() {
     if [ $# -lt 1 ]; then
         preferr "usage: jjq retry <id> [revset]"
-        exit 1
+        exit $EXIT_USAGE
     fi
 
     local id="$1"
     shift
     local padded_id
-    padded_id=$(validate_seq_id "$id") || exit 1
+    padded_id=$(validate_seq_id "$id") || exit $EXIT_USAGE
     local failed_bookmark="jjq/failed/$padded_id"
 
     # Check if the failed bookmark exists
     if [ -z "$(jj bookmark list -r "bookmarks(exact:$failed_bookmark)" -T name 2>/dev/null)" ]; then
         preferr "failed item $id not found"
-        exit 1
+        exit $EXIT_USAGE
     fi
 
     # Check if trunk has moved since the failure
@@ -743,7 +757,7 @@ cmd_retry() {
         candidate_revset="$1"
         if ! jj log -r "$candidate_revset" --no-graph -T'change_id.short()' >/dev/null 2>&1; then
             preferr "revset '$candidate_revset' not found"
-            exit 1
+            exit $EXIT_USAGE
         fi
         prefout "retrying failed item $id using '$candidate_revset'"
     else
@@ -757,7 +771,7 @@ cmd_retry() {
 
         if [ -z "$original_candidate" ]; then
             preferr "could not find original candidate for failed item $id"
-            exit 1
+            exit $EXIT_USAGE
         fi
 
         candidate_revset="$original_candidate"
@@ -765,7 +779,7 @@ cmd_retry() {
     fi
 
     # Pre-flight conflict check: verify candidate merges cleanly with trunk
-    preflight_conflict_check "$candidate_revset" "$trunk_bookmark" || exit 1
+    preflight_conflict_check "$candidate_revset" "$trunk_bookmark" || exit $?
 
     # Push the candidate to the queue using next_id
     ensure_jjq
@@ -817,14 +831,14 @@ cmd_retry() {
 cmd_delete() {
     if [ $# -lt 1 ]; then
         preferr "usage: jjq delete <id>"
-        exit 1
+        exit $EXIT_USAGE
     fi
 
     ensure_jjq
 
     local id="$1"
     local padded_id
-    padded_id=$(validate_seq_id "$id") || exit 1
+    padded_id=$(validate_seq_id "$id") || exit $EXIT_USAGE
 
     local queue_bookmark="jjq/queue/$padded_id"
     local failed_bookmark="jjq/failed/$padded_id"
@@ -855,7 +869,7 @@ cmd_delete() {
         item_type="failed"
     else
         preferr "item $id not found in queue or failed"
-        exit 1
+        exit $EXIT_USAGE
     fi
 
     # Log the operation
@@ -888,7 +902,7 @@ cmd_config() {
         *)
             preferr "unknown config key: $key"
             preferr "valid keys: trunk_bookmark, check_command, max_failures"
-            exit 1
+            exit $EXIT_USAGE
             ;;
     esac
 
@@ -907,7 +921,7 @@ cmd_config() {
         if [ "$key" = "max_failures" ]; then
             if ! [[ "$value" =~ ^[0-9]+$ ]]; then
                 preferr "max_failures must be a number"
-                exit 1
+                exit $EXIT_USAGE
             fi
         fi
 
