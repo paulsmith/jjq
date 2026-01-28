@@ -68,6 +68,10 @@ pub fn push(revset: &str) -> Result<()> {
     jj::bookmark_create(&bookmark, revset)?;
 
     prefout(&format!("revision '{}' queued at {}", revset, id));
+
+    // Show one-time hint about configuring jj log
+    config::maybe_show_log_hint()?;
+
     Ok(())
 }
 
@@ -177,7 +181,7 @@ fn run_one() -> Result<RunResult> {
 
         env::set_current_dir(&orig_dir)?;
         // Keep workspace for debugging
-        let ws_path = runner_workspace.into_path();
+        let ws_path = runner_workspace.keep();
         drop(run_lock);
 
         preferr(&format!("merge {} has conflicts, marked as failed", id));
@@ -202,7 +206,7 @@ fn run_one() -> Result<RunResult> {
         jj::describe(&workspace_rev, &format!("Failed: merge {} (check)", id))?;
 
         env::set_current_dir(&orig_dir)?;
-        let ws_path = runner_workspace.into_path();
+        let ws_path = runner_workspace.keep();
         drop(run_lock);
 
         preferr(&format!("merge {} check failed", id));

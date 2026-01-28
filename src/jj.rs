@@ -5,6 +5,16 @@ use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+/// Get a jj config value, returning None if not set.
+pub fn config_get(key: &str) -> Result<Option<String>> {
+    let output = run(&["config", "get", key])?;
+    if output.status.success() {
+        Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Execute a jj command and return the output.
 pub fn run(args: &[&str]) -> Result<Output> {
     let output = Command::new("jj")

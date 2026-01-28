@@ -4,6 +4,7 @@
 use anyhow::{bail, Result};
 use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use tempfile::TempDir;
 
 use crate::jj;
@@ -123,6 +124,77 @@ pub fn set(key: &str, value: &str) -> Result<()> {
     fs::write(format!("config/{}", key), value)?;
     jj::describe("@", &format!("config: set {}", key))?;
     jj::run_quiet(&["bookmark", "set", JJQ_BOOKMARK])?;
+
+    env::set_current_dir(&orig_dir)?;
+    jj::workspace_forget(&workspace_name)?;
+
+    Ok(())
+}
+
+/// Show a one-time hint about configuring jj log filter.
+/// Only shows if: stdout is a TTY, log filter not already configured, hint not shown before.
+pub fn maybe_show_log_hint() -> Result<()> {
+    // Skip if not a terminal (unless JJQTEST_FORCE_HINT is set for testing)
+    let force_hint = env::var("JJQTEST_FORCE_HINT").is_ok();
+    if !force_hint && !std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+
+    // Skip if log filter already configured to hide jjq metadata
+    if let Ok(Some(current_log)) = jj::config_get("revsets.log") {
+        if current_log.contains(JJQ_BOOKMARK) {
+            return Ok(());
+        }
+    }
+
+    // Skip if hint already shown (check metadata)
+    if hint_already_shown()? {
+        return Ok(());
+    }
+
+    // Show hint
+    eprintln!();
+    eprintln!("hint: To hide jjq metadata from 'jj log', run:");
+    eprintln!("  jj config set --repo revsets.log '~ ::{}'", JJQ_BOOKMARK);
+    eprintln!();
+
+    // Record hint shown
+    record_hint_shown()?;
+
+    Ok(())
+}
+
+/// Check if the log hint has already been shown.
+fn hint_already_shown() -> Result<bool> {
+    if !is_initialized()? {
+        return Ok(false);
+    }
+    match jj::file_show("log_hint_shown", JJQ_BOOKMARK) {
+        Ok(content) => Ok(!content.trim().is_empty()),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Record that the log hint has been shown.
+fn record_hint_shown() -> Result<()> {
+    if !is_initialized()? {
+        return Ok(());
+    }
+
+    let temp_dir = TempDir::new()?;
+    let workspace_name = format!("jjq-hint-{}", std::process::id());
+
+    jj::workspace_add(
+        temp_dir.path().to_str().unwrap(),
+        &workspace_name,
+        &[JJQ_BOOKMARK],
+    )?;
+
+    let orig_dir = env::current_dir()?;
+    env::set_current_dir(temp_dir.path())?;
+
+    fs::write("log_hint_shown", "1")?;
+    jj::run_quiet(&["squash", "-u"])?;
 
     env::set_current_dir(&orig_dir)?;
     jj::workspace_forget(&workspace_name)?;

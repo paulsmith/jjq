@@ -275,6 +275,34 @@ func main() {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Check if a file exists on a revision.
+    fn jj_file_exists(&self, path: &str, rev: &str) -> bool {
+        let output = process::Command::new("jj")
+            .current_dir(&self.path)
+            .args(["file", "show", path, "-r", rev])
+            .output()
+            .expect("failed to run jj");
+        output.status.success()
+    }
+
+    /// Run jjq with additional environment variables.
+    fn jjq_with_env(&self, args: &[&str], env_vars: &[(&str, &str)]) -> String {
+        #[allow(deprecated)]
+        let mut cmd = Command::cargo_bin("jjq").unwrap();
+        cmd.current_dir(&self.path);
+        cmd.env("NON_INTERACTIVE", "1");
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+        let output = cmd.args(args).output().expect("failed to run jjq");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        let combined = format!("{}{}", stdout, stderr);
+        normalize_output(&combined, &self.path)
+    }
 }
 
 /// Run a jj command in the given directory.
@@ -846,4 +874,78 @@ fn test_multiple_push_same_revision() {
       1: <CHANGE_ID> initial
       2: <CHANGE_ID> initial
     ");
+}
+
+#[test]
+fn test_log_hint_not_shown_in_non_tty() {
+    let repo = TestRepo::with_go_project();
+
+    // Push should succeed without showing hint (non-TTY mode)
+    let output = repo.jjq_success(&["push", "main"]);
+
+    // Verify no hint in output
+    assert!(
+        !output.contains("hint:"),
+        "hint should not appear in non-TTY mode"
+    );
+    assert!(
+        !output.contains("jj config set"),
+        "config suggestion should not appear in non-TTY mode"
+    );
+
+    // Verify log_hint_shown was NOT recorded (non-TTY returns early)
+    assert!(
+        !repo.jj_file_exists("log_hint_shown", "jjq/_/_"),
+        "log_hint_shown should not be recorded in non-TTY mode"
+    );
+}
+
+#[test]
+fn test_log_hint_shown_once_when_forced() {
+    let repo = TestRepo::with_go_project();
+
+    // First push with forced hint - should show hint
+    let output1 = repo.jjq_with_env(&["push", "main"], &[("JJQTEST_FORCE_HINT", "1")]);
+    assert!(
+        output1.contains("hint:"),
+        "hint should appear on first push when forced"
+    );
+    assert!(
+        output1.contains("jj config set"),
+        "config suggestion should appear"
+    );
+
+    // Verify log_hint_shown was recorded
+    assert!(
+        repo.jj_file_exists("log_hint_shown", "jjq/_/_"),
+        "log_hint_shown should be recorded after hint shown"
+    );
+
+    // Second push with forced hint - should NOT show hint again
+    let output2 = repo.jjq_with_env(&["push", "main"], &[("JJQTEST_FORCE_HINT", "1")]);
+    assert!(
+        !output2.contains("hint:"),
+        "hint should not appear on second push"
+    );
+}
+
+#[test]
+fn test_log_hint_skipped_when_filter_configured() {
+    let repo = TestRepo::with_go_project();
+
+    // Configure the log filter first
+    run_jj(repo.path(), &["config", "set", "--repo", "revsets.log", "~ ::jjq/_/_"]);
+
+    // Push with forced hint - should skip because filter already configured
+    let output = repo.jjq_with_env(&["push", "main"], &[("JJQTEST_FORCE_HINT", "1")]);
+    assert!(
+        !output.contains("hint:"),
+        "hint should not appear when log filter already configured"
+    );
+
+    // Verify log_hint_shown was NOT recorded (skipped due to filter)
+    assert!(
+        !repo.jj_file_exists("log_hint_shown", "jjq/_/_"),
+        "log_hint_shown should not be recorded when filter already configured"
+    );
 }
