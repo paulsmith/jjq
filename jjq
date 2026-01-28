@@ -241,25 +241,48 @@ ensure_jjq() {
     rm -rf "$d"
     trap - EXIT
 
-    # First-time setup prompt
-    maybe_configure_log_filter
+    # First-time setup hint
+    maybe_show_log_hint
 }
 
-# Prompt user to configure jj log filter (first-time setup)
-maybe_configure_log_filter() {
-    [ -f .jj/repo/config.toml ] && return
-    [ -n "${NON_INTERACTIVE-}" ] && return
+# Show one-time hint about configuring jj log filter
+maybe_show_log_hint() {
+    # Skip if not a terminal
+    [ -t 1 ] || return 0
 
-    echo "Welcome to jjq"
-    echo -n "Configure \`jj log\` to hide jjq metadata? "
-    read -n1 -p '(y/N) ' -r answer
-    echo
-    if [[ $answer == [yY] ]]; then
-        cat > .jj/repo/config.toml <<-EOF
-			[revsets]
-			log = '~ ::${jjq_bookmark}'
-		EOF
-    fi
+    # Skip if log filter already configured
+    local current_log
+    current_log=$(jj config get revsets.log 2>/dev/null) || true
+    [[ "$current_log" == *"$jjq_bookmark"* ]] && return 0
+
+    # Skip if hint already shown (check metadata)
+    local hint_shown
+    hint_shown=$(jj file show "log_hint_shown" -r "$jjq_bookmark" 2>/dev/null) || true
+    [ -n "$hint_shown" ] && return 0
+
+    # Show hint
+    echo ""
+    echo "hint: To hide jjq metadata from 'jj log', run:"
+    echo "  jj config set --repo revsets.log '~ ::$jjq_bookmark'"
+    echo ""
+
+    # Record hint shown in metadata
+    record_hint_shown
+}
+
+# Record that the log hint has been shown
+record_hint_shown() {
+    local d
+    d=$(mktemp -d)
+    # shellcheck disable=SC2064 # Intentional: capture $d now
+    trap "rm -rf $d" RETURN
+
+    local workspace_name="jjq$$"
+    run_quiet jj workspace add -r "$jjq_bookmark" --name "$workspace_name" "$d"
+    echo "1" > "$d/log_hint_shown"
+    run_quiet jj -R "$d" commit -m "record log hint shown"
+    run_quiet jj -R "$d" squash
+    run_quiet jj workspace forget "$workspace_name"
 }
 
 next_id() {

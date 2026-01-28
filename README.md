@@ -84,7 +84,7 @@ To hide jjq metadata from `jj log`, add this to `.jj/repo/config.toml`:
 log = "~ ::jjq/_/_"
 ```
 
-(jjq will offer to configure this on first use)
+(jjq shows this hint on first interactive use)
 
 ## Configuration
 
