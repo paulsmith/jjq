@@ -1,0 +1,31 @@
+i want you to try out jjq and put it through it's paces.
+
+your task is to be a coordinating top-level agent for a "team" of agents that's implementing an example web app.
+
+start by creating a new jj repo somewhere, and initialize it with a Go module and skeleton of a simple net/http web app and basic unit test(s).
+
+be sure to commit initial changes and set the 'main' bookmark to the appropriate revision to be the protected trunk. also think about what the check command for jjq should be (probably tests and lints passing?) and configure it.
+
+then come up with 3 simple features to add to the app. keep track of them somehow.
+
+then task 3 background software engineer subagents with implementing one task each.
+
+they should each operate in their own separate jj workspace, parented to the protected trunk.
+
+instruct them to file a "PR" when they are done by calling `jjq push` on their change.
+
+you should manage the queue and be the traffic cop for all activities.
+
+if any problems come up, task your agents with resolving them with the appropriate feedback and resolution criteria.
+
+once the initial 3 simple features are complete, i want you to be sneaky and introduce a bug somewhere. up to you where/how. then task one of the agents with fixing it.
+
+it would also be good to get more experience with jjq when merges cause conflicts. try to engineer a scenario where that happens. that could be part of the initial 3 features, up to you.
+
+familiarize yourself with the current e2e test script @jjq-test but don't feel like you have to follow anything in it.
+
+everyone should know how to use jj well, use jj correctly, and commit liberally.
+
+everyone should follow good development practices including strict TDD. everyone should have a verifiable and validatable definition of DONE for their task.
+
+your meta-task is to observe how everyone does using jjq and make note of what can be improved. especially focus on any repeated errors or back-and-forth-ing with the tool - we want to iron out jjq's UI / UX and make it easy for anyone to use. also focus on any correctness errors jjq makes - these are critical to address.
