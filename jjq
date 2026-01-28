@@ -168,6 +168,37 @@ get_max_failures() {
     get_config "max_failures" "$DEFAULT_MAX_FAILURES"
 }
 
+# Pre-flight conflict check: verify a revision merges cleanly with trunk.
+# Usage: preflight_conflict_check <revset> <trunk_bookmark>
+# Returns 0 if clean, 1 if conflicts (with error messages printed).
+preflight_conflict_check() {
+    local revset="$1"
+    local trunk_bookmark="$2"
+
+    # Verify trunk bookmark exists
+    if ! jj log -r "bookmarks(exact:$trunk_bookmark)" --no-graph -T'""' >/dev/null 2>&1; then
+        preferr "trunk bookmark '$trunk_bookmark' not found"
+        return 1
+    fi
+
+    # Create temporary merge commit in-repo only, no working copy
+    local conflict_check_change_id
+    conflict_check_change_id=$(jj new --no-edit -r "$trunk_bookmark" -r "$revset" 2>&1 | head -1 | cut -f4 -d' ')
+
+    # Check for conflicts
+    local has_conflicts
+    has_conflicts=$(jj log -r "$conflict_check_change_id" --no-graph -T'if(conflict, "yes")')
+
+    jj abandon "$conflict_check_change_id" >/dev/null 2>&1
+
+    if [ -n "$has_conflicts" ]; then
+        preferr "revision '$revset' conflicts with $trunk_bookmark"
+        preferr "rebase onto $trunk_bookmark and resolve conflicts before pushing"
+        return 1
+    fi
+    return 0
+}
+
 # Validate and normalize a sequence ID from user input
 # Returns the zero-padded ID on success, exits with error on failure
 validate_seq_id() {
@@ -342,28 +373,7 @@ cmd_push() {
     # Pre-flight conflict check: verify revision could merge cleanly with trunk
     local trunk_bookmark
     trunk_bookmark=$(get_trunk_bookmark)
-
-    # Verify trunk bookmark exists
-    if ! jj log -r "bookmarks(exact:$trunk_bookmark)" --no-graph -T'""' >/dev/null 2>&1; then
-        preferr "trunk bookmark '$trunk_bookmark' not found"
-        exit 1
-    fi
-
-    # Create temporary merge commit in-repo only, no working copy
-    local conflict_check_change_id
-    conflict_check_change_id=$(jj new --no-edit -r "$trunk_bookmark" -r "$revset" 2>&1 | head -1 | cut -f4 -d' ')
-
-    # Check for conflicts
-    local has_conflicts
-    has_conflicts=$(jj log -r "$conflict_check_change_id" --no-graph -T'if(conflict, "yes")')
-
-    jj abandon "$conflict_check_change_id" >/dev/null 2>&1
-
-    if [ -n "$has_conflicts" ]; then
-        preferr "revision '$revset' conflicts with $trunk_bookmark"
-        preferr "rebase onto $trunk_bookmark and resolve conflicts before pushing"
-        exit 1
-    fi
+    preflight_conflict_check "$revset" "$trunk_bookmark" || exit 1
 
     ensure_jjq
 
