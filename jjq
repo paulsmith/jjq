@@ -17,6 +17,51 @@ prefout() {
     echo "jjq: $*"
 }
 
+# Lock directory inside .jj (not tracked by jj)
+JJQ_LOCK_DIR=""
+
+# Find the jj repo root and set up lock directory
+init_lock_dir() {
+    local repo_root
+    repo_root=$(jj root 2>/dev/null) || {
+        preferr "not in a jj repository"
+        exit 1
+    }
+    JJQ_LOCK_DIR="${repo_root}/.jj/jjq-locks"
+    mkdir -p "$JJQ_LOCK_DIR"
+}
+
+# Acquire a named lock using mkdir atomicity
+# Usage: acquire_lock <name>
+# Returns 0 if lock acquired, 1 if already held
+acquire_lock() {
+    local name="$1"
+    local lockdir="${JJQ_LOCK_DIR}/${name}"
+
+    if mkdir "$lockdir" 2>/dev/null; then
+        # Got the lock - record PID for stale detection
+        echo $$ > "$lockdir/pid"
+        return 0
+    fi
+    return 1
+}
+
+# Release a named lock
+# Usage: release_lock <name>
+release_lock() {
+    local name="$1"
+    local lockdir="${JJQ_LOCK_DIR}/${name}"
+    rm -rf "$lockdir"
+}
+
+# Check if a lock is held (for status display)
+# Usage: is_lock_held <name>
+is_lock_held() {
+    local name="$1"
+    local lockdir="${JJQ_LOCK_DIR}/${name}"
+    [ -d "$lockdir" ]
+}
+
 # Run a command quietly - only show output on failure
 run_quiet() {
     local output
@@ -164,6 +209,9 @@ shift
 
 jjq_bookmark="jjq/_/_"
 
+# Initialize lock directory (must be in a jj repo)
+init_lock_dir
+
 # Pure check - returns 0 if initialized, 1 if not
 # No side effects, safe to call anywhere
 jjq_is_initialized() {
@@ -215,18 +263,16 @@ maybe_configure_log_filter() {
 }
 
 next_id() {
-    local lock="jjq/lock/id"
-
-    # Take the lock
-    if ! jj bookmark create -r "$jjq_bookmark" "$lock" >/dev/null 2>&1; then
+    # Take the lock using mkdir atomicity
+    if ! acquire_lock "id"; then
         preferr "could not acquire sequence ID lock (another process may be pushing)"
         return 1
     fi
 
     local d
     d=$(mktemp -d)
-    # shellcheck disable=SC2064 # Intentional: capture $d and $lock now
-    trap "rm -rf $d; jj bookmark delete $lock >/dev/null 2>&1" EXIT
+    # shellcheck disable=SC2064 # Intentional: capture $d now
+    trap "rm -rf $d; release_lock id" EXIT
 
     local workspace_name="jjq$$"
     run_quiet jj workspace add -r "$jjq_bookmark" --name "$workspace_name" "$d"
@@ -241,7 +287,7 @@ next_id() {
     popd >/dev/null
 
     # Release the lock explicitly (trap is backup)
-    jj bookmark delete "$lock" >/dev/null 2>&1
+    release_lock "id"
     trap - EXIT
     rm -rf "$d"
 
@@ -309,18 +355,15 @@ cmd_run() {
     runner_workspace=$(mktemp -d)
     local run_name
     run_name=$(printf "jjq-run-%06d" "$((10#$id))")
-    local lock="jjq/lock/run"
 
-    # We use jj bookmarks to take out a global run lock, since only one runner
-    # can process the queue at a time. This lets us avoid trying a cross-platform
-    # file locking mechanism and keep it contained to jj.
-    if ! jj bookmark create -r "$jjq_bookmark" "$lock" >/dev/null 2>&1; then
+    # Take the run lock using mkdir atomicity
+    if ! acquire_lock "run"; then
         preferr "queue runner lock already held"
         exit 1
     fi
 
     # shellcheck disable=SC2064 # Intentional: capture vars now
-    trap "jj bookmark delete $lock >/dev/null 2>&1; rm -rf $runner_workspace" EXIT
+    trap "release_lock run; rm -rf $runner_workspace" EXIT
 
     # Create a workspace to attempt the merge, with a new commit for the
     # merge-to-be with two parents: the trunk and the candidate revision
@@ -344,7 +387,7 @@ cmd_run() {
         preferr "workspace remains: $runner_workspace"
         # Keep workspace for debugging, but release lock
         trap - EXIT
-        jj bookmark delete "$lock" >/dev/null 2>&1
+        release_lock "run"
         exit 1
     fi
 
@@ -372,7 +415,7 @@ cmd_run() {
         preferr "workspace remains: $runner_workspace"
         # Keep workspace for debugging, but release lock
         trap - EXIT
-        jj bookmark delete "$lock" >/dev/null 2>&1
+        release_lock "run"
         exit 1
     fi
 
@@ -385,7 +428,7 @@ cmd_run() {
         run_quiet jj workspace forget "$run_name"
         rm -rf "$runner_workspace"
         # Release lock
-        jj bookmark delete "$lock" >/dev/null 2>&1
+        release_lock "run"
         trap - EXIT
         # Leave queue item in place for retry
         preferr "trunk bookmark moved during run; queue item left in place, re-run to retry"
@@ -408,7 +451,7 @@ cmd_run() {
         "Timestamp: $(timestamp)"
 
     # Explicit cleanup (trap is backup for unexpected exits)
-    jj bookmark delete "$lock" >/dev/null 2>&1
+    release_lock "run"
     trap - EXIT
     rm -rf "$runner_workspace"
 }
@@ -429,7 +472,7 @@ cmd_status() {
     failed_items=$(jj bookmark list -r 'bookmarks(glob:"jjq/failed/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/failed/[0-9]{6}$' | sort -r | head -"$max_failures" || true)
 
     # Check for active run
-    if jj bookmark list -r 'bookmarks(exact:"jjq/lock/run")' -T'name' 2>/dev/null | grep -q 'jjq/lock/run'; then
+    if is_lock_held "run"; then
         prefout "Run in progress"
         echo
     fi

@@ -88,11 +88,12 @@ Git branches), which treats `/` as directory separators.
 |----------|----------------------------------|--------------------------|
 | `queue`  | Queued merge candidates          | Zero-padded sequence ID  |
 | `failed` | Failed merge attempts            | Zero-padded sequence ID  |
-| `lock`   | Mutex-style locks                | Lock name                |
 | `_`      | Metadata branch head             | `_` (literal underscore) |
 
 Note: Workspace names use a different pattern (`jjq-run-<padded-id>`) to
 avoid confusion with bookmarks. See §Workspaces for details.
+
+Note: Locking uses filesystem directories, not bookmarks. See §Locking.
 
 #### Sequence ID Encoding
 
@@ -124,9 +125,6 @@ bookmark names.
 Examples of valid bookmarks:
 - `jjq/queue/000001` - First queued item
 - `jjq/failed/000042` - Failed item 42
-- `jjq/lock/run` - Queue runner lock
-- `jjq/lock/id` - Sequence ID lock
-- `jjq/lock/config` - Configuration lock
 - `jjq/_/_` - Metadata branch head
 
 ### Metadata Branch
@@ -201,52 +199,78 @@ MUST fail with an error indicating that configuration is required.
 
 ## Locking
 
-jjq uses jj bookmarks as mutex-style locks to coordinate concurrent access.
-A lock is considered held when its corresponding bookmark exists.
+jjq uses filesystem-based locks to coordinate concurrent access. Locks
+leverage the atomicity of the `mkdir(2)` system call: a directory creation
+either succeeds (lock acquired) or fails because the directory exists
+(lock held by another process).
+
+> **Note:** Earlier versions of this specification described bookmark-based
+> locking using jj bookmarks. This approach was replaced because jj's
+> optimistic concurrency model does not guarantee mutual exclusion—concurrent
+> `jj bookmark create` commands can both succeed due to jj's automatic
+> reconciliation of divergent operations. See `docs/jj-transaction-model.md`
+> for details.
+
+### Lock Directory
+
+All locks are stored in the `.jj/jjq-locks/` directory within the repository.
+Each lock is represented by a subdirectory named after the lock.
+
+```
+<repo>/.jj/jjq-locks/
+├── id/          # Sequence ID lock
+│   └── pid      # PID of lock holder
+└── run/         # Queue runner lock
+    └── pid      # PID of lock holder
+```
 
 ### Lock Acquisition
 
-To acquire a lock, an implementation MUST attempt to create the lock's
-bookmark pointing to the `jjq/_/_` revision. If the bookmark already exists,
-the lock is held by another process and acquisition MUST fail.
+To acquire a lock, an implementation MUST:
+
+1. Attempt to create the lock directory using `mkdir`
+2. If `mkdir` succeeds, write the current process ID to a `pid` file
+   within the lock directory
+3. If `mkdir` fails with EEXIST, the lock is held by another process
+   and acquisition MUST fail
+
+The `mkdir` system call is atomic; there is no race window between
+checking for existence and creating the directory.
 
 ### Lock Release
 
-To release a lock, an implementation MUST delete the lock's bookmark.
-Implementations MUST release locks they hold before exiting, including
-on error paths.
+To release a lock, an implementation MUST remove the lock directory
+and its contents. Implementations MUST release locks they hold before
+exiting, including on error paths.
 
 ### Defined Locks
 
-| Bookmark          | Protects                              |
-|-------------------|---------------------------------------|
-| `jjq/lock/id`     | Sequence ID store read-modify-write   |
-| `jjq/lock/run`    | Queue runner exclusivity              |
-| `jjq/lock/config` | Configuration store read-modify-write |
+| Lock Name | Protects                              |
+|-----------|---------------------------------------|
+| `id`      | Sequence ID store read-modify-write   |
+| `run`     | Queue runner exclusivity              |
 
-#### Sequence ID Lock (`jjq/lock/id`)
+#### Sequence ID Lock (`id`)
 
 MUST be held during the entire read-modify-write cycle of the sequence
 ID store. Multiple processes MAY queue items concurrently; this lock
 serializes their access to the sequence counter.
 
-#### Run Lock (`jjq/lock/run`)
+#### Run Lock (`run`)
 
 MUST be held for the duration of a queue run. Only one process MAY
 process the queue at a time. This lock MUST be acquired before
 processing begins and released after completion (success or failure).
 
-#### Config Lock (`jjq/lock/config`)
-
-MUST be held when reading or writing configuration values. This
-serializes concurrent access to the configuration store, preventing
-lost updates when multiple processes modify configuration simultaneously.
-
 ### Stale Locks
 
-If a process terminates abnormally, locks may remain held. The spec does
-not define automatic stale lock detection. Users MAY manually delete
-lock bookmarks to recover from this state.
+If a process terminates abnormally, lock directories may remain. The spec
+does not mandate automatic stale lock detection. Users MAY manually remove
+lock directories to recover from this state.
+
+Implementations MAY optionally check the `pid` file to determine if the
+lock holder is still running, but MUST NOT automatically remove locks
+based solely on PID checks (PIDs can wrap around and be reused).
 
 ---
 
