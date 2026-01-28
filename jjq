@@ -764,6 +764,9 @@ cmd_retry() {
         prefout "retrying failed item $id using original candidate $original_candidate"
     fi
 
+    # Pre-flight conflict check: verify candidate merges cleanly with trunk
+    preflight_conflict_check "$candidate_revset" "$trunk_bookmark" || exit 1
+
     # Push the candidate to the queue using next_id
     ensure_jjq
 
