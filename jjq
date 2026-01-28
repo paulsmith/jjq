@@ -339,7 +339,7 @@ cmd_push() {
         exit 1
     }
 
-    # Pre-flight conflict check: verify revision merges cleanly with trunk
+    # Pre-flight conflict check: verify revision could merge cleanly with trunk
     local trunk_bookmark
     trunk_bookmark=$(get_trunk_bookmark)
 
@@ -349,19 +349,15 @@ cmd_push() {
         exit 1
     fi
 
-    local check_workspace check_workspace_name
-    check_workspace=$(mktemp -d)
-    check_workspace_name="jjq-check-$$"
+    # Create temporary merge commit in-repo only, no working copy
+    local conflict_check_change_id
+    conflict_check_change_id=$(jj new --no-edit -r "$trunk_bookmark" -r "$revset" 2>&1 | head -1 | cut -f4 -d' ')
 
-    # Create temporary workspace with merge commit to check for conflicts
-    run_quiet jj workspace add -r "$trunk_bookmark" -r "$revset" --name "$check_workspace_name" "$check_workspace"
-
+    # Check for conflicts
     local has_conflicts
-    has_conflicts=$(jj log -r "${check_workspace_name}@" --no-graph -T'if(conflict, "yes")')
+    has_conflicts=$(jj log -r "$conflict_check_change_id" --no-graph -T'if(conflict, "yes")')
 
-    # Clean up temporary workspace
-    run_quiet jj workspace forget "$check_workspace_name"
-    rm -rf "$check_workspace"
+    jj abandon "$conflict_check_change_id" >/dev/null 2>&1
 
     if [ -n "$has_conflicts" ]; then
         preferr "revision '$revset' conflicts with $trunk_bookmark"
