@@ -436,11 +436,17 @@ cmd_run() {
     fi
 
     # Success path
+    # Capture the merge commit's change ID before any modifications
+    local merge_change_id
+    merge_change_id=$(jj log -r '@' --no-graph -T'change_id.short()')
+
     run_quiet jj bookmark delete "jjq/queue/$id"
     run_quiet jj desc -m "Success: merge $id"
     run_quiet jj bookmark move "$trunk_bookmark"
     popd >/dev/null
     run_quiet jj workspace forget "$run_name"
+
+    prefout "merged $id to $trunk_bookmark (now at $merge_change_id)"
 
     # Log the success
     log_op "" "run: success $id" \

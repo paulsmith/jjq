@@ -415,10 +415,13 @@ Process the next item in the queue.
     - Output error message indicating trunk moved during run
     - Exit with code 1
 12. On success:
+    - Capture the merge revision's change ID (before any modifications)
     - Delete `jjq/queue/<id>`
     - Move trunk bookmark to the merge revision (`jjq-run-<padded-id>@`)
     - Forget the workspace (`jj workspace forget jjq-run-<padded-id>`)
     - Delete the temporary workspace directory
+    - Output success message including sequence ID, trunk bookmark name,
+      and the merge revision's change ID
     - Release run lock
     - Exit with code 0
 
