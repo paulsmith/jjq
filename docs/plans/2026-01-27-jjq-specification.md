@@ -140,11 +140,12 @@ this metadata branch.
 
 The working tree of revisions on the metadata branch contains:
 
-| Path               | Purpose                              | Format        |
-|--------------------|--------------------------------------|---------------|
-| `last_id`          | Current sequence ID counter          | ASCII integer |
-| `config/<key>`     | Configuration values                 | ASCII text    |
-| `log_hint_shown`   | Log filter hint display marker       | ASCII text    |
+| Path                    | Purpose                              | Format        |
+|-------------------------|--------------------------------------|---------------|
+| `last_id`               | Current sequence ID counter          | ASCII integer |
+| `config/<key>`          | Configuration values                 | ASCII text    |
+| `log_hint_shown`        | Log filter hint display marker       | ASCII text    |
+| `pending-retries/<id>`  | Retry lineage tracking               | ASCII integer |
 
 ##### Sequence ID Store (`last_id`)
 
@@ -208,6 +209,22 @@ whether the hint should be shown.
 
 This file is created automatically when the hint is displayed and MUST NOT
 be created during initialization.
+
+##### Retry Lineage Store (`pending-retries/`)
+
+Files under `pending-retries/` track the relationship between a retried
+queue item and the original failed item it replaces. Each file maps a
+new queue item ID to the failed item ID it retries.
+
+- The file name is the new (retrying) item's unpadded sequence ID
+- The file contents are the original (failed) item's unpadded sequence ID
+
+These files are created by the `retry` command when a failed item is
+re-queued (see §Commands - retry). The `run` command reads these files
+to attach retry lineage trailers to successful merge revisions (see
+§Commands - run). After a successful merge that includes a retry lineage
+trailer, the corresponding `pending-retries/` file MUST be deleted from
+the metadata branch.
 
 ---
 
@@ -460,6 +477,9 @@ Process the next item in the queue, or all items if `--all` is specified.
    - Delete `jjq/queue/<id>`
    - Create `jjq/failed/<id>` pointing to the merge revision
    - Output error message including workspace path
+   - Output actionable guidance SHOULD be displayed telling the user
+     how to resolve (e.g., fix conflicts in the workspace and use
+     `jjq retry`)
    - Release run lock
    - Exit with code 1 (workspace is NOT deleted)
 9. Execute the configured check command in the workspace.
@@ -467,6 +487,9 @@ Process the next item in the queue, or all items if `--all` is specified.
     - Delete `jjq/queue/<id>`
     - Create `jjq/failed/<id>` pointing to the merge revision
     - Output check failure message and workspace path
+    - Actionable guidance SHOULD be displayed telling the user how
+      to resolve (e.g., fix the issue in the workspace and use
+      `jjq retry`)
     - Release run lock
     - Exit with code 1 (workspace is NOT deleted)
 11. Verify trunk bookmark still points to the same revision recorded in
@@ -478,6 +501,12 @@ Process the next item in the queue, or all items if `--all` is specified.
     - Exit with code 1
 12. On success:
     - Capture the merge revision's change ID (before any modifications)
+    - If the queue item has a `pending-retries/<id>` file on the
+      metadata branch, the merge revision's description MUST include
+      a `jjq-retry-of: <original-id>` trailer (where `<original-id>`
+      is the contents of the pending-retry file). After adding the
+      trailer, the `pending-retries/<id>` file MUST be deleted from
+      the metadata branch.
     - Delete `jjq/queue/<id>`
     - Move trunk bookmark to the merge revision (`jjq-run-<padded-id>@`)
     - Forget the workspace (`jj workspace forget jjq-run-<padded-id>`)
@@ -585,6 +614,16 @@ For each queued or failed item, implementations SHOULD display:
 - The short change ID of the revision
 - The first line of the revision's description
 
+When retry relationships exist (i.e., `pending-retries/` files are
+present on the metadata branch), the status output SHOULD annotate
+affected items:
+- Queued items that are retries SHOULD show `(retry of N)` after
+  their description, where N is the original failed item's sequence ID
+- Failed items with pending retries SHOULD show `→ retrying as N`
+  after their description, where N is the new queue item's sequence ID
+
+When no retry relationships exist, no annotations are shown.
+
 #### Errors
 
 | Condition                          | Exit Code |
@@ -617,21 +656,28 @@ Retry a failed merge attempt by re-queuing it.
 #### Behavior
 
 1. Verify `jjq/failed/<padded-id>` exists. If not, fail with exit code 1.
-2. If `[revset]` is provided:
+2. Compare the failed merge revision's trunk parent (parent 1) commit ID
+   with the current trunk bookmark's commit ID. If they differ, output a
+   warning that trunk has advanced since the original merge and suggest
+   rebasing. This warning is informational only; the retry proceeds
+   regardless.
+3. If `[revset]` is provided:
    - Resolve it to a revision. If it does not resolve to exactly one
      revision, fail with exit code 1.
    - Use this as the candidate revision.
-3. If `[revset]` is omitted:
+4. If `[revset]` is omitted:
    - Examine the failed merge revision's parents.
    - The second parent is the original candidate revision.
    - Use this as the candidate revision.
-4. Acquire the sequence ID lock.
-5. Obtain the next sequence ID.
-6. Release the sequence ID lock.
-7. Create bookmark `jjq/queue/<new-padded-id>` pointing to the candidate.
-8. Delete `jjq/failed/<padded-id>` (only after queue entry exists).
-9. Output confirmation including the new sequence ID.
-10. Exit with code 0.
+5. Acquire the sequence ID lock.
+6. Obtain the next sequence ID.
+7. Release the sequence ID lock.
+8. Write file `pending-retries/<new-id>` on the metadata branch containing
+   the original failed item's unpadded sequence ID (i.e., `<id>`).
+9. Create bookmark `jjq/queue/<new-padded-id>` pointing to the candidate.
+10. Delete `jjq/failed/<padded-id>` (only after queue entry exists).
+11. Output confirmation including the new sequence ID.
+12. Exit with code 0.
 
 #### Errors
 
@@ -673,7 +719,13 @@ Remove an item from the queue or failed list.
 2. Check if `jjq/queue/<padded-id>` exists:
    - If yes, delete it and exit with code 0.
 3. Check if `jjq/failed/<padded-id>` exists:
-   - If yes, delete it and exit with code 0.
+   - If yes, delete the bookmark.
+   - Look up the workspace named `jjq-run-<padded-id>`. If it is
+     registered, forget it via `jj workspace forget`.
+   - If the workspace directory still exists on the filesystem,
+     remove it.
+   - Output the removed workspace path (if applicable).
+   - Exit with code 0.
 4. If neither exists, fail with exit code 1.
 
 #### Errors
@@ -686,9 +738,44 @@ Remove an item from the queue or failed list.
 
 - Delete checks the queue first, then failed. An ID cannot exist in
   both simultaneously under normal operation.
-- Deleting a failed item does NOT clean up its associated workspace
-  (if any).
+- Deleting a failed item also cleans up its associated workspace
+  (if any), including forgetting the workspace in jj and removing
+  the workspace directory from the filesystem.
 - Delete does not require any locks; bookmark deletion is atomic in jj.
+
+---
+
+### clean
+
+```
+jjq clean
+```
+
+Remove all jjq workspaces and their directories.
+
+#### Behavior
+
+1. Enumerate all jj workspaces matching the pattern `jjq-run-*`.
+2. If no matching workspaces exist, output "no workspaces to clean"
+   and exit with code 0.
+3. For each matching workspace:
+   - Extract the sequence ID from the workspace name.
+   - Determine if a corresponding `jjq/failed/<padded-id>` bookmark
+     exists (label the workspace as "failed item N") or not (label
+     as "orphaned").
+   - Forget the workspace via `jj workspace forget`.
+   - If the workspace directory exists on the filesystem, remove it.
+4. Output summary: count of removed workspaces with per-workspace
+   details (name, label, path if known).
+5. Exit with code 0.
+
+#### Notes
+
+- The `clean` command acts immediately without confirmation.
+- Workspace filesystem paths are resolved from the jjq metadata
+  branch operation log.
+- `clean` does NOT delete `jjq/failed/*` bookmarks; it only removes
+  workspaces. Use `delete` to remove failed items.
 
 ---
 

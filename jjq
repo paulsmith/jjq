@@ -107,6 +107,15 @@ timestamp() {
     date -u +%Y-%m-%dT%H:%M:%SZ
 }
 
+# Look up the filesystem path of a workspace from jjq metadata log history.
+# Usage: lookup_workspace_path <unpadded_id>
+lookup_workspace_path() {
+    jj log -r "ancestors(bookmarks(exact:\"jjq/_/_\"), 100)" --no-graph \
+        -T 'description ++ "\n---\n"' 2>/dev/null | \
+        grep -A 10 "Sequence-Id: $1$" | \
+        grep "^Workspace:" | head -1 | cut -d' ' -f2- || true
+}
+
 # Read a config value from the jjq metadata branch
 # Usage: get_config <key> <default>
 get_config() {
@@ -199,6 +208,7 @@ usage() {
     err "   retry <id> [revset]     - retry a failed merge"
     err "   delete <id>             - delete a queued or failed item"
     err "   config [key] [value]    - get/set configuration"
+    err "   clean                  - remove failed workspaces"
     exit 1
 }
 
@@ -422,6 +432,11 @@ run_one_item() {
     # shellcheck disable=SC2064 # Intentional: capture vars now
     trap "release_lock run; rm -rf $runner_workspace" RETURN
 
+    # Check if this is a retry (has pending-retry metadata)
+    # Note: pending-retries files use unpadded id (e.g., "31" not "000031")
+    local retry_of=""
+    retry_of=$(jj file show "pending-retries/$((10#$id))" -r "$jjq_bookmark" 2>/dev/null) || true
+
     # Create a workspace to attempt the merge, with a new commit for the
     # merge-to-be with two parents: the trunk and the candidate revision
     run_quiet jj workspace add -r "bookmarks(exact:$trunk_bookmark)" -r "bookmarks(exact:jjq/queue/$id)" --name "$run_name" "$runner_workspace"
@@ -441,7 +456,11 @@ run_one_item() {
             "Workspace: $runner_workspace" \
             "Timestamp: $(timestamp)"
         preferr "merge $id has conflicts, marked as failed"
-        preferr "workspace remains: $runner_workspace"
+        preferr "workspace: $runner_workspace"
+        preferr ""
+        preferr "To resolve:"
+        preferr "  1. Fix conflicts in the workspace above (or create a new revision)"
+        preferr "  2. Run: jjq retry $((10#$id)) <fixed-revset>"
         # Keep workspace for debugging, but release lock
         trap - RETURN
         release_lock "run"
@@ -468,8 +487,12 @@ run_one_item() {
             "Check-Command: $check_command" \
             "Workspace: $runner_workspace" \
             "Timestamp: $(timestamp)"
-        preferr "merge $id check failed"
-        preferr "workspace remains: $runner_workspace"
+        preferr "merge $id failed check, marked as failed"
+        preferr "workspace: $runner_workspace"
+        preferr ""
+        preferr "To resolve:"
+        preferr "  1. Fix the issue and create a new revision"
+        preferr "  2. Run: jjq retry $((10#$id)) <fixed-revset>"
         # Keep workspace for debugging, but release lock
         trap - RETURN
         release_lock "run"
@@ -498,12 +521,30 @@ run_one_item() {
     merge_change_id=$(jj log -r '@' --no-graph -T'change_id.short()')
 
     run_quiet jj bookmark delete "jjq/queue/$id"
-    run_quiet jj desc -m "Success: merge $id"
+    local merge_desc="Success: merge $id"
+    if [ -n "$retry_of" ]; then
+        merge_desc="$merge_desc"$'\n\n'"jjq-retry-of: $retry_of"
+    fi
+    run_quiet jj desc -m "$merge_desc"
     run_quiet jj bookmark move "$trunk_bookmark"
     popd >/dev/null
     run_quiet jj workspace forget "$run_name"
 
     prefout "merged $id to $trunk_bookmark (now at $merge_change_id)"
+
+    # Clean up pending-retry metadata if this was a retry
+    if [ -n "$retry_of" ]; then
+        local cleanup_dir
+        cleanup_dir=$(mktemp -d)
+        run_quiet jj workspace add -r "$jjq_bookmark" --name "jjq-cleanup-$$" "$cleanup_dir"
+        rm -f "$cleanup_dir/pending-retries/$((10#$id))"
+        pushd "$cleanup_dir" >/dev/null
+        run_quiet jj desc -m "cleanup: remove pending-retry for $id"
+        run_quiet jj bookmark set "$jjq_bookmark"
+        popd >/dev/null
+        run_quiet jj workspace forget "jjq-cleanup-$$"
+        rm -rf "$cleanup_dir"
+    fi
 
     # Log the success
     log_op "" "run: success $id" \
@@ -596,14 +637,36 @@ cmd_status() {
         return
     fi
 
+    # Build retry relationship data from pending-retries/ on metadata branch
+    # Format: newline-delimited "new_id:original_id" pairs (bash 3 compatible)
+    local retry_data=""
+    local pending_retries
+    pending_retries=$(jj file list -r "$jjq_bookmark" 2>/dev/null | grep '^pending-retries/' || true)
+    for entry in $pending_retries; do
+        local new_id="${entry##*/}"
+        local original_id
+        original_id=$(jj file show "$entry" -r "$jjq_bookmark" 2>/dev/null) || continue
+        retry_data="${retry_data}${new_id}:${original_id}"$'\n'
+    done
+
     if [ -n "$queue_items" ]; then
         prefout "Queued:"
         while IFS= read -r bookmark; do
             [ -n "$bookmark" ] || continue
             local id="${bookmark##*/}"
+            local plain_id=$((10#$id))
             local info
             info=$(jj log -r "bookmarks(exact:$bookmark)" --no-graph -T'change_id.short() ++ " " ++ description.first_line()')
-            echo "  $((10#$id)): $info"
+            local annotation=""
+            if [ -n "$retry_data" ]; then
+                local match
+                match=$(echo "$retry_data" | grep "^${plain_id}:" || true)
+                if [ -n "$match" ]; then
+                    local orig="${match#*:}"
+                    annotation=" (retry of $orig)"
+                fi
+            fi
+            echo "  $plain_id: $info$annotation"
         done <<< "$queue_items"
     fi
 
@@ -615,9 +678,19 @@ cmd_status() {
         while IFS= read -r bookmark; do
             [ -n "$bookmark" ] || continue
             local id="${bookmark##*/}"
+            local plain_id=$((10#$id))
             local info
             info=$(jj log -r "bookmarks(exact:$bookmark)" --no-graph -T'change_id.short() ++ " " ++ description.first_line()')
-            echo "  $((10#$id)): $info"
+            local annotation=""
+            if [ -n "$retry_data" ]; then
+                local match
+                match=$(echo "$retry_data" | grep ":${plain_id}$" || true)
+                if [ -n "$match" ]; then
+                    local retry_id="${match%%:*}"
+                    annotation=" → retrying as $retry_id"
+                fi
+            fi
+            echo "  $plain_id: $info$annotation"
         done <<< "$failed_items"
     fi
 }
@@ -638,6 +711,24 @@ cmd_retry() {
     if [ -z "$(jj bookmark list -r "bookmarks(exact:$failed_bookmark)" -T name 2>/dev/null)" ]; then
         preferr "failed item $id not found"
         exit 1
+    fi
+
+    # Check if trunk has moved since the failure
+    local trunk_bookmark
+    trunk_bookmark=$(get_trunk_bookmark)
+
+    # Get trunk commit used in failed merge (parent 1)
+    local failed_trunk_commit
+    failed_trunk_commit=$(jj log -r "parents($failed_bookmark) & ::$trunk_bookmark" --no-graph -T'commit_id' 2>/dev/null | head -1)
+
+    # Get current trunk commit
+    local current_trunk_commit
+    current_trunk_commit=$(jj log -r "bookmarks(exact:$trunk_bookmark)" --no-graph -T'commit_id')
+
+    # Warn if trunk has moved
+    if [ -n "$failed_trunk_commit" ] && [ "$failed_trunk_commit" != "$current_trunk_commit" ]; then
+        preferr "warning: trunk has advanced since this failure"
+        preferr "hint: consider rebasing your fix onto current trunk first"
     fi
 
     local candidate_revset
@@ -672,6 +763,26 @@ cmd_retry() {
 
     local new_id
     new_id="$(next_id)"
+
+    # Store retry metadata for later use by run command
+    local meta_dir
+    meta_dir=$(mktemp -d)
+    # shellcheck disable=SC2064 # Intentional: capture $meta_dir now
+    trap "rm -rf $meta_dir" RETURN
+
+    local meta_workspace="jjq-meta-$$"
+    run_quiet jj workspace add -r "$jjq_bookmark" --name "$meta_workspace" "$meta_dir"
+
+    mkdir -p "$meta_dir/pending-retries"
+    echo "$((10#$id))" > "$meta_dir/pending-retries/$new_id"
+
+    pushd "$meta_dir" >/dev/null
+    run_quiet jj desc -m "retry: record $new_id is retry of $id"
+    run_quiet jj bookmark set "$jjq_bookmark"
+    popd >/dev/null
+
+    run_quiet jj workspace forget "$meta_workspace"
+
     local queue_bookmark
     queue_bookmark="$(printf "jjq/queue/%06d" "$new_id")"
 
@@ -716,9 +827,23 @@ cmd_delete() {
         item_type="queued"
         prefout "deleted queued item $id"
     elif [ -n "$(jj bookmark list -r "bookmarks(exact:$failed_bookmark)" -T name 2>/dev/null)" ]; then
+        # Check for associated workspace before deleting
+        local run_name="jjq-run-$padded_id"
+        local workspace_path=""
+        workspace_path=$(lookup_workspace_path "$((10#$padded_id))")
+
         run_quiet jj bookmark delete "$failed_bookmark"
-        item_type="failed"
         prefout "deleted failed item $id"
+
+        # Always try to forget the workspace from jj (silently ignore if not found)
+        jj workspace forget "$run_name" >/dev/null 2>&1 || true
+
+        # Remove directory if it still exists
+        if [ -n "$workspace_path" ] && [ -d "$workspace_path" ]; then
+            rm -rf "$workspace_path"
+            prefout "removed workspace $workspace_path"
+        fi
+        item_type="failed"
     else
         preferr "item $id not found in queue or failed"
         exit 1
@@ -789,6 +914,59 @@ cmd_config() {
     fi
 }
 
+cmd_clean() {
+    local removed=0
+    local details=""
+
+    # Find all jjq-run-* workspaces (extract just the workspace name)
+    local workspaces
+    workspaces=$(jj workspace list 2>/dev/null | awk '/^jjq-run-/{print $1}' | tr -d ':' || true)
+
+    if [ -z "$workspaces" ]; then
+        prefout "no workspaces to clean"
+        return
+    fi
+
+    while IFS= read -r ws_name; do
+        [ -n "$ws_name" ] || continue
+
+        # Extract ID from workspace name (jjq-run-NNNNNN)
+        local ws_id="${ws_name#jjq-run-}"
+        local plain_id=$((10#$ws_id))
+
+        # Check if corresponding failed bookmark exists
+        local label
+        if jj bookmark list -r "bookmarks(exact:jjq/failed/$ws_id)" -T name 2>/dev/null | grep -q .; then
+            label="failed item $plain_id"
+        else
+            label="orphaned"
+        fi
+
+        # Try to find workspace filesystem path from log history
+        local ws_path=""
+        ws_path=$(lookup_workspace_path "$plain_id")
+
+        # Forget the workspace from jj
+        jj workspace forget "$ws_name" >/dev/null 2>&1 || true
+
+        # Remove directory if found and still exists
+        if [ -n "$ws_path" ] && [ -d "$ws_path" ]; then
+            rm -rf "$ws_path"
+        fi
+
+        local path_info=""
+        if [ -n "$ws_path" ]; then
+            path_info=" $ws_path"
+        fi
+        details="$details"$'\n'"  $ws_name ($label)$path_info"
+        removed=$((removed + 1))
+    done <<< "$workspaces"
+
+    if [ $removed -gt 0 ]; then
+        prefout "removed $removed workspace(s)$details"
+    fi
+}
+
 case "$cmd" in
     push) cmd_push "$@" ;;
     run) cmd_run "$@" ;;
@@ -796,5 +974,6 @@ case "$cmd" in
     retry) cmd_retry "$@" ;;
     delete) cmd_delete "$@" ;;
     config) cmd_config "$@" ;;
+    clean) cmd_clean "$@" ;;
     *) usage ;;
 esac

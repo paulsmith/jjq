@@ -203,9 +203,20 @@ cmd_run() {
 
         echo "Processing queue item $((10#$next_id))..."
 
-        if jjq run; then
+        run_output=$(jjq run 2>&1) && run_ok=true || run_ok=false
+
+        if $run_ok; then
             echo "  Merged successfully"
         else
+            echo "$run_output" | head -20
+
+            # Verify conflict resolution guidance is present in failure output
+            if echo "$run_output" | grep -q "To resolve:"; then
+                echo "  PASS: failure output includes resolution guidance"
+            else
+                echo "  WARN: failure output missing resolution guidance"
+            fi
+
             padded_id=$(printf "%06d" "$((10#$next_id))")
             failed_rev="jjq/failed/$padded_id"
 
@@ -215,6 +226,9 @@ cmd_run() {
                 echo "  Failed check (not conflicts) - cannot auto-resolve"
                 exit 1
             fi
+
+            # Capture the failed item ID before retry (for annotation check)
+            failed_id=$((10#$next_id))
 
             # Find which PR this was by checking bookmarks on the parents (second parent is the PR)
             original_pr=$(jj log -r "parents($failed_rev)" --no-graph -T'bookmarks ++ "\n"' 2>/dev/null | tr ' ' '\n' | grep -E '^pr[0-9]+$' | head -1 || true)
@@ -240,6 +254,14 @@ cmd_run() {
 
             echo "  Retrying..."
             jjq retry "$((10#$next_id))" "jjq-fix-$$@"
+
+            # Verify status shows retry annotation
+            status_output=$(jjq status 2>&1)
+            if echo "$status_output" | grep -q "(retry of $failed_id)"; then
+                echo "  PASS: status shows retry annotation"
+            else
+                echo "  WARN: status missing retry annotation"
+            fi
 
             jj workspace forget "jjq-fix-$$" >/dev/null 2>&1
             rm -rf "$fix_dir"
@@ -291,6 +313,26 @@ cmd_verify() {
             ((errors++))
         fi
     done
+
+    # Check for retry lineage trailers in merge commit descriptions
+    local retry_trailers
+    retry_trailers=$(jj log -r '::main' --no-graph -T'description ++ "\n---\n"' 2>/dev/null | grep 'jjq-retry-of:' || true)
+    if [ -n "$retry_trailers" ]; then
+        echo "PASS: retry lineage trailers found in merge commits"
+    else
+        echo "FAIL: no retry lineage trailers found (expected for conflict retries)"
+        ((errors++))
+    fi
+
+    # Check that jjq clean runs without error
+    local clean_output
+    clean_output=$(jjq clean 2>&1) || true
+    if echo "$clean_output" | grep -qE '(removed [0-9]+ workspace|no workspaces to clean)'; then
+        echo "PASS: jjq clean command works"
+    else
+        echo "FAIL: jjq clean produced unexpected output: $clean_output"
+        ((errors++))
+    fi
 
     # Run tests
     echo "Running tests..."
