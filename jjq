@@ -194,7 +194,7 @@ usage() {
     err ""
     err "commands:"
     err "   push <revset>           - push revision on merge queue"
-    err "   run                     - try to merge next candidate on queue"
+    err "   run [--all]             - try to merge next candidate (or all) on queue"
     err "   status                  - print the status of the queue"
     err "   retry <id> [revset]     - retry a failed merge"
     err "   delete <id>             - delete a queued or failed item"
@@ -326,12 +326,16 @@ cmd_push() {
     prefout "revision '$revset' queued at $id"
 }
 
-cmd_run() {
+# Process one queue item. Returns:
+#   0 = success (item merged)
+#   1 = failure (conflict, check failed, etc.)
+#   2 = queue empty
+run_one_item() {
     local id
-    id="$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' | grep -E '^jjq/queue/[0-9]{6}$' | cut -f3 -d'/' | sort -n | head -1)"
+    id="$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' | grep -E '^jjq/queue/[0-9]{6}$' | cut -f3 -d'/' | sort -n | head -1 || true)"
     if [ -z "$id" ]; then
         prefout "queue is empty"
-        exit 0
+        return 2
     fi
     prefout "processing queue item $id"
 
@@ -344,7 +348,7 @@ cmd_run() {
 
     if [ -z "$check_command" ]; then
         preferr "check_command not configured (use 'jjq config check_command <cmd>')"
-        exit 1
+        return 1
     fi
 
     # Record trunk commit ID to detect if it moves during run
@@ -359,11 +363,11 @@ cmd_run() {
     # Take the run lock using mkdir atomicity
     if ! acquire_lock "run"; then
         preferr "queue runner lock already held"
-        exit 1
+        return 1
     fi
 
     # shellcheck disable=SC2064 # Intentional: capture vars now
-    trap "release_lock run; rm -rf $runner_workspace" EXIT
+    trap "release_lock run; rm -rf $runner_workspace" RETURN
 
     # Create a workspace to attempt the merge, with a new commit for the
     # merge-to-be with two parents: the trunk and the candidate revision
@@ -386,9 +390,9 @@ cmd_run() {
         preferr "merge $id has conflicts, marked as failed"
         preferr "workspace remains: $runner_workspace"
         # Keep workspace for debugging, but release lock
-        trap - EXIT
+        trap - RETURN
         release_lock "run"
-        exit 1
+        return 1
     fi
 
     run_quiet jj desc -m "WIP: attempting merge $id"
@@ -414,9 +418,9 @@ cmd_run() {
         preferr "merge $id check failed"
         preferr "workspace remains: $runner_workspace"
         # Keep workspace for debugging, but release lock
-        trap - EXIT
+        trap - RETURN
         release_lock "run"
-        exit 1
+        return 1
     fi
 
     # Verify trunk hasn't moved during the run
@@ -429,10 +433,10 @@ cmd_run() {
         rm -rf "$runner_workspace"
         # Release lock
         release_lock "run"
-        trap - EXIT
+        trap - RETURN
         # Leave queue item in place for retry
         preferr "trunk bookmark moved during run; queue item left in place, re-run to retry"
-        exit 1
+        return 1
     fi
 
     # Success path
@@ -458,8 +462,59 @@ cmd_run() {
 
     # Explicit cleanup (trap is backup for unexpected exits)
     release_lock "run"
-    trap - EXIT
+    trap - RETURN
     rm -rf "$runner_workspace"
+    return 0
+}
+
+cmd_run() {
+    local run_all=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all)
+                run_all=true
+                shift
+                ;;
+            *)
+                preferr "unknown option: $1"
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ "$run_all" = true ]; then
+        # Process all items until queue is empty or failure
+        local merged_count=0
+        while true; do
+            local result
+            run_one_item && result=0 || result=$?
+            if [ $result -eq 0 ]; then
+                # Success, continue processing
+                merged_count=$((merged_count + 1))
+            elif [ $result -eq 2 ]; then
+                # Queue empty
+                if [ $merged_count -gt 0 ]; then
+                    prefout "processed $merged_count item(s)"
+                fi
+                exit 0
+            else
+                # Failure
+                if [ $merged_count -gt 0 ]; then
+                    prefout "processed $merged_count item(s) before failure"
+                fi
+                exit 1
+            fi
+        done
+    else
+        # Process single item
+        local result
+        run_one_item && result=0 || result=$?
+        if [ $result -eq 2 ]; then
+            exit 0  # Queue empty is success for single run
+        fi
+        exit $result
+    fi
 }
 
 cmd_status() {
