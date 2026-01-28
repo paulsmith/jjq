@@ -1,3 +1,5 @@
 test/
 .workspaces/
 .jj-*
+.ws/
+/target
