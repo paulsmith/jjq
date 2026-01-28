@@ -144,6 +144,7 @@ The working tree of revisions on the metadata branch contains:
 |--------------------|--------------------------------------|---------------|
 | `last_id`          | Current sequence ID counter          | ASCII integer |
 | `config/<key>`     | Configuration values                 | ASCII text    |
+| `log_hint_shown`   | Log filter hint display marker       | ASCII text    |
 
 ##### Sequence ID Store (`last_id`)
 
@@ -194,6 +195,19 @@ Defined configuration keys:
 
 The `check_command` key has no default. If unconfigured, the `run` command
 MUST fail with an error indicating that configuration is required.
+
+##### Log Hint Marker (`log_hint_shown`)
+
+The file `log_hint_shown` is a marker indicating that the log filter hint
+has been displayed to the user. Its presence (not its contents) determines
+whether the hint should be shown.
+
+- If the file exists: the hint MUST NOT be shown
+- If the file does not exist: the hint MAY be shown (subject to other
+  conditions; see §Initialization - Log Filter Hint)
+
+This file is created automatically when the hint is displayed and MUST NOT
+be created during initialization.
 
 ---
 
@@ -308,6 +322,33 @@ Initialization MUST:
 
 Initialization MUST be idempotent - if already initialized, it MUST
 succeed without modification.
+
+#### Log Filter Hint
+
+After initialization, implementations SHOULD display a one-time hint
+suggesting how to hide jjq metadata from `jj log` output. This hint
+helps users configure their repository to exclude the `jjq/_/_` branch
+from normal log views.
+
+The hint MUST only be shown when ALL of the following conditions are met:
+1. Standard output is connected to a terminal (TTY detection)
+2. The jj `revsets.log` configuration does not already reference the
+   jjq metadata bookmark
+3. The `log_hint_shown` marker file does not exist in the metadata branch
+
+When shown, the hint SHOULD suggest running:
+```
+jj config set --repo revsets.log '~ ::jjq/_/_'
+```
+
+After displaying the hint, implementations MUST create the `log_hint_shown`
+file in the metadata branch to prevent the hint from appearing again.
+The file contents are not significant; its presence is the marker.
+
+This hint-based approach ensures:
+- Scripts and non-interactive contexts are not blocked by prompts
+- Users are informed of the configuration option
+- The hint appears only once per repository
 
 ### Common Behaviors
 
