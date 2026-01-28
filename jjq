@@ -598,28 +598,44 @@ cmd_run() {
     done
 
     if [ "$run_all" = true ]; then
-        # Process all items until queue is empty or failure
         local merged_count=0
+        local failed_count=0
+        local first_failure=""
         while true; do
             local result
             run_one_item && result=0 || result=$?
-            if [ $result -eq 0 ]; then
-                # Success, continue processing
+            if [ $result -eq $EXIT_SUCCESS ]; then
                 merged_count=$((merged_count + 1))
             elif [ $result -eq $_EXIT_QUEUE_EMPTY ]; then
-                # Queue empty
-                if [ $merged_count -gt 0 ]; then
-                    prefout "processed $merged_count item(s)"
+                break
+            elif [ $result -eq $EXIT_LOCK_HELD ]; then
+                # Can't process anything while another runner is active
+                if [ $merged_count -gt 0 ] || [ $failed_count -gt 0 ]; then
+                    prefout "processed $merged_count item(s), $failed_count failed (lock held, stopping)"
                 fi
-                exit 0
+                exit $EXIT_LOCK_HELD
             else
-                # Failure
-                if [ $merged_count -gt 0 ]; then
-                    prefout "processed $merged_count item(s) before failure"
+                # Conflict or check failure - skip and continue
+                failed_count=$((failed_count + 1))
+                if [ -z "$first_failure" ]; then
+                    first_failure=$result
                 fi
-                exit 1
             fi
         done
+
+        local total=$((merged_count + failed_count))
+        if [ $total -gt 0 ]; then
+            if [ $failed_count -eq 0 ]; then
+                prefout "processed $merged_count item(s)"
+            else
+                prefout "processed $merged_count item(s), $failed_count failed"
+            fi
+        fi
+
+        if [ $failed_count -gt 0 ]; then
+            exit "$first_failure"
+        fi
+        exit $EXIT_SUCCESS
     else
         # Process single item
         local result
