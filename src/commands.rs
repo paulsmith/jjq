@@ -72,14 +72,15 @@ fn lookup_workspace_path(id: u32) -> Option<String> {
 /// Push a revision onto the merge queue.
 pub fn push(revset: &str) -> Result<()> {
     // Resolve both change ID and commit ID
-    let (change_id, commit_id) = jj::resolve_revset_full(revset)?;
+    let (change_id, commit_id) = jj::resolve_revset_full(revset)
+        .map_err(|e| ExitError::new(exit_codes::USAGE, e.to_string()))?;
 
     // Get trunk bookmark
     let trunk_bookmark = config::get_trunk_bookmark()?;
 
     // Verify trunk bookmark exists
     if !jj::bookmark_exists(&trunk_bookmark)? {
-        bail!("trunk bookmark '{}' not found", trunk_bookmark);
+        return Err(ExitError::new(exit_codes::USAGE, format!("trunk bookmark '{}' not found", trunk_bookmark)).into());
     }
 
     // Idempotent push: clean up existing queue/failed entries for this change
