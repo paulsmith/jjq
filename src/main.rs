@@ -3,6 +3,7 @@
 
 mod commands;
 mod config;
+mod exit_codes;
 mod jj;
 mod lock;
 mod queue;
@@ -55,6 +56,10 @@ enum Commands {
 
 fn main() {
     if let Err(e) = run() {
+        if let Some(exit_err) = e.downcast_ref::<exit_codes::ExitError>() {
+            eprintln!("jjq: {}", exit_err.message);
+            std::process::exit(exit_err.code);
+        }
         eprintln!("jjq: {}", e);
         std::process::exit(1);
     }

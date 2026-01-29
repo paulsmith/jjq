@@ -7,6 +7,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use crate::config;
+use crate::exit_codes::{self, ExitError};
 use crate::jj;
 use crate::lock::{self, Lock};
 use crate::queue;
@@ -57,7 +58,7 @@ pub fn push(revset: &str) -> Result<()> {
             "rebase onto {} and resolve conflicts before pushing",
             trunk_bookmark
         ));
-        bail!("revision conflicts with trunk");
+        return Err(ExitError::new(exit_codes::CONFLICT, "revision conflicts with trunk").into());
     }
 
     config::ensure_initialized()?;
@@ -83,7 +84,7 @@ pub fn run(all: bool) -> Result<()> {
         match run_one()? {
             RunResult::Success => Ok(()),
             RunResult::Empty => Ok(()),
-            RunResult::Failure(msg) => bail!("{}", msg),
+            RunResult::Failure(code, msg) => Err(ExitError::new(code, msg).into()),
         }
     }
 }
@@ -91,7 +92,7 @@ pub fn run(all: bool) -> Result<()> {
 enum RunResult {
     Success,
     Empty,
-    Failure(String),
+    Failure(i32, String),
 }
 
 fn run_all() -> Result<()> {
@@ -108,11 +109,11 @@ fn run_all() -> Result<()> {
                 }
                 return Ok(());
             }
-            RunResult::Failure(msg) => {
+            RunResult::Failure(code, msg) => {
                 if merged_count > 0 {
                     prefout(&format!("processed {} item(s) before failure", merged_count));
                 }
-                bail!("{}", msg);
+                return Err(ExitError::new(code, msg).into());
             }
         }
     }
@@ -138,6 +139,7 @@ fn run_one() -> Result<RunResult> {
         None => {
             preferr("check_command not configured (use 'jjq config check_command <cmd>')");
             return Ok(RunResult::Failure(
+                exit_codes::USAGE,
                 "check_command not configured".to_string(),
             ));
         }
@@ -148,7 +150,7 @@ fn run_one() -> Result<RunResult> {
         Some(lock) => lock,
         None => {
             preferr("queue runner lock already held");
-            return Ok(RunResult::Failure("run lock unavailable".to_string()));
+            return Ok(RunResult::Failure(exit_codes::LOCK_HELD, "run lock unavailable".to_string()));
         }
     };
 
@@ -186,7 +188,7 @@ fn run_one() -> Result<RunResult> {
 
         preferr(&format!("merge {} has conflicts, marked as failed", id));
         preferr(&format!("workspace remains: {}", ws_path.display()));
-        return Ok(RunResult::Failure(format!("merge {} has conflicts", id)));
+        return Ok(RunResult::Failure(exit_codes::CONFLICT, format!("merge {} has conflicts", id)));
     }
 
     jj::describe(&workspace_rev, &format!("WIP: attempting merge {}", id))?;
@@ -211,7 +213,7 @@ fn run_one() -> Result<RunResult> {
 
         preferr(&format!("merge {} check failed", id));
         preferr(&format!("workspace remains: {}", ws_path.display()));
-        return Ok(RunResult::Failure(format!("merge {} check failed", id)));
+        return Ok(RunResult::Failure(exit_codes::CHECK_FAILED, format!("merge {} check failed", id)));
     }
 
     // Verify trunk hasn't moved
@@ -223,7 +225,7 @@ fn run_one() -> Result<RunResult> {
         drop(run_lock);
 
         preferr("trunk bookmark moved during run; queue item left in place, re-run to retry");
-        return Ok(RunResult::Failure("trunk moved during run".to_string()));
+        return Ok(RunResult::Failure(exit_codes::TRUNK_MOVED, "trunk moved during run".to_string()));
     }
 
     // Success path
