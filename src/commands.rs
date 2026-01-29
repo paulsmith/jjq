@@ -41,6 +41,34 @@ fn extract_candidate_trailer(description: &str) -> Option<String> {
     None
 }
 
+/// Look up the filesystem path of a workspace from jjq metadata log history.
+fn lookup_workspace_path(id: u32) -> Option<String> {
+    let output = jj::run_ok(&[
+        "log",
+        "-r",
+        "ancestors(bookmarks(exact:\"jjq/_/_\"), 100)",
+        "--no-graph",
+        "-T",
+        "description ++ \"\\n---\\n\"",
+    ]);
+    match output {
+        Ok(text) => {
+            let needle = format!("Sequence-Id: {}", id);
+            for block in text.split("\n---\n") {
+                if block.contains(&needle) {
+                    for line in block.lines() {
+                        if let Some(path) = line.strip_prefix("Workspace: ") {
+                            return Some(path.trim().to_string());
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 /// Push a revision onto the merge queue.
 pub fn push(revset: &str) -> Result<()> {
     // Resolve both change ID and commit ID
@@ -390,8 +418,27 @@ pub fn delete(id_str: &str) -> Result<()> {
 
     // Check failed
     if queue::failed_item_exists(id)? {
+        let padded = queue::format_seq_id(id);
+        let run_name = format!("jjq-run-{}", padded);
+
+        // Look up workspace path before deleting
+        let workspace_path = lookup_workspace_path(id);
+
         jj::bookmark_delete(&queue::failed_bookmark(id))?;
-        prefout(&format!("deleted failed item {}", id));
+        prefout(&format!("deleted failed item {}", id_str));
+
+        // Try to forget the workspace (silently ignore if not found)
+        let _ = jj::workspace_forget(&run_name);
+
+        // Remove directory if found and still exists
+        if let Some(ref path) = workspace_path {
+            let p = std::path::Path::new(path);
+            if p.is_dir() {
+                let _ = std::fs::remove_dir_all(p);
+                prefout(&format!("removed workspace {}", path));
+            }
+        }
+
         return Ok(());
     }
 
@@ -445,4 +492,60 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
             bail!("cannot set value without key")
         }
     }
+}
+
+/// Remove all jjq workspaces and their directories.
+pub fn clean() -> Result<()> {
+    let ws_output = jj::workspace_list()?;
+
+    let mut removed = 0u32;
+    let mut details = Vec::new();
+
+    for line in ws_output.lines() {
+        let ws_name = line.split_whitespace().next().unwrap_or("");
+        let ws_name = ws_name.trim_end_matches(':');
+        if !ws_name.starts_with("jjq-run-") {
+            continue;
+        }
+
+        // Extract ID from workspace name
+        let ws_id_str = ws_name.strip_prefix("jjq-run-").unwrap_or("000000");
+        let plain_id: u32 = ws_id_str.parse().unwrap_or(0);
+
+        // Check if corresponding failed bookmark exists
+        let label = if queue::failed_item_exists(plain_id)? {
+            format!("failed item {}", plain_id)
+        } else {
+            "orphaned".to_string()
+        };
+
+        // Look up workspace path
+        let workspace_path = lookup_workspace_path(plain_id);
+
+        // Forget the workspace
+        let _ = jj::workspace_forget(ws_name);
+
+        // Remove directory if found
+        if let Some(ref path) = workspace_path {
+            let p = std::path::Path::new(path);
+            if p.is_dir() {
+                let _ = std::fs::remove_dir_all(p);
+            }
+        }
+
+        let path_info = workspace_path
+            .map(|p| format!(" {}", p))
+            .unwrap_or_default();
+        details.push(format!("  {} ({}){}", ws_name, label, path_info));
+        removed += 1;
+    }
+
+    if removed == 0 {
+        prefout("no workspaces to clean");
+    } else {
+        let detail_str = details.join("\n");
+        prefout(&format!("removed {} workspace(s)\n{}", removed, detail_str));
+    }
+
+    Ok(())
 }

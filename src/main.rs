@@ -38,6 +38,8 @@ enum Commands {
         /// Sequence ID of the item
         id: String,
     },
+    /// Remove jjq workspaces
+    Clean,
     /// Get or set configuration
     Config {
         /// Configuration key
@@ -69,6 +71,7 @@ fn run() -> Result<()> {
         Commands::Run { all } => commands::run(all),
         Commands::Status => commands::status(),
         Commands::Delete { id } => commands::delete(&id),
+        Commands::Clean => commands::clean(),
         Commands::Config { key, value } => commands::config(key.as_deref(), value.as_deref()),
     }
 }

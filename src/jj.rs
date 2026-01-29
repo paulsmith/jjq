@@ -245,3 +245,8 @@ pub fn workspace_forget(name: &str) -> Result<()> {
     run_quiet(&["workspace", "forget", name])
 }
 
+/// List all workspaces (raw output from jj workspace list).
+pub fn workspace_list() -> Result<String> {
+    run_ok(&["workspace", "list"])
+}
+

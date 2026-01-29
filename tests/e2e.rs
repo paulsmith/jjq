@@ -936,3 +936,28 @@ fn test_push_idempotent_clears_failed() {
     let repush = repo.jjq_success(&["push", "fb"]);
     assert!(repush.contains("clearing failed entry"), "should clear failed entry: {}", repush);
 }
+
+#[test]
+fn test_clean_no_workspaces() {
+    let repo = TestRepo::with_go_project();
+    let output = repo.jjq_success(&["clean"]);
+    insta::assert_snapshot!(output, @"jjq: no workspaces to clean");
+}
+
+#[test]
+fn test_clean_removes_failed_workspaces() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["config", "check_command", "false"]);
+
+    run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
+    fs::write(repo.path().join("fail.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "fb"]);
+    repo.jjq_success(&["push", "fb"]);
+
+    // Run to create failed item (and preserved workspace)
+    repo.jjq_failure(&["run"]);
+
+    // Clean should find and remove the workspace
+    let output = repo.jjq_success(&["clean"]);
+    assert!(output.contains("removed 1 workspace"), "should remove workspace: {}", output);
+}
