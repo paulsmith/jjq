@@ -35,19 +35,10 @@ pub fn push(revset: &str) -> Result<()> {
         bail!("trunk bookmark '{}' not found", trunk_bookmark);
     }
 
-    // Pre-flight conflict check
-    let check_workspace = TempDir::new()?;
-    let check_workspace_name = format!("jjq-check-{}", std::process::id());
-
-    jj::workspace_add(
-        check_workspace.path().to_str().unwrap(),
-        &check_workspace_name,
-        &[&trunk_bookmark, revset],
-    )?;
-
-    let has_conflicts = jj::has_conflicts(&format!("{}@", check_workspace_name))?;
-
-    jj::workspace_forget(&check_workspace_name)?;
+    // Pre-flight conflict check using headless merge commit
+    let conflict_check_id = jj::new_rev(&[&trunk_bookmark, revset])?;
+    let has_conflicts = jj::has_conflicts(&conflict_check_id)?;
+    jj::abandon(&conflict_check_id)?;
 
     if has_conflicts {
         preferr(&format!(

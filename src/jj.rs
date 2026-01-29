@@ -190,6 +190,11 @@ pub fn describe(rev: &str, message: &str) -> Result<()> {
     run_quiet(&["desc", "-r", rev, "-m", message])
 }
 
+/// Abandon a revision.
+pub fn abandon(rev: &str) -> Result<()> {
+    run_quiet(&["abandon", rev])
+}
+
 /// Show file contents from a revision.
 pub fn file_show(path: &str, rev: &str) -> Result<String> {
     run_ok(&["file", "show", path, "-r", rev])
