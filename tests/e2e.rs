@@ -455,9 +455,24 @@ fn test_push_and_status() {
 fn test_push_conflict_detection() {
     let repo = TestRepo::with_go_project();
 
-    // Create a branch that conflicts with main
-    run_jj(repo.path(), &["new", "-m", "conflicting change", "main"]);
-    // Modify main.go in a way that will conflict
+    // Create a branch that modifies main.go one way
+    run_jj(repo.path(), &["new", "-m", "trunk advance", "main"]);
+    fs::write(
+        repo.path().join("main.go"),
+        r#"package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("Modified main!")
+}
+"#,
+    )
+    .unwrap();
+    run_jj(repo.path(), &["bookmark", "move", "main"]);
+
+    // Create a conflicting branch from the original main (root)
+    run_jj(repo.path(), &["new", "-m", "conflicting change", "root()"]);
     fs::write(
         repo.path().join("main.go"),
         r#"package main
@@ -471,42 +486,6 @@ func main() {
     )
     .unwrap();
     run_jj(repo.path(), &["bookmark", "create", "conflict-branch"]);
-
-    // First push succeeds
-    repo.jjq_success(&["push", "conflict-branch"]);
-
-    // Modify main directly to create conflict scenario
-    run_jj(repo.path(), &["edit", "main"]);
-    fs::write(
-        repo.path().join("main.go"),
-        r#"package main
-
-import "fmt"
-
-func main() {
-	fmt.Println("Modified main!")
-}
-"#,
-    )
-    .unwrap();
-    run_jj(repo.path(), &["desc", "-m", "modify main"]);
-
-    // Create another branch from the modified main
-    run_jj(repo.path(), &["new", "-m", "another change", "@"]);
-    fs::write(
-        repo.path().join("main.go"),
-        r#"package main
-
-import "fmt"
-
-func main() {
-	fmt.Println("Yet another change!")
-}
-"#,
-    )
-    .unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "another-branch"]);
-    run_jj(repo.path(), &["bookmark", "move", "main", "--to", "@-"]);
 
     // This should fail with conflict detection
     let output = repo.jjq_failure(&["push", "conflict-branch"]);
@@ -797,19 +776,13 @@ fn test_full_workflow_with_prs() {
 fn test_multiple_push_same_revision() {
     let repo = TestRepo::with_go_project();
 
-    // Push main twice - should get different sequence IDs
+    // Push main once - should succeed
     let push1 = repo.jjq_success(&["push", "main"]);
     insta::assert_snapshot!(push1, @"jjq: revision 'main' queued at 1");
 
-    let push2 = repo.jjq_success(&["push", "main"]);
-    insta::assert_snapshot!(push2, @"jjq: revision 'main' queued at 2");
-
-    let status = repo.jjq_success(&["status"]);
-    insta::assert_snapshot!(status, @r"
-    jjq: Queued:
-      1: <CHANGE_ID> initial
-      2: <CHANGE_ID> initial
-    ");
+    // Push same commit ID again - should be rejected as duplicate
+    let push2 = repo.jjq_output(&["push", "main"]);
+    assert!(push2.contains("already queued at 1"), "should reject duplicate: {}", push2);
 }
 
 #[test]
@@ -924,4 +897,42 @@ fn test_log_hint_skipped_when_filter_configured() {
         !repo.jj_file_exists("log_hint_shown", "jjq/_/_"),
         "log_hint_shown should not be recorded when filter already configured"
     );
+}
+
+#[test]
+fn test_push_exact_duplicate_rejected() {
+    let repo = TestRepo::with_go_project();
+
+    repo.jjq_success(&["push", "main"]);
+
+    // Same commit ID should be rejected
+    let output = repo.jjq_output(&["push", "main"]);
+    assert!(output.contains("already queued"), "should reject exact duplicate: {}", output);
+}
+
+#[test]
+fn test_push_idempotent_clears_failed() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["config", "check_command", "false"]);
+
+    // Create and push a branch
+    run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
+    fs::write(repo.path().join("fail.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "fb"]);
+    repo.jjq_success(&["push", "fb"]);
+
+    // Run to create failed item
+    repo.jjq_failure(&["run"]);
+
+    // Verify failed item exists
+    let status = repo.jjq_success(&["status"]);
+    assert!(status.contains("Failed"), "should have failed item: {}", status);
+
+    // Amend the revision (changes commit ID, keeps change ID)
+    run_jj(repo.path(), &["edit", "fb"]);
+    fs::write(repo.path().join("fail.txt"), "fixed content").unwrap();
+
+    // Re-push should clear the failed entry
+    let repush = repo.jjq_success(&["push", "fb"]);
+    assert!(repush.contains("clearing failed entry"), "should clear failed entry: {}", repush);
 }

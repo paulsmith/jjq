@@ -128,10 +128,37 @@ pub fn resolve_revset(revset: &str) -> Result<String> {
     Ok(change_id.to_string())
 }
 
+/// Resolve a revset to both change ID and commit ID.
+pub fn resolve_revset_full(revset: &str) -> Result<(String, String)> {
+    let output = run(&[
+        "log", "-r", revset, "--no-graph", "-T",
+        "change_id.short() ++ \" \" ++ commit_id",
+    ])?;
+    if !output.status.success() {
+        bail!("revset '{}' not found", revset);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.trim();
+    if line.is_empty() {
+        bail!("revset '{}' not found", revset);
+    }
+    if line.contains('\n') {
+        bail!("revset '{}' resolves to multiple revisions", revset);
+    }
+    let (change_id, commit_id) = line.split_once(' ')
+        .ok_or_else(|| anyhow::anyhow!("unexpected output format from jj log"))?;
+    Ok((change_id.to_string(), commit_id.to_string()))
+}
+
 /// Get the commit ID for a revision.
 pub fn get_commit_id(revset: &str) -> Result<String> {
     run_ok(&["log", "-r", revset, "--no-graph", "-T", "commit_id"])
         .map(|s| s.trim().to_string())
+}
+
+/// Get the full description of a revision.
+pub fn get_description(revset: &str) -> Result<String> {
+    run_ok(&["log", "-r", revset, "--no-graph", "-T", "description"])
 }
 
 /// Check if a revision has conflicts.

@@ -22,17 +22,68 @@ fn preferr(msg: &str) {
     eprintln!("jjq: {}", msg);
 }
 
+/// Extract the numeric ID from a bookmark name like "jjq/queue/000042".
+fn extract_id_from_bookmark(bookmark: &str) -> u32 {
+    bookmark
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Extract the change ID from a "jjq-candidate: <id>" trailer in a description.
+fn extract_candidate_trailer(description: &str) -> Option<String> {
+    for line in description.lines() {
+        if let Some(id) = line.strip_prefix("jjq-candidate: ") {
+            return Some(id.trim().to_string());
+        }
+    }
+    None
+}
+
 /// Push a revision onto the merge queue.
 pub fn push(revset: &str) -> Result<()> {
-    // Resolve the revset to verify it exists and is unique
-    let _change_id = jj::resolve_revset(revset)?;
+    // Resolve both change ID and commit ID
+    let (change_id, commit_id) = jj::resolve_revset_full(revset)?;
 
-    // Get trunk bookmark for conflict check
+    // Get trunk bookmark
     let trunk_bookmark = config::get_trunk_bookmark()?;
 
     // Verify trunk bookmark exists
     if !jj::bookmark_exists(&trunk_bookmark)? {
         bail!("trunk bookmark '{}' not found", trunk_bookmark);
+    }
+
+    // Idempotent push: clean up existing queue/failed entries for this change
+
+    // Scan queue bookmarks
+    let queue_bookmarks = jj::bookmark_list_glob("jjq/queue/??????")?;
+    for bookmark in &queue_bookmarks {
+        let entry_commit_id = jj::get_commit_id(&format!("bookmarks(exact:{})", bookmark))?;
+        if entry_commit_id == commit_id {
+            let entry_id = extract_id_from_bookmark(bookmark);
+            preferr(&format!("revision already queued at {}", entry_id));
+            return Err(ExitError::new(exit_codes::USAGE, "revision already queued").into());
+        }
+        let entry_change_id = jj::resolve_revset(&format!("bookmarks(exact:{})", bookmark))?;
+        if entry_change_id == change_id {
+            let entry_id = extract_id_from_bookmark(bookmark);
+            jj::bookmark_delete(bookmark)?;
+            prefout(&format!("replacing queued entry {}", entry_id));
+        }
+    }
+
+    // Scan failed bookmarks: extract candidate change ID from jjq-candidate trailer
+    let failed_bookmarks = jj::bookmark_list_glob("jjq/failed/??????")?;
+    for bookmark in &failed_bookmarks {
+        let desc = jj::get_description(&format!("bookmarks(exact:{})", bookmark))?;
+        if let Some(candidate_change_id) = extract_candidate_trailer(&desc) {
+            if candidate_change_id == change_id {
+                let entry_id = extract_id_from_bookmark(bookmark);
+                jj::bookmark_delete(bookmark)?;
+                prefout(&format!("clearing failed entry {}", entry_id));
+            }
+        }
     }
 
     // Pre-flight conflict check using headless merge commit
