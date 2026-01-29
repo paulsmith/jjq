@@ -87,7 +87,9 @@ enum RunResult {
 }
 
 fn run_all() -> Result<()> {
-    let mut merged_count = 0;
+    let mut merged_count = 0u32;
+    let mut failed_count = 0u32;
+    let mut first_failure: Option<i32> = None;
 
     loop {
         match run_one()? {
@@ -95,19 +97,41 @@ fn run_all() -> Result<()> {
                 merged_count += 1;
             }
             RunResult::Empty => {
-                if merged_count > 0 {
-                    prefout(&format!("processed {} item(s)", merged_count));
-                }
-                return Ok(());
+                break;
             }
-            RunResult::Failure(code, msg) => {
-                if merged_count > 0 {
-                    prefout(&format!("processed {} item(s) before failure", merged_count));
+            RunResult::Failure(code, _msg) => {
+                if code == exit_codes::LOCK_HELD {
+                    // Can't process anything while another runner is active
+                    if merged_count > 0 || failed_count > 0 {
+                        prefout(&format!(
+                            "processed {} item(s), {} failed (lock held, stopping)",
+                            merged_count, failed_count
+                        ));
+                    }
+                    return Err(ExitError::new(exit_codes::LOCK_HELD, "run lock unavailable").into());
                 }
-                return Err(ExitError::new(code, msg).into());
+                // Conflict or check failure — skip and continue
+                failed_count += 1;
+                if first_failure.is_none() {
+                    first_failure = Some(code);
+                }
             }
         }
     }
+
+    let total = merged_count + failed_count;
+    if total > 0 {
+        if failed_count == 0 {
+            prefout(&format!("processed {} item(s)", merged_count));
+        } else {
+            prefout(&format!("processed {} item(s), {} failed", merged_count, failed_count));
+        }
+    }
+
+    if let Some(code) = first_failure {
+        return Err(ExitError::new(code, "one or more items failed").into());
+    }
+    Ok(())
 }
 
 fn run_one() -> Result<RunResult> {
@@ -148,10 +172,13 @@ fn run_one() -> Result<RunResult> {
     // Record trunk commit ID
     let trunk_commit_id = jj::get_commit_id(&format!("bookmarks(exact:{})", trunk_bookmark))?;
 
+    // Capture candidate change ID before creating workspace
+    let queue_bookmark = queue::queue_bookmark(id);
+    let candidate_change_id = jj::resolve_revset(&format!("bookmarks(exact:{})", queue_bookmark))?;
+
     // Create workspace for merge
     let runner_workspace = TempDir::new()?;
     let run_name = format!("jjq-run-{}", queue::format_seq_id(id));
-    let queue_bookmark = queue::queue_bookmark(id);
 
     jj::workspace_add(
         runner_workspace.path().to_str().unwrap(),
@@ -170,15 +197,21 @@ fn run_one() -> Result<RunResult> {
     if jj::has_conflicts(&workspace_rev)? {
         jj::bookmark_delete(&queue_bookmark)?;
         jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
-        jj::describe(&workspace_rev, &format!("Failed: merge {} (conflicts)", id))?;
+        jj::describe(
+            &workspace_rev,
+            &format!("Failed: merge {} (conflicts)\n\njjq-candidate: {}", id, candidate_change_id),
+        )?;
 
         env::set_current_dir(&orig_dir)?;
-        // Keep workspace for debugging
         let ws_path = runner_workspace.keep();
         drop(run_lock);
 
         preferr(&format!("merge {} has conflicts, marked as failed", id));
-        preferr(&format!("workspace remains: {}", ws_path.display()));
+        preferr(&format!("workspace: {}", ws_path.display()));
+        preferr("");
+        preferr("To resolve:");
+        preferr(&format!("  1. Rebase your revision onto {} and resolve conflicts", trunk_bookmark));
+        preferr("  2. Run: jjq push <fixed-revset>");
         return Ok(RunResult::Failure(exit_codes::CONFLICT, format!("merge {} has conflicts", id)));
     }
 
@@ -196,14 +229,21 @@ fn run_one() -> Result<RunResult> {
 
         jj::bookmark_delete(&queue_bookmark)?;
         jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
-        jj::describe(&workspace_rev, &format!("Failed: merge {} (check)", id))?;
+        jj::describe(
+            &workspace_rev,
+            &format!("Failed: merge {} (check)\n\njjq-candidate: {}", id, candidate_change_id),
+        )?;
 
         env::set_current_dir(&orig_dir)?;
         let ws_path = runner_workspace.keep();
         drop(run_lock);
 
-        preferr(&format!("merge {} check failed", id));
-        preferr(&format!("workspace remains: {}", ws_path.display()));
+        preferr(&format!("merge {} failed check, marked as failed", id));
+        preferr(&format!("workspace: {}", ws_path.display()));
+        preferr("");
+        preferr("To resolve:");
+        preferr("  1. Fix the issue and create a new revision");
+        preferr("  2. Run: jjq push <fixed-revset>");
         return Ok(RunResult::Failure(exit_codes::CHECK_FAILED, format!("merge {} check failed", id)));
     }
 

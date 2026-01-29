@@ -579,8 +579,12 @@ fn test_run_check_failure() {
     jjq: processing queue item 1
 
 
-    jjq: merge 1 check failed
-    jjq: workspace remains: <TEMP_PATH>
+    jjq: merge 1 failed check, marked as failed
+    jjq: workspace: <TEMP_PATH>
+    jjq:
+    jjq: To resolve:
+    jjq:   1. Fix the issue and create a new revision
+    jjq:   2. Run: jjq push <fixed-revset>
     jjq: merge 1 check failed
     ");
 
@@ -769,7 +773,11 @@ fn test_full_workflow_with_prs() {
     insta::assert_snapshot!(run2, @r"
     jjq: processing queue item 2
     jjq: merge 2 has conflicts, marked as failed
-    jjq: workspace remains: <TEMP_PATH>
+    jjq: workspace: <TEMP_PATH>
+    jjq:
+    jjq: To resolve:
+    jjq:   1. Rebase your revision onto main and resolve conflicts
+    jjq:   2. Run: jjq push <fixed-revset>
     jjq: merge 2 has conflicts
     ");
 
@@ -855,6 +863,46 @@ fn test_log_hint_shown_once_when_forced() {
         !output2.contains("hint:"),
         "hint should not appear on second push"
     );
+}
+
+#[test]
+fn test_run_all_continues_past_failures() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["config", "check_command", "true"]);
+
+    // f1: modifies main.go (will merge cleanly against trunk)
+    run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
+    fs::write(
+        repo.path().join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 1\")\n}\n",
+    )
+    .unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f1"]);
+
+    // f2: also modifies main.go differently — will conflict after f1 merges
+    run_jj(repo.path(), &["new", "-m", "feature 2", "main"]);
+    fs::write(
+        repo.path().join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 2\")\n}\n",
+    )
+    .unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f2"]);
+
+    // f3: clean merge (just adds a file)
+    run_jj(repo.path(), &["new", "-m", "feature 3", "main"]);
+    fs::write(repo.path().join("f3.txt"), "feature 3").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f3"]);
+
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+    repo.jjq_success(&["push", "f3"]);
+
+    // run --all should process f1, fail on f2 (conflict), continue to f3
+    let output = repo.jjq_output(&["run", "--all"]);
+    assert!(output.contains("merged 1 to main"), "f1 should merge: {}", output);
+    assert!(output.contains("merge 2 has conflicts"), "f2 should conflict: {}", output);
+    assert!(output.contains("merged 3 to main"), "f3 should merge: {}", output);
+    assert!(output.contains("2 item(s), 1 failed"), "summary should show 2 merged, 1 failed: {}", output);
 }
 
 #[test]
