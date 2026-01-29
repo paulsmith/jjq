@@ -1,7 +1,7 @@
 # Remove retry command, make push idempotent
 
 Date: 2026-01-28
-Status: Proposed
+Status: Implemented
 
 ## Context
 

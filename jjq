@@ -148,6 +148,7 @@ set_config() {
 
     local d
     d=$(mktemp -d)
+    # shellcheck disable=SC2064 # Intentional: capture $d now
     trap "rm -rf $d" EXIT
 
     local workspace_name="jjq-config-$$"
@@ -246,7 +247,6 @@ usage() {
     err "   push <revset>           - push revision on merge queue"
     err "   run [--all]             - try to merge next candidate (or all) on queue"
     err "   status                  - print the status of the queue"
-    err "   retry <id> [revset]     - retry a failed merge"
     err "   delete <id>             - delete a queued or failed item"
     err "   config [key] [value]    - get/set configuration"
     err "   clean                  - remove failed workspaces"
@@ -373,16 +373,49 @@ cmd_push() {
     local revset="$1"
     shift
 
-    # Dereference the stable change ID from the revset
-    local change_id
-    change_id=$(jj log -r "$revset" --no-graph -T'change_id.short()' 2>/dev/null) || {
+    # Dereference the stable change ID and commit ID from the revset
+    local change_id commit_id ids
+    ids=$(jj log -r "$revset" --no-graph -T'change_id.short() ++ " " ++ commit_id' 2>/dev/null) || {
         preferr "revset '$revset' not found"
         exit $EXIT_USAGE
     }
+    change_id="${ids%% *}"
+    commit_id="${ids#* }"
 
-    # Pre-flight conflict check: verify revision could merge cleanly with trunk
+    # Resolve trunk bookmark (needed for both idempotent cleanup and preflight)
     local trunk_bookmark
     trunk_bookmark=$(get_trunk_bookmark)
+
+    # Idempotent push: clean up existing queue/failed entries for this change
+    local bookmark entry_id entry_change_id entry_commit_id
+
+    # Scan queue bookmarks
+    for bookmark in $(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/queue/[0-9]{6}$' || true); do
+        entry_commit_id=$(jj log -r "bookmarks(exact:$bookmark)" --no-graph -T'commit_id' 2>/dev/null) || continue
+        if [ "$entry_commit_id" = "$commit_id" ]; then
+            entry_id=$((10#${bookmark##*/}))
+            preferr "revision already queued at $entry_id"
+            exit $EXIT_USAGE
+        fi
+        entry_change_id=$(jj log -r "bookmarks(exact:$bookmark)" --no-graph -T'change_id.short()' 2>/dev/null) || continue
+        if [ "$entry_change_id" = "$change_id" ]; then
+            entry_id=$((10#${bookmark##*/}))
+            run_quiet jj bookmark delete "$bookmark"
+            prefout "replacing queued entry $entry_id"
+        fi
+    done
+
+    # Scan failed bookmarks: extract candidate change ID from jjq-candidate trailer
+    for bookmark in $(jj bookmark list -r 'bookmarks(glob:"jjq/failed/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/failed/[0-9]{6}$' || true); do
+        entry_change_id=$(jj log -r "bookmarks(exact:$bookmark)" --no-graph -T'description' 2>/dev/null | grep '^jjq-candidate: ' | head -1 | sed 's/^jjq-candidate: //') || continue
+        if [ "$entry_change_id" = "$change_id" ]; then
+            entry_id=$((10#${bookmark##*/}))
+            run_quiet jj bookmark delete "$bookmark"
+            prefout "clearing failed entry $entry_id"
+        fi
+    done
+
+    # Pre-flight conflict check: verify revision could merge cleanly with trunk
     preflight_conflict_check "$revset" "$trunk_bookmark" || exit $?
 
     ensure_jjq
@@ -452,10 +485,9 @@ run_one_item() {
     # shellcheck disable=SC2064 # Intentional: capture vars now
     trap "release_lock run; rm -rf $runner_workspace" RETURN
 
-    # Check if this is a retry (has pending-retry metadata)
-    # Note: pending-retries files use unpadded id (e.g., "31" not "000031")
-    local retry_of=""
-    retry_of=$(jj file show "pending-retries/$((10#$id))" -r "$jjq_bookmark" 2>/dev/null) || true
+    # Capture candidate's change ID before creating the merge workspace
+    local candidate_change_id
+    candidate_change_id=$(jj log -r "bookmarks(exact:jjq/queue/$id)" --no-graph -T'change_id.short()' 2>/dev/null)
 
     # Create a workspace to attempt the merge, with a new commit for the
     # merge-to-be with two parents: the trunk and the candidate revision
@@ -466,7 +498,7 @@ run_one_item() {
     if [ -n "$(jj log -r "${run_name}@" --no-graph -T'if(conflict, "has conflict(s)")')" ]; then
         run_quiet jj bookmark delete "jjq/queue/$id"
         run_quiet jj bookmark create -r "${run_name}@" "jjq/failed/$id"
-        run_quiet jj desc -m "Failed: merge $id (conflicts)"
+        run_quiet jj desc -m "Failed: merge $id (conflicts)"$'\n\n'"jjq-candidate: $candidate_change_id"
         popd >/dev/null
         # Log the failure with workspace path for cleanup
         log_op "" "run: failed $id (conflicts)" \
@@ -479,8 +511,8 @@ run_one_item() {
         preferr "workspace: $runner_workspace"
         preferr ""
         preferr "To resolve:"
-        preferr "  1. Fix conflicts in the workspace above (or create a new revision)"
-        preferr "  2. Run: jjq retry $((10#$id)) <fixed-revset>"
+        preferr "  1. Rebase your revision onto $trunk_bookmark and resolve conflicts"
+        preferr "  2. Run: jjq push <fixed-revset>"
         # Keep workspace for debugging, but release lock
         trap - RETURN
         release_lock "run"
@@ -497,7 +529,7 @@ run_one_item() {
         err "$check_output"
         run_quiet jj bookmark delete "jjq/queue/$id"
         run_quiet jj bookmark create -r "${run_name}@" "jjq/failed/$id"
-        run_quiet jj desc -m "Failed: merge $id (check)"
+        run_quiet jj desc -m "Failed: merge $id (check)"$'\n\n'"jjq-candidate: $candidate_change_id"
         popd >/dev/null
         # Log the failure with workspace path for cleanup
         log_op "" "run: failed $id (check)" \
@@ -512,7 +544,7 @@ run_one_item() {
         preferr ""
         preferr "To resolve:"
         preferr "  1. Fix the issue and create a new revision"
-        preferr "  2. Run: jjq retry $((10#$id)) <fixed-revset>"
+        preferr "  2. Run: jjq push <fixed-revset>"
         # Keep workspace for debugging, but release lock
         trap - RETURN
         release_lock "run"
@@ -541,30 +573,12 @@ run_one_item() {
     merge_change_id=$(jj log -r '@' --no-graph -T'change_id.short()')
 
     run_quiet jj bookmark delete "jjq/queue/$id"
-    local merge_desc="Success: merge $id"
-    if [ -n "$retry_of" ]; then
-        merge_desc="$merge_desc"$'\n\n'"jjq-retry-of: $retry_of"
-    fi
-    run_quiet jj desc -m "$merge_desc"
+    run_quiet jj desc -m "Success: merge $id"
     run_quiet jj bookmark move "$trunk_bookmark"
     popd >/dev/null
     run_quiet jj workspace forget "$run_name"
 
     prefout "merged $id to $trunk_bookmark (now at $merge_change_id)"
-
-    # Clean up pending-retry metadata if this was a retry
-    if [ -n "$retry_of" ]; then
-        local cleanup_dir
-        cleanup_dir=$(mktemp -d)
-        run_quiet jj workspace add -r "$jjq_bookmark" --name "jjq-cleanup-$$" "$cleanup_dir"
-        rm -f "$cleanup_dir/pending-retries/$((10#$id))"
-        pushd "$cleanup_dir" >/dev/null
-        run_quiet jj desc -m "cleanup: remove pending-retry for $id"
-        run_quiet jj bookmark set "$jjq_bookmark"
-        popd >/dev/null
-        run_quiet jj workspace forget "jjq-cleanup-$$"
-        rm -rf "$cleanup_dir"
-    fi
 
     # Log the success
     log_op "" "run: success $id" \
@@ -604,11 +618,11 @@ cmd_run() {
         while true; do
             local result
             run_one_item && result=0 || result=$?
-            if [ $result -eq $EXIT_SUCCESS ]; then
+            if [ "$result" -eq $EXIT_SUCCESS ]; then
                 merged_count=$((merged_count + 1))
-            elif [ $result -eq $_EXIT_QUEUE_EMPTY ]; then
+            elif [ "$result" -eq $_EXIT_QUEUE_EMPTY ]; then
                 break
-            elif [ $result -eq $EXIT_LOCK_HELD ]; then
+            elif [ "$result" -eq $EXIT_LOCK_HELD ]; then
                 # Can't process anything while another runner is active
                 if [ $merged_count -gt 0 ] || [ $failed_count -gt 0 ]; then
                     prefout "processed $merged_count item(s), $failed_count failed (lock held, stopping)"
@@ -673,18 +687,6 @@ cmd_status() {
         return
     fi
 
-    # Build retry relationship data from pending-retries/ on metadata branch
-    # Format: newline-delimited "new_id:original_id" pairs (bash 3 compatible)
-    local retry_data=""
-    local pending_retries
-    pending_retries=$(jj file list -r "$jjq_bookmark" 2>/dev/null | grep '^pending-retries/' || true)
-    for entry in $pending_retries; do
-        local new_id="${entry##*/}"
-        local original_id
-        original_id=$(jj file show "$entry" -r "$jjq_bookmark" 2>/dev/null) || continue
-        retry_data="${retry_data}${new_id}:${original_id}"$'\n'
-    done
-
     if [ -n "$queue_items" ]; then
         prefout "Queued:"
         while IFS= read -r bookmark; do
@@ -693,16 +695,7 @@ cmd_status() {
             local plain_id=$((10#$id))
             local info
             info=$(jj log -r "bookmarks(exact:$bookmark)" --no-graph -T'change_id.short() ++ " " ++ description.first_line()')
-            local annotation=""
-            if [ -n "$retry_data" ]; then
-                local match
-                match=$(echo "$retry_data" | grep "^${plain_id}:" || true)
-                if [ -n "$match" ]; then
-                    local orig="${match#*:}"
-                    annotation=" (retry of $orig)"
-                fi
-            fi
-            echo "  $plain_id: $info$annotation"
+            echo "  $plain_id: $info"
         done <<< "$queue_items"
     fi
 
@@ -717,131 +710,9 @@ cmd_status() {
             local plain_id=$((10#$id))
             local info
             info=$(jj log -r "bookmarks(exact:$bookmark)" --no-graph -T'change_id.short() ++ " " ++ description.first_line()')
-            local annotation=""
-            if [ -n "$retry_data" ]; then
-                local match
-                match=$(echo "$retry_data" | grep ":${plain_id}$" || true)
-                if [ -n "$match" ]; then
-                    local retry_id="${match%%:*}"
-                    annotation=" → retrying as $retry_id"
-                fi
-            fi
-            echo "  $plain_id: $info$annotation"
+            echo "  $plain_id: $info"
         done <<< "$failed_items"
     fi
-}
-
-cmd_retry() {
-    if [ $# -lt 1 ]; then
-        preferr "usage: jjq retry <id> [revset]"
-        exit $EXIT_USAGE
-    fi
-
-    local id="$1"
-    shift
-    local padded_id
-    padded_id=$(validate_seq_id "$id") || exit $EXIT_USAGE
-    local failed_bookmark="jjq/failed/$padded_id"
-
-    # Check if the failed bookmark exists
-    if [ -z "$(jj bookmark list -r "bookmarks(exact:$failed_bookmark)" -T name 2>/dev/null)" ]; then
-        preferr "failed item $id not found"
-        exit $EXIT_USAGE
-    fi
-
-    # Check if trunk has moved since the failure
-    local trunk_bookmark
-    trunk_bookmark=$(get_trunk_bookmark)
-
-    # Get trunk commit used in failed merge (parent 1)
-    local failed_trunk_commit
-    failed_trunk_commit=$(jj log -r "parents($failed_bookmark) & ::$trunk_bookmark" --no-graph -T'commit_id' 2>/dev/null | head -1)
-
-    # Get current trunk commit
-    local current_trunk_commit
-    current_trunk_commit=$(jj log -r "bookmarks(exact:$trunk_bookmark)" --no-graph -T'commit_id')
-
-    # Warn if trunk has moved
-    if [ -n "$failed_trunk_commit" ] && [ "$failed_trunk_commit" != "$current_trunk_commit" ]; then
-        preferr "warning: trunk has advanced since this failure"
-        preferr "hint: consider rebasing your fix onto current trunk first"
-    fi
-
-    local candidate_revset
-    if [ $# -gt 0 ]; then
-        # User provided an explicit revset
-        candidate_revset="$1"
-        if ! jj log -r "$candidate_revset" --no-graph -T'change_id.short()' >/dev/null 2>&1; then
-            preferr "revset '$candidate_revset' not found"
-            exit $EXIT_USAGE
-        fi
-        prefout "retrying failed item $id using '$candidate_revset'"
-    else
-        # Find the original candidate: the parent of the failed merge that
-        # is not an ancestor of trunk. This is more robust than relying on
-        # parent ordering.
-        local trunk_bookmark
-        trunk_bookmark=$(get_trunk_bookmark)
-        local original_candidate
-        original_candidate=$(jj log -r "parents($failed_bookmark) ~ ::$trunk_bookmark" --no-graph -T'change_id.short()' 2>/dev/null | head -1)
-
-        if [ -z "$original_candidate" ]; then
-            preferr "could not find original candidate for failed item $id"
-            exit $EXIT_USAGE
-        fi
-
-        candidate_revset="$original_candidate"
-        prefout "retrying failed item $id using original candidate $original_candidate"
-    fi
-
-    # Pre-flight conflict check: verify candidate merges cleanly with trunk
-    preflight_conflict_check "$candidate_revset" "$trunk_bookmark" || exit $?
-
-    # Push the candidate to the queue using next_id
-    ensure_jjq
-
-    local new_id
-    new_id="$(next_id)"
-
-    # Store retry metadata for later use by run command
-    local meta_dir
-    meta_dir=$(mktemp -d)
-    # shellcheck disable=SC2064 # Intentional: capture $meta_dir now
-    trap "rm -rf $meta_dir" RETURN
-
-    local meta_workspace="jjq-meta-$$"
-    run_quiet jj workspace add -r "$jjq_bookmark" --name "$meta_workspace" "$meta_dir"
-
-    mkdir -p "$meta_dir/pending-retries"
-    echo "$((10#$id))" > "$meta_dir/pending-retries/$new_id"
-
-    pushd "$meta_dir" >/dev/null
-    run_quiet jj desc -m "retry: record $new_id is retry of $id"
-    run_quiet jj bookmark set "$jjq_bookmark"
-    popd >/dev/null
-
-    run_quiet jj workspace forget "$meta_workspace"
-
-    local queue_bookmark
-    queue_bookmark="$(printf "jjq/queue/%06d" "$new_id")"
-
-    run_quiet jj bookmark create -r "$candidate_revset" "$queue_bookmark"
-
-    # Delete the failed bookmark only after queue entry exists
-    run_quiet jj bookmark delete "$failed_bookmark"
-
-    # Log the operation (edit the commit created by next_id)
-    local change_id
-    change_id=$(jj log -r "$candidate_revset" --no-graph -T'change_id.short()' 2>/dev/null) || true
-    log_op "$jjq_bookmark" "retry: requeued $id as $new_id" \
-        "Operation: retry" \
-        "Original-Id: $id" \
-        "Sequence-Id: $new_id" \
-        "Revset: $candidate_revset" \
-        "Change-Id: $change_id" \
-        "Timestamp: $(timestamp)"
-
-    prefout "revision queued at $new_id"
 }
 
 cmd_delete() {
@@ -1010,7 +881,6 @@ case "$cmd" in
     push) cmd_push "$@" ;;
     run) cmd_run "$@" ;;
     status) cmd_status "$@" ;;
-    retry) cmd_retry "$@" ;;
     delete) cmd_delete "$@" ;;
     config) cmd_config "$@" ;;
     clean) cmd_clean "$@" ;;

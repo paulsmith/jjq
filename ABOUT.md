@@ -194,22 +194,10 @@ When a merge attempt from a queue run fails, either due to a conflict when
 creating the merge-to-be, or a failed check, that queue item is marked as
 "failed".
 
-The user must then take action to resolve the failure, and either delete it
-from the queue, or retry it.
-
-### Retries
-
-Retrying a queue item after it has failed is supported by the jjq CLI. The user,
-instead of pushing a revision, retries the sequence ID of the item.
-
-Retries receive a new sequence ID.
-
-Retries never happen automatically. The jjq tool will never retry an item on its
-own without a user's explicit intent.
-
-Retries default to pushing the revision pointed to by the failure bookmark. They
-can optionally take an explicit revset argument to push that revision instead
-and maintain the association with the original queued item.
+The user must then take action to resolve the failure: fix the revision (rebase
+onto trunk, resolve conflicts), then push it again. Push is idempotent —
+re-pushing the same change ID clears any stale queue or failed entries for that
+change and queues the updated revision.
 
 ### Status
 

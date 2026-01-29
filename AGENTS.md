@@ -28,17 +28,15 @@ jjq stores all state in the jj repository itself:
 3. **Isolated branch** - `jjq/_/_` bookmark points to a branch parented to `root()` that holds:
    - `last_id` file - Current sequence ID
    - `config/` directory - User configuration
-   - `pending-retries/` directory - Maps retry IDs to original failed IDs
    - Commit messages serve as operation log (with trailers for structured data)
 
 ### Commands
 
 | Command | Function |
 |---------|----------|
-| `push <revset>` | Add revision to queue (with pre-flight conflict check) |
+| `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID) |
 | `run [--all]` | Process next queue item, or all items in batch |
 | `status` | Show queue and recent failures |
-| `retry <id> [revset]` | Re-queue a failed item (with pre-flight conflict check) |
 | `delete <id>` | Remove item from queue/failed |
 | `config [key] [value]` | Get/set configuration |
 | `clean` | Remove failed workspaces |
@@ -61,7 +59,7 @@ jjq stores all state in the jj repository itself:
 - **Runner workspace** - Temporary jj workspace in `/tmp` for running checks
 - **Check command** - User-configured shell command that determines success/failure
 - **Pre-flight conflict check** - Headless merge commit to verify clean merge before queuing
-- **Retry lineage** - `pending-retries/` metadata tracks which failed item a retry came from; on success, a `jjq-retry-of:` trailer is added to the merge commit
+- **Idempotent push** - Re-pushing a change ID clears stale queue/failed entries; same commit ID is rejected as duplicate
 
 ### Concurrency
 

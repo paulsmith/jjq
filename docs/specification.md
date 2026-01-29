@@ -103,8 +103,8 @@ MUST NOT appear in bookmark names.
 
 #### Sequence ID Parsing
 
-When accepting sequence IDs as command arguments (e.g., `retry <id>`,
-`delete <id>`), implementations MUST:
+When accepting sequence IDs as command arguments (e.g., `delete <id>`),
+implementations MUST:
 
 1. Accept only strings consisting entirely of ASCII decimal digits (`0-9`)
 2. Reject empty strings, negative numbers, and non-numeric input
@@ -145,7 +145,6 @@ The working tree of revisions on the metadata branch contains:
 | `last_id`               | Current sequence ID counter          | ASCII integer |
 | `config/<key>`          | Configuration values                 | ASCII text    |
 | `log_hint_shown`        | Log filter hint display marker       | ASCII text    |
-| `pending-retries/<id>`  | Retry lineage tracking               | ASCII integer |
 
 ##### Sequence ID Store (`last_id`)
 
@@ -209,22 +208,6 @@ whether the hint should be shown.
 
 This file is created automatically when the hint is displayed and MUST NOT
 be created during initialization.
-
-##### Retry Lineage Store (`pending-retries/`)
-
-Files under `pending-retries/` track the relationship between a retried
-queue item and the original failed item it replaces. Each file maps a
-new queue item ID to the failed item ID it retries.
-
-- The file name is the new (retrying) item's unpadded sequence ID
-- The file contents are the original (failed) item's unpadded sequence ID
-
-These files are created by the `retry` command when a failed item is
-re-queued (see §Commands - retry). The `run` command reads these files
-to attach retry lineage trailers to successful merge revisions (see
-§Commands - run). After a successful merge that includes a retry lineage
-trailer, the corresponding `pending-retries/` file MUST be deleted from
-the metadata branch.
 
 ---
 
@@ -393,41 +376,51 @@ Queue a revision for merging to trunk.
 #### Behavior
 
 1. Resolve `<revset>` to a revision. If it does not resolve to exactly
-   one revision, the command MUST fail with exit code 1.
-2. Perform a pre-flight conflict check:
-   - Create a temporary workspace outside the repository working copy
-   - Create a merge revision with the trunk bookmark and the candidate
-     revision as parents
+   one revision, the command MUST fail with exit code 10.
+2. Resolve the revision's change ID and commit ID.
+3. Idempotent cleanup:
+   a. Scan all `jjq/queue/*` bookmarks. If any points to the same
+      commit ID, MUST fail with exit code 10 ("already queued at N").
+   b. If any queue bookmark points to the same change ID but a
+      different commit ID, delete it and inform the user
+      ("replacing queued entry N").
+   c. Scan all `jjq/failed/*` bookmarks. For each, extract the
+      candidate change ID from the `jjq-candidate:` trailer in its
+      commit description. If it matches, delete the failed bookmark
+      and inform the user ("clearing failed entry N").
+4. Perform a pre-flight conflict check:
+   - Create a headless merge commit with the trunk bookmark and the
+     candidate revision as parents
    - Check if the merge revision has conflicts
-   - Clean up the temporary workspace (forget and delete)
+   - Abandon the temporary merge commit
    - If conflicts exist, MUST fail with exit code 1 and output an error
      message indicating the revision conflicts with trunk
-3. Ensure jjq is initialized.
-4. Acquire the sequence ID lock.
-5. Obtain the next sequence ID.
-6. Release the sequence ID lock.
-7. Create bookmark `jjq/queue/<padded-id>` pointing to the resolved revision.
-8. Output confirmation including the assigned sequence ID.
-9. Exit with code 0.
+5. Ensure jjq is initialized.
+6. Acquire the sequence ID lock.
+7. Obtain the next sequence ID.
+8. Release the sequence ID lock.
+9. Create bookmark `jjq/queue/<padded-id>` pointing to the resolved revision.
+10. Output confirmation including the assigned sequence ID.
+11. Exit with code 0.
 
 #### Errors
 
 | Condition                          | Exit Code |
 |------------------------------------|-----------|
-| Revset does not resolve            | 1         |
-| Revset resolves to multiple revs   | 1         |
-| Trunk bookmark does not exist      | 1         |
+| Revset does not resolve            | 10        |
+| Revset resolves to multiple revs   | 10        |
+| Exact duplicate (same commit ID)   | 10        |
+| Trunk bookmark does not exist      | 10        |
 | Revision conflicts with trunk      | 1         |
-| Cannot acquire sequence ID lock    | 1         |
-| Sequence ID exhausted (at 999999)  | 1         |
+| Cannot acquire sequence ID lock    | 3         |
+| Sequence ID exhausted (at 999999)  | 10        |
 
 #### Notes
 
-- The revision's change ID is captured at push time. If the user amends
-  the revision after pushing, the queued bookmark continues to track it
-  (jj bookmarks follow change IDs, not commit IDs).
-- Pushing the same revision multiple times is permitted; each push
-  receives a distinct sequence ID.
+- Push is idempotent over change IDs: re-pushing the same change ID
+  (with a different commit ID) replaces any existing queue or failed
+  entries for that change. This is the intended workflow for handling
+  failures — fix the revision, rebase onto trunk, push again.
 - The conflict check verifies merge-ability at push time. However, trunk
   may advance between push and run, so a clean push does not guarantee
   a clean merge at run time. The check catches conflicts that exist at
@@ -466,30 +459,34 @@ Process the next item in the queue, or all items if `--all` is specified.
    - Parent 1 (first): The revision at the trunk bookmark
    - Parent 2 (second): The queued revision (`jjq/queue/<id>`)
 
-   This parent ordering is REQUIRED; the `retry` command depends on it
-   to identify the original candidate revision from a failed merge.
-
    The merge revision is the working copy of this workspace and can be
    referenced as `jjq-run-<padded-id>@` in revsets.
+
+   Before creating the workspace, the candidate's change ID MUST be
+   captured from the queue bookmark (for use in failure descriptions).
 8. Check for conflicts in the merge revision. A revision has conflicts
    if its tree contains conflict objects (in jj terms, the `conflict`
    template keyword evaluates to true). If conflicts exist:
    - Delete `jjq/queue/<id>`
    - Create `jjq/failed/<id>` pointing to the merge revision
+   - Set the merge revision's description to include a
+     `jjq-candidate: <change-id>` trailer identifying the original
+     candidate (this survives jj rewrites of the merge commit)
    - Output error message including workspace path
    - Output actionable guidance SHOULD be displayed telling the user
-     how to resolve (e.g., fix conflicts in the workspace and use
-     `jjq retry`)
+     how to resolve (e.g., rebase onto trunk, resolve conflicts, and
+     use `jjq push`)
    - Release run lock
    - Exit with code 1 (workspace is NOT deleted)
 9. Execute the configured check command in the workspace.
 10. If check exits non-zero:
     - Delete `jjq/queue/<id>`
     - Create `jjq/failed/<id>` pointing to the merge revision
+    - Set the merge revision's description to include a
+      `jjq-candidate: <change-id>` trailer (same as step 8)
     - Output check failure message and workspace path
     - Actionable guidance SHOULD be displayed telling the user how
-      to resolve (e.g., fix the issue in the workspace and use
-      `jjq retry`)
+      to resolve (e.g., fix the issue and use `jjq push`)
     - Release run lock
     - Exit with code 1 (workspace is NOT deleted)
 11. Verify trunk bookmark still points to the same revision recorded in
@@ -501,12 +498,6 @@ Process the next item in the queue, or all items if `--all` is specified.
     - Exit with code 1
 12. On success:
     - Capture the merge revision's change ID (before any modifications)
-    - If the queue item has a `pending-retries/<id>` file on the
-      metadata branch, the merge revision's description MUST include
-      a `jjq-retry-of: <original-id>` trailer (where `<original-id>`
-      is the contents of the pending-retry file). After adding the
-      trailer, the `pending-retries/<id>` file MUST be deleted from
-      the metadata branch.
     - Delete `jjq/queue/<id>`
     - Move trunk bookmark to the merge revision (`jjq-run-<padded-id>@`)
     - Forget the workspace (`jj workspace forget jjq-run-<padded-id>`)
@@ -614,16 +605,6 @@ For each queued or failed item, implementations SHOULD display:
 - The short change ID of the revision
 - The first line of the revision's description
 
-When retry relationships exist (i.e., `pending-retries/` files are
-present on the metadata branch), the status output SHOULD annotate
-affected items:
-- Queued items that are retries SHOULD show `(retry of N)` after
-  their description, where N is the original failed item's sequence ID
-- Failed items with pending retries SHOULD show `→ retrying as N`
-  after their description, where N is the new queue item's sequence ID
-
-When no retry relationships exist, no annotations are shown.
-
 #### Errors
 
 | Condition                          | Exit Code |
@@ -636,68 +617,6 @@ An uninitialized repository is not an error.
 
 - Status is read-only except for the config lock acquisition.
 - Status is intended as a quick overview, not a comprehensive history.
-
----
-
-### retry
-
-```
-jjq retry <id> [revset]
-```
-
-Retry a failed merge attempt by re-queuing it.
-
-#### Arguments
-
-- `<id>`: Sequence ID of the failed item (with or without zero-padding)
-- `[revset]`: Optional. A jj revset expression resolving to exactly one
-  revision. If omitted, uses the original candidate revision.
-
-#### Behavior
-
-1. Verify `jjq/failed/<padded-id>` exists. If not, fail with exit code 1.
-2. Compare the failed merge revision's trunk parent (parent 1) commit ID
-   with the current trunk bookmark's commit ID. If they differ, output a
-   warning that trunk has advanced since the original merge and suggest
-   rebasing. This warning is informational only; the retry proceeds
-   regardless.
-3. If `[revset]` is provided:
-   - Resolve it to a revision. If it does not resolve to exactly one
-     revision, fail with exit code 1.
-   - Use this as the candidate revision.
-4. If `[revset]` is omitted:
-   - Examine the failed merge revision's parents.
-   - The second parent is the original candidate revision.
-   - Use this as the candidate revision.
-5. Acquire the sequence ID lock.
-6. Obtain the next sequence ID.
-7. Release the sequence ID lock.
-8. Write file `pending-retries/<new-id>` on the metadata branch containing
-   the original failed item's unpadded sequence ID (i.e., `<id>`).
-9. Create bookmark `jjq/queue/<new-padded-id>` pointing to the candidate.
-10. Delete `jjq/failed/<padded-id>` (only after queue entry exists).
-11. Output confirmation including the new sequence ID.
-12. Exit with code 0.
-
-#### Errors
-
-| Condition                          | Exit Code |
-|------------------------------------|-----------|
-| Failed item does not exist         | 1         |
-| Revset does not resolve            | 1         |
-| Revset resolves to multiple revs   | 1         |
-| Cannot acquire sequence ID lock    | 1         |
-| Sequence ID exhausted (at 999999)  | 1         |
-
-#### Notes
-
-- Retries always receive a new sequence ID, placing them at the end of
-  the queue.
-- Retries never happen automatically; user intent is always required.
-- The retry logic depends on the parent ordering established by the `run`
-  command (trunk is parent 1, candidate is parent 2). Implementations MAY
-  alternatively identify the candidate as the parent not reachable from
-  trunk using a revset like `parents(<failed>) ~ ::<trunk>`.
 
 ---
 
@@ -919,8 +838,8 @@ The jjq queue operates with strict FIFO (first-in, first-out) semantics.
 
 - Items are processed in ascending sequence ID order.
 - The item with the lowest sequence ID is always processed next.
-- Sequence IDs are assigned in the order that `push` (or `retry`)
-  commands acquire the sequence ID lock.
+- Sequence IDs are assigned in the order that `push` commands acquire
+  the sequence ID lock.
 
 ### Determining Queue Order
 
@@ -937,11 +856,12 @@ When multiple processes push items concurrently:
 - The order of sequence IDs reflects the order of lock acquisition,
   which may differ from the order the commands were initiated
 
-### Retries and Queue Position
+### Re-pushed Items and Queue Position
 
-Retried items receive new sequence IDs, placing them at the end of
-the queue. This is intentional: a retry represents new user action
-and should not jump ahead of items pushed after the original failure.
+When a failed item is fixed and re-pushed, the new push receives a new
+sequence ID, placing it at the end of the queue. This is intentional:
+a re-push represents new user action and should not jump ahead of items
+pushed after the original failure.
 
 ### No Priority or Reordering
 
@@ -967,7 +887,6 @@ in this document.
 - `status` command
 - `delete` command
 - `config` command
-- `retry` command
 - All bookmark conventions
 - All locking requirements
 

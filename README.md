@@ -53,9 +53,18 @@ jjq config max_failures 5            # set max failures shown in status
 
 ### Handle failures
 
+When a merge fails, fix the issue and re-push:
+
 ```sh
-jjq retry 3           # retry failed item 3 with its original revision
-jjq retry 3 abc       # retry with a different revision
+jj rebase -r mychange -d main  # rebase onto current trunk
+# resolve any conflicts
+jjq push mychange              # clears old failure, re-queues
+```
+
+Push is idempotent: re-pushing the same change ID automatically clears any
+previous queue or failed entries for that change.
+
+```sh
 jjq delete 3          # remove item 3 from queue/failed
 jjq clean             # list failed workspaces
 jjq clean 3           # clean workspace for failed item 3

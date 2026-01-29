@@ -227,17 +227,19 @@ cmd_run() {
                 exit 1
             fi
 
-            # Capture the failed item ID before retry (for annotation check)
-            failed_id=$((10#$next_id))
-
             # Find which PR this was by checking bookmarks on the parents (second parent is the PR)
             original_pr=$(jj log -r "parents($failed_rev)" --no-graph -T'bookmarks ++ "\n"' 2>/dev/null | tr ' ' '\n' | grep -E '^pr[0-9]+$' | head -1 || true)
 
             echo "  Conflicts detected (was: $original_pr) - resolving..."
+
+            # Rebase the original PR onto current main
+            jj rebase -r "$original_pr" -d main >/dev/null 2>&1
+
+            # Resolve conflicts on the rebased revision
             fix_dir=$(mktemp -d)
             trap "rm -rf $fix_dir" EXIT
 
-            jj workspace add -r "$failed_rev" --name "jjq-fix-$$" "$fix_dir" >/dev/null 2>&1
+            jj workspace add -r "$original_pr" --name "jjq-fix-$$" "$fix_dir" >/dev/null 2>&1
             pushd "$fix_dir" >/dev/null
 
             # Call the PR's resolve function if we identified it
@@ -249,23 +251,16 @@ cmd_run() {
             fi
 
             go fmt ./... >/dev/null 2>&1 || true
-            jj desc -m "Resolved conflict" >/dev/null 2>&1
+            # Squash resolved content into the PR (preserves change ID)
+            jj squash >/dev/null 2>&1
             popd >/dev/null
-
-            echo "  Retrying..."
-            jjq retry "$((10#$next_id))" "jjq-fix-$$@"
-
-            # Verify status shows retry annotation
-            status_output=$(jjq status 2>&1)
-            if echo "$status_output" | grep -q "(retry of $failed_id)"; then
-                echo "  PASS: status shows retry annotation"
-            else
-                echo "  WARN: status missing retry annotation"
-            fi
 
             jj workspace forget "jjq-fix-$$" >/dev/null 2>&1
             rm -rf "$fix_dir"
             trap - EXIT
+
+            echo "  Re-pushing..."
+            jjq push "$original_pr"
         fi
         echo ""
     done
@@ -314,16 +309,6 @@ cmd_verify() {
         fi
     done
 
-    # Check for retry lineage trailers in merge commit descriptions
-    local retry_trailers
-    retry_trailers=$(jj log -r '::main' --no-graph -T'description ++ "\n---\n"' 2>/dev/null | grep 'jjq-retry-of:' || true)
-    if [ -n "$retry_trailers" ]; then
-        echo "PASS: retry lineage trailers found in merge commits"
-    else
-        echo "FAIL: no retry lineage trailers found (expected for conflict retries)"
-        ((errors++))
-    fi
-
     # Check that jjq clean runs without error
     local clean_output
     clean_output=$(jjq clean 2>&1) || true
@@ -352,9 +337,8 @@ cmd_verify() {
     jj abandon >/dev/null 2>&1
     jj new main >/dev/null 2>&1
 
-    # Test retry conflict rejection
-    echo "Testing retry conflict rejection..."
-    # Create a clean revision, push it, manually fail it, then try to retry with a conflicting rev
+    # Test idempotent push: re-push same change ID clears failed entry
+    echo "Testing idempotent push (failed entry cleanup)..."
     jj new main -m "will-fail item" >/dev/null 2>&1
     echo '# test' >> README.md
     local test_rev
@@ -362,26 +346,57 @@ cmd_verify() {
     jjq push "$test_rev" >/dev/null 2>&1
     local test_id
     test_id=$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/queue/[0-9]{6}$' | cut -f3 -d'/' | sort -n | tail -1)
-    # Manually move from queue to failed
-    jj bookmark create -r "bookmarks(exact:jjq/queue/$test_id)" "jjq/failed/$test_id" >/dev/null 2>&1
+    # Simulate failure: create a merge commit and move bookmark from queue to failed
+    local test_trunk_bm
+    test_trunk_bm=$(jjq config trunk_bookmark 2>/dev/null | tail -1)
+    local merge_output
+    merge_output=$(jj new --no-edit -r "bookmarks(exact:$test_trunk_bm)" -r "bookmarks(exact:jjq/queue/$test_id)" 2>&1)
+    local merge_change
+    merge_change=$(echo "$merge_output" | awk '/Created new commit/{print $4}')
+    jj desc -r "$merge_change" -m "Failed: merge (simulated)"$'\n\n'"jjq-candidate: $test_rev" >/dev/null 2>&1
+    jj bookmark create -r "$merge_change" "jjq/failed/$test_id" >/dev/null 2>&1
     jj bookmark delete "jjq/queue/$test_id" >/dev/null 2>&1
 
-    # Create a conflicting revision branched from root() (diverges from main)
-    jj new 'root()' -m "retry-conflict" >/dev/null 2>&1
-    echo 'package main; func main() {}' > main.go
-    local retry_conflict_rev
-    retry_conflict_rev=$(jj log -r @ --no-graph -T'change_id.short()')
-    local retry_exit=0
-    jjq retry "$((10#$test_id))" "$retry_conflict_rev" 2>/dev/null || retry_exit=$?
-    if [ $retry_exit -eq 1 ]; then
-        echo "PASS: retry rejects conflicting revision with exit code 1"
+    # Amend the revision (new commit ID, same change ID) and re-push
+    jj edit "$test_rev" >/dev/null 2>&1
+    echo '# test amended' >> README.md
+    jj new main >/dev/null 2>&1
+    local push_output
+    push_output=$(jjq push "$test_rev" 2>&1)
+    if echo "$push_output" | grep -q "clearing failed entry"; then
+        echo "PASS: idempotent push clears failed entry on re-push"
     else
-        echo "FAIL: retry conflict returned exit code $retry_exit, expected 1"
+        echo "FAIL: idempotent push did not clear failed entry"
+        echo "  output: $push_output"
         ((errors++))
     fi
-    # Clean up: delete the failed item and abandon the conflicting rev
+    # Clean up
+    local new_test_id
+    new_test_id=$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/queue/[0-9]{6}$' | cut -f3 -d'/' | sort -n | tail -1)
+    [ -n "$new_test_id" ] && jjq delete "$((10#$new_test_id))" >/dev/null 2>&1
+    jj abandon "$merge_change" >/dev/null 2>&1 || true
+    jj new main >/dev/null 2>&1
+
+    # Test idempotent push: exact duplicate rejection
+    echo "Testing idempotent push (duplicate rejection)..."
+    jj new main -m "dup test" >/dev/null 2>&1
+    echo '# dup' >> README.md
+    local dup_rev
+    dup_rev=$(jj log -r @ --no-graph -T'change_id.short()')
+    jjq push "$dup_rev" >/dev/null 2>&1
+    local dup_exit=0
+    jjq push "$dup_rev" 2>/dev/null || dup_exit=$?
+    if [ $dup_exit -eq 10 ]; then
+        echo "PASS: push rejects exact duplicate with exit code 10"
+    else
+        echo "FAIL: duplicate push returned exit code $dup_exit, expected 10"
+        ((errors++))
+    fi
+    # Clean up
+    local dup_id
+    dup_id=$(jj bookmark list -r 'bookmarks(glob:"jjq/queue/??????")' -T'name ++"\n"' 2>/dev/null | grep -E '^jjq/queue/[0-9]{6}$' | cut -f3 -d'/' | sort -n | tail -1)
+    [ -n "$dup_id" ] && jjq delete "$((10#$dup_id))" >/dev/null 2>&1
     jj abandon >/dev/null 2>&1
-    jjq delete "$((10#$test_id))" >/dev/null 2>&1
     jj new main >/dev/null 2>&1
 
     # Test run --all continues past check failures
