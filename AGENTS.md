@@ -7,7 +7,8 @@ jjq is a merge queue CLI tool for jj (Jujutsu VCS). It's implemented as a single
 ## Key Files
 
 - `jjq` - The entire implementation (bash script)
-- `SPEC.md` - Design specification
+- `ABOUT.md` - about jjq document
+- `docs/specification.md` - RFC-style specification
 - `jjq-test` - End-to-end test script
 
 ## Architecture
@@ -16,29 +17,42 @@ jjq is a merge queue CLI tool for jj (Jujutsu VCS). It's implemented as a single
 
 jjq stores all state in the jj repository itself:
 
-1. **Bookmarks** - Used for queue items, failed items, and locks
+1. **Bookmarks** - Used for queue items and failed items
    - `jjq/queue/NNNNNN` - Queued items (6-digit zero-padded sequence ID)
    - `jjq/failed/NNNNNN` - Failed merge attempts
-   - `jjq/lock/run` - Global lock for queue runner
-   - `jjq/lock/id` - Lock for sequence ID allocation
 
-2. **Isolated branch** - `jjq/_/_` bookmark points to a branch parented to `root()` that holds:
+2. **Filesystem locks** - Uses `mkdir` atomicity in `.jj/jjq-locks/`
+   - `run` - Ensures only one queue runner at a time
+   - `id` - Protects sequence ID allocation
+
+3. **Isolated branch** - `jjq/_/_` bookmark points to a branch parented to `root()` that holds:
    - `last_id` file - Current sequence ID
    - `config/` directory - User configuration
+   - `pending-retries/` directory - Maps retry IDs to original failed IDs
    - Commit messages serve as operation log (with trailers for structured data)
 
 ### Commands
 
 | Command | Function |
 |---------|----------|
-| `push <revset>` | Add revision to queue |
-| `run` | Process next queue item |
+| `push <revset>` | Add revision to queue (with pre-flight conflict check) |
+| `run [--all]` | Process next queue item, or all items in batch |
 | `status` | Show queue and recent failures |
-| `retry <id> [revset]` | Re-queue a failed item |
+| `retry <id> [revset]` | Re-queue a failed item (with pre-flight conflict check) |
 | `delete <id>` | Remove item from queue/failed |
 | `config [key] [value]` | Get/set configuration |
-| `clean [id\|all]` | Remove failed workspaces |
-| `log [n]` | Show operation history |
+| `clean` | Remove failed workspaces |
+
+### Exit Codes
+
+| Code | Constant | Meaning |
+|------|----------|---------|
+| 0 | `EXIT_SUCCESS` | Success |
+| 1 | `EXIT_CONFLICT` | Merge conflict (pre-flight or during run) |
+| 2 | `EXIT_CHECK_FAILED` | User's check command returned non-zero |
+| 3 | `EXIT_LOCK_HELD` | Another runner is active |
+| 4 | `EXIT_TRUNK_MOVED` | Trunk bookmark advanced during run |
+| 10 | `EXIT_USAGE` | Bad arguments, item not found, invalid revset |
 
 ### Key Concepts
 
@@ -46,22 +60,31 @@ jjq stores all state in the jj repository itself:
 - **Merge-to-be** - A commit with two parents: trunk and candidate revision
 - **Runner workspace** - Temporary jj workspace in `/tmp` for running checks
 - **Check command** - User-configured shell command that determines success/failure
+- **Pre-flight conflict check** - Headless merge commit to verify clean merge before queuing
+- **Retry lineage** - `pending-retries/` metadata tracks which failed item a retry came from; on success, a `jjq-retry-of:` trailer is added to the merge commit
 
 ### Concurrency
 
-- Bookmark creation is used as a mutex (create fails if exists)
-- `jjq/lock/run` ensures only one queue runner at a time
-- `jjq/lock/id` protects sequence ID allocation
+- `mkdir` atomicity is used as a mutex (mkdir fails if dir exists)
+- Lock dirs stored in `.jj/jjq-locks/` (outside jj's tracked areas)
+- `run` lock ensures only one queue runner at a time
+- `id` lock protects sequence ID allocation
+
+### Batch Mode (`run --all`)
+
+When running in batch mode, jjq processes all queue items in sequence:
+- Failed items (conflict or check failure) are skipped and processing continues
+- Lock-held (`EXIT_LOCK_HELD`) causes immediate bail (no further progress possible)
+- Summary reports both merged and failed counts
+- Exits 0 if all merged, first failure code if any failed
 
 ## Testing
 
-The project uses end-to-end testing via `test_e2e.sh`:
-
 ```sh
-./test_e2e.sh
+./jjq-test
 ```
 
-Tests create temporary jj repositories and exercise the full command flow.
+The test script creates a temporary jj repository with 4 PR branches (some with known conflicts), processes the merge queue, resolves conflicts deterministically, and verifies the final state. Tests also cover exit codes, conflict rejection, and batch mode resilience.
 
 ## Development Notes
 
@@ -69,6 +92,7 @@ Tests create temporary jj repositories and exercise the full command flow.
 - Uses `jj log -T'...'` templates for structured output parsing
 - `run_quiet` helper suppresses output on success, shows on failure
 - `log_op` records operations as commits with trailer metadata
+- `preflight_conflict_check` creates a headless merge commit to test for conflicts without a workspace
 
 ## Common Patterns
 
