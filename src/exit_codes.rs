@@ -3,15 +3,11 @@
 
 use std::fmt;
 
-pub const SUCCESS: i32 = 0;
 pub const CONFLICT: i32 = 1;
 pub const CHECK_FAILED: i32 = 2;
 pub const LOCK_HELD: i32 = 3;
 pub const TRUNK_MOVED: i32 = 4;
 pub const USAGE: i32 = 10;
-
-/// Internal sentinel — not returned to the user.
-pub const QUEUE_EMPTY: i32 = 99;
 
 /// Error type that carries a specific exit code.
 #[derive(Debug)]

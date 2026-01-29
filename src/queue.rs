@@ -25,7 +25,7 @@ pub fn parse_seq_id(input: &str) -> Result<u32> {
 
     let id: u32 = input.parse().unwrap_or(0);
 
-    if id < 1 || id > 999999 {
+    if !(1..=999999).contains(&id) {
         bail!("invalid sequence ID: {} (must be 1-999999)", id);
     }
 

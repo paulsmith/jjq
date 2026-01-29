@@ -100,10 +100,8 @@ pub fn set(key: &str, value: &str) -> Result<()> {
     }
 
     // Validate max_failures is numeric
-    if key == "max_failures" {
-        if value.parse::<u32>().is_err() {
-            bail!("max_failures must be a non-negative integer");
-        }
+    if key == "max_failures" && value.parse::<u32>().is_err() {
+        bail!("max_failures must be a non-negative integer");
     }
 
     ensure_initialized()?;
@@ -141,10 +139,10 @@ pub fn maybe_show_log_hint() -> Result<()> {
     }
 
     // Skip if log filter already configured to hide jjq metadata
-    if let Ok(Some(current_log)) = jj::config_get("revsets.log") {
-        if current_log.contains(JJQ_BOOKMARK) {
-            return Ok(());
-        }
+    if let Ok(Some(current_log)) = jj::config_get("revsets.log")
+        && current_log.contains(JJQ_BOOKMARK)
+    {
+        return Ok(());
     }
 
     // Skip if hint already shown (check metadata)

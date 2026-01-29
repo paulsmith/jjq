@@ -105,12 +105,12 @@ pub fn push(revset: &str) -> Result<()> {
     let failed_bookmarks = jj::bookmark_list_glob("jjq/failed/??????")?;
     for bookmark in &failed_bookmarks {
         let desc = jj::get_description(&format!("bookmarks(exact:{})", bookmark))?;
-        if let Some(candidate_change_id) = extract_candidate_trailer(&desc) {
-            if candidate_change_id == change_id {
-                let entry_id = extract_id_from_bookmark(bookmark);
-                jj::bookmark_delete(bookmark)?;
-                prefout(&format!("clearing failed entry {}", entry_id));
-            }
+        if let Some(candidate_change_id) = extract_candidate_trailer(&desc)
+            && candidate_change_id == change_id
+        {
+            let entry_id = extract_id_from_bookmark(bookmark);
+            jj::bookmark_delete(bookmark)?;
+            prefout(&format!("clearing failed entry {}", entry_id));
         }
     }
 
