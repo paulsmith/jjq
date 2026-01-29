@@ -293,47 +293,6 @@ pub fn status() -> Result<()> {
     Ok(())
 }
 
-/// Retry a failed merge.
-pub fn retry(id_str: &str, revset: Option<&str>) -> Result<()> {
-    let id = queue::parse_seq_id(id_str)?;
-    let failed_bookmark = queue::failed_bookmark(id);
-
-    if !queue::failed_item_exists(id)? {
-        bail!("failed item {} not found", id);
-    }
-
-    let candidate_revset = match revset {
-        Some(r) => {
-            // Verify revset exists
-            jj::resolve_revset(r)?;
-            prefout(&format!("retrying failed item {} using '{}'", id, r));
-            r.to_string()
-        }
-        None => {
-            // Find original candidate from failed merge parents
-            let trunk_bookmark = config::get_trunk_bookmark()?;
-            let original_candidate =
-                jj::get_candidate_parent(&format!("bookmarks(exact:{})", failed_bookmark), &trunk_bookmark)?;
-            prefout(&format!(
-                "retrying failed item {} using original candidate {}",
-                id, original_candidate
-            ));
-            original_candidate
-        }
-    };
-
-    config::ensure_initialized()?;
-
-    let new_id = queue::next_id()?;
-    let new_bookmark = queue::queue_bookmark(new_id);
-
-    jj::bookmark_create(&new_bookmark, &candidate_revset)?;
-    jj::bookmark_delete(&failed_bookmark)?;
-
-    prefout(&format!("revision queued at {}", new_id));
-    Ok(())
-}
-
 /// Delete an item from queue or failed list.
 pub fn delete(id_str: &str) -> Result<()> {
     let id = queue::parse_seq_id(id_str)?;

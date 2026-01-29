@@ -33,13 +33,6 @@ enum Commands {
     },
     /// Display current queue state
     Status,
-    /// Retry a failed merge attempt
-    Retry {
-        /// Sequence ID of the failed item
-        id: String,
-        /// Optional revset to use instead of original candidate
-        revset: Option<String>,
-    },
     /// Remove an item from queue or failed list
     Delete {
         /// Sequence ID of the item
@@ -75,7 +68,6 @@ fn run() -> Result<()> {
         Commands::Push { revset } => commands::push(&revset),
         Commands::Run { all } => commands::run(all),
         Commands::Status => commands::status(),
-        Commands::Retry { id, revset } => commands::retry(&id, revset.as_deref()),
         Commands::Delete { id } => commands::delete(&id),
         Commands::Config { key, value } => commands::config(key.as_deref(), value.as_deref()),
     }
