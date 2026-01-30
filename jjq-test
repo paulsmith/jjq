@@ -4,6 +4,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+JJQ_BIN="${JJQ_BIN:-jjq}"
+# Resolve relative paths to absolute (needed since test runs in temp dir)
+if [[ "$JJQ_BIN" == ./* || "$JJQ_BIN" == ../* ]]; then
+    JJQ_BIN="$(cd "$(dirname "$JJQ_BIN")" && pwd)/$(basename "$JJQ_BIN")"
+fi
 export PATH="$SCRIPT_DIR:$PATH"
 
 #=============================================================================
@@ -181,14 +186,14 @@ pr_description() {
 #=============================================================================
 cmd_run() {
     echo "=== Configuring jjq ==="
-    jjq config check_command "make"
+    "$JJQ_BIN" config check_command "make"
 
     echo ""
     echo "=== Pushing PRs onto the merge queue ==="
     for pr in $ALL_PRS; do
-        jjq push "$pr"
+        "$JJQ_BIN" push "$pr"
     done
-    jjq status
+    "$JJQ_BIN" status
 
     echo ""
     echo "=== Processing the merge queue ==="
@@ -203,9 +208,9 @@ cmd_run() {
 
         echo "Processing queue item $((10#$next_id))..."
 
-        run_output=$(jjq run 2>&1) && run_ok=true || run_ok=false
+        run_output=$($JJQ_BIN run 2>&1) && run_ok=1 || run_ok=0
 
-        if $run_ok; then
+        if [ $run_ok -eq 1 ]; then
             echo "  Merged successfully"
         else
             echo "$run_output" | head -20
@@ -255,6 +260,9 @@ cmd_run() {
             jj squash >/dev/null 2>&1
             popd >/dev/null
 
+            echo "  Re-pushing fixed revision..."
+            "$JJQ_BIN" push "jjq-fix-$$@"
+
             jj workspace forget "jjq-fix-$$" >/dev/null 2>&1
             rm -rf "$fix_dir"
             trap - EXIT
@@ -267,7 +275,7 @@ cmd_run() {
 
     echo ""
     echo "=== Final status ==="
-    jjq status
+    "$JJQ_BIN" status
 }
 
 #=============================================================================
