@@ -35,6 +35,7 @@ impl Lock {
     }
 
     /// Acquire a lock, failing with an error if already held.
+    #[allow(dead_code)]
     pub fn acquire_or_fail(name: &str, message: &str) -> Result<Lock> {
         match Lock::acquire(name)? {
             Some(lock) => Ok(lock),
