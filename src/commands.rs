@@ -426,7 +426,7 @@ pub fn delete(id_str: &str) -> Result<()> {
         let workspace_path = lookup_workspace_path(id);
 
         jj::bookmark_delete(&queue::failed_bookmark(id))?;
-        prefout(&format!("deleted failed item {}", id_str));
+        prefout(&format!("deleted failed item {}", id));
 
         // Try to forget the workspace (silently ignore if not found)
         let _ = jj::workspace_forget(&run_name);
@@ -472,6 +472,18 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
                     k,
                     config::VALID_KEYS.join(", ")
                 );
+            }
+
+            // If not initialized, show defaults
+            if !config::is_initialized()? {
+                let value = match k {
+                    "trunk_bookmark" => config::DEFAULT_TRUNK_BOOKMARK.to_string(),
+                    "check_command" => String::new(),
+                    "max_failures" => config::DEFAULT_MAX_FAILURES.to_string(),
+                    _ => unreachable!(),
+                };
+                println!("{}", value);
+                return Ok(());
             }
 
             let value = match k {

@@ -168,8 +168,8 @@ fn hint_already_shown() -> Result<bool> {
         return Ok(false);
     }
     match jj::file_show("log_hint_shown", JJQ_BOOKMARK) {
-        Ok(content) => Ok(!content.trim().is_empty()),
-        Err(_) => Ok(false),
+        Ok(_) => Ok(true),   // File exists = hint was shown
+        Err(_) => Ok(false), // File doesn't exist = hint not shown
     }
 }
 
@@ -192,7 +192,8 @@ fn record_hint_shown() -> Result<()> {
     env::set_current_dir(temp_dir.path())?;
 
     fs::write("log_hint_shown", "1")?;
-    jj::run_quiet(&["squash", "-u"])?;
+    jj::describe("@", "record log hint shown")?;
+    jj::run_quiet(&["bookmark", "set", JJQ_BOOKMARK])?;
 
     env::set_current_dir(&orig_dir)?;
     jj::workspace_forget(&workspace_name)?;
