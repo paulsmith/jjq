@@ -839,7 +839,7 @@ fn test_log_hint_shown_once_when_forced() {
 }
 
 #[test]
-fn test_run_all_continues_past_failures() {
+fn test_run_all_stops_on_first_failure() {
     let repo = TestRepo::with_go_project();
     repo.jjq_success(&["config", "check_command", "true"]);
 
@@ -870,12 +870,16 @@ fn test_run_all_continues_past_failures() {
     repo.jjq_success(&["push", "f2"]);
     repo.jjq_success(&["push", "f3"]);
 
-    // run --all should process f1, fail on f2 (conflict), continue to f3
+    // run --all should process f1, fail on f2 (conflict), and STOP (not process f3)
     let output = repo.jjq_output(&["run", "--all"]);
     assert!(output.contains("merged 1 to main"), "f1 should merge: {}", output);
     assert!(output.contains("merge 2 has conflicts"), "f2 should conflict: {}", output);
-    assert!(output.contains("merged 3 to main"), "f3 should merge: {}", output);
-    assert!(output.contains("2 item(s), 1 failed"), "summary should show 2 merged, 1 failed: {}", output);
+    assert!(!output.contains("merged 3 to main"), "f3 should NOT be processed: {}", output);
+    assert!(output.contains("processed 1 item(s) before failure"), "summary should show 1 processed before failure: {}", output);
+
+    // f3 should still be in the queue
+    let status = repo.jjq_success(&["status"]);
+    assert!(status.contains("feature 3"), "f3 should still be queued: {}", status);
 }
 
 #[test]
