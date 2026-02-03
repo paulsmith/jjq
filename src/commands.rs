@@ -205,11 +205,13 @@ fn run_one() -> Result<RunResult> {
 
     config::ensure_initialized()?;
 
-    // Get config values
+    // Acquire config lock to read settings
+    let config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
     let trunk_bookmark = config::get_trunk_bookmark()?;
     let check_command = match config::get_check_command()? {
         Some(cmd) => cmd,
         None => {
+            drop(config_lock);
             preferr("check_command not configured (use 'jjq config check_command <cmd>')");
             return Ok(RunResult::Failure(
                 exit_codes::CONFLICT,
@@ -217,6 +219,7 @@ fn run_one() -> Result<RunResult> {
             ));
         }
     };
+    drop(config_lock);
 
     // Acquire run lock
     let run_lock = match Lock::acquire("run")? {
@@ -342,7 +345,10 @@ pub fn status() -> Result<()> {
         return Ok(());
     }
 
+    // Acquire config lock to read settings
+    let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
     let max_failures = config::get_max_failures()?;
+    drop(_config_lock);
 
     // Check for active run
     if lock::is_held("run")? {
@@ -430,6 +436,7 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
         (None, None) => {
             // Show all config
             config::ensure_initialized()?;
+            let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
             let trunk = config::get_trunk_bookmark()?;
             let check = config::get_check_command()?;
             let max_fail = config::get_max_failures()?;
@@ -464,6 +471,7 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
                 return Ok(());
             }
 
+            let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
             let value = match k {
                 "trunk_bookmark" => config::get_trunk_bookmark()?,
                 "check_command" => config::get_check_command()?.unwrap_or_default(),
@@ -475,6 +483,7 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
         }
         (Some(k), Some(v)) => {
             // Set value
+            let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
             config::set(k, v)?;
             prefout(&format!("{} = {}", k, v));
             Ok(())
