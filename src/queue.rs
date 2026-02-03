@@ -8,6 +8,7 @@ use std::fs;
 use tempfile::TempDir;
 
 use crate::config::{self, JJQ_BOOKMARK};
+use crate::exit_codes::{self, ExitError};
 use crate::jj;
 use crate::lock::Lock;
 
@@ -39,10 +40,16 @@ pub fn format_seq_id(id: u32) -> String {
 
 /// Get the next sequence ID, incrementing the counter.
 pub fn next_id() -> Result<u32> {
-    let _lock = Lock::acquire_or_fail(
-        "id",
-        "could not acquire sequence ID lock (another process may be pushing)",
-    )?;
+    let _lock = match Lock::acquire("id")? {
+        Some(lock) => lock,
+        None => {
+            return Err(ExitError::new(
+                exit_codes::LOCK_HELD,
+                "could not acquire sequence ID lock (another process may be pushing)",
+            )
+            .into());
+        }
+    };
 
     config::ensure_initialized()?;
 
@@ -64,7 +71,7 @@ pub fn next_id() -> Result<u32> {
     if current >= 999999 {
         env::set_current_dir(&orig_dir)?;
         jj::workspace_forget(&workspace_name)?;
-        bail!("sequence ID exhausted (at 999999)");
+        return Err(ExitError::new(exit_codes::USAGE, "sequence ID exhausted (at 999999)").into());
     }
 
     let new_id = current + 1;
