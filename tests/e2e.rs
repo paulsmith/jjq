@@ -663,7 +663,10 @@ fn test_delete_failed() {
     ");
 
     let delete_output = repo.jjq_success(&["delete", "1"]);
-    insta::assert_snapshot!(delete_output, @"jjq: deleted failed item 1");
+    insta::assert_snapshot!(delete_output, @r"
+    jjq: deleted failed item 1
+    jjq: removed workspace <TEMP_PATH>
+    ");
 
     let status_after = repo.jjq_success(&["status"]);
     insta::assert_snapshot!(status_after, @"jjq: queue is empty");

@@ -3,6 +3,7 @@
 
 use anyhow::{bail, Result};
 use std::env;
+use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -43,6 +44,17 @@ fn extract_candidate_trailer(description: &str) -> Option<String> {
 
 /// Look up the filesystem path of a workspace from jjq metadata log history.
 fn lookup_workspace_path(id: u32) -> Option<String> {
+    // Try reading workspace path from metadata file first
+    let padded = queue::format_seq_id(id);
+    let file_path = format!("workspace/{}", padded);
+    if let Ok(path) = jj::file_show(&file_path, config::JJQ_BOOKMARK) {
+        let path = path.trim().to_string();
+        if !path.is_empty() {
+            return Some(path);
+        }
+    }
+
+    // Fall back to searching commit descriptions
     let output = jj::run_ok(&[
         "log",
         "-r",
@@ -67,6 +79,37 @@ fn lookup_workspace_path(id: u32) -> Option<String> {
         }
         Err(_) => None,
     }
+}
+
+/// Record workspace path in metadata for later recovery by delete/clean.
+fn record_workspace_metadata(id: u32, workspace_path: &str) -> Result<()> {
+    let temp_dir = tempfile::TempDir::new()?;
+    let workspace_name = format!("jjq-meta-{}", std::process::id());
+
+    jj::workspace_add(
+        temp_dir.path().to_str().unwrap(),
+        &workspace_name,
+        &[config::JJQ_BOOKMARK],
+    )?;
+
+    let orig_dir = env::current_dir()?;
+    env::set_current_dir(temp_dir.path())?;
+
+    fs::create_dir_all("workspace")?;
+    fs::write(
+        format!("workspace/{}", queue::format_seq_id(id)),
+        workspace_path,
+    )?;
+    jj::describe(
+        "@",
+        &format!("Sequence-Id: {}\nWorkspace: {}", id, workspace_path),
+    )?;
+    jj::run_quiet(&["bookmark", "set", config::JJQ_BOOKMARK])?;
+
+    env::set_current_dir(&orig_dir)?;
+    jj::workspace_forget(&workspace_name)?;
+
+    Ok(())
 }
 
 /// Push a revision onto the merge queue.
@@ -249,6 +292,9 @@ fn run_one() -> Result<RunResult> {
             &format!("bookmarks(exact:{})", queue_bookmark),
         ],
     )?;
+
+    // Record the workspace path in metadata for later recovery by delete/clean
+    record_workspace_metadata(id, runner_workspace.path().to_str().unwrap())?;
 
     let orig_dir = env::current_dir()?;
     env::set_current_dir(runner_workspace.path())?;
