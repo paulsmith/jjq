@@ -1,11 +1,11 @@
 # jjq - merge queue for jj
 
-jjq is a merge queue tool for jj, the Git-compatible VCS. jjq is lightweight,
-in that it can be used on a jj repo with little ceremony or distruption and
-coexist with other processes. jjq is a jj-native merge queue tool, in that it
-uses jj features such as bookmarks and workspaces to operate the merge queue.
-jjq uses the jj repo as a data store for its queue items, work logs, and other
-metadata, while isolating its data from the user's.
+jjq is a merge queue tool for jj (Jujutsu), the Git-compatible VCS. jjq is
+lightweight, in that it can be used on a jj repo with little ceremony or
+distruption and coexist with other processes. jjq is a jj-native merge queue
+tool, in that it uses jj features such as bookmarks and workspaces to operate
+the merge queue. jjq uses the jj repo as a data store for its queue items, work
+logs, and other metadata, while isolating its data from the user's.
 
 jjq is a CLI. Users issue jjq commands like `push`, `run`, and `status` to
 operate the merge queue and get information about it.

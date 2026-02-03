@@ -2,12 +2,12 @@
 
 ## Project Overview
 
-jjq is a merge queue CLI tool for jj (Jujutsu VCS). It's implemented as a single bash script.
+jjq is a merge queue CLI tool for jj (Jujutsu VCS).
 
-## Key Files
+## Key Files / Paths
 
-- `jjq` - The entire implementation (bash script)
-- `ABOUT.md` - about jjq document
+- `src` - root of the Rust implementation
+- `docs/README.md` - high-level overview
 - `docs/specification.md` - RFC-style specification
 - `jjq-test` - End-to-end test script
 
@@ -106,12 +106,4 @@ jj workspace add -r "$jjq_bookmark" --name "workspace-name" "$d"
 # ... do work in $d ...
 jj workspace forget "workspace-name"
 rm -rf "$d"
-```
-
-### Logging operations
-```bash
-log_op "" "operation: summary" \
-    "Operation: name" \
-    "Key: value" \
-    "Timestamp: $(timestamp)"
 ```
