@@ -1,27 +1,33 @@
 # jjq - merge queue for jj
 
-jjq is a lightweight merge queue tool for [jj](https://martinvonz.github.io/jj/), the Git-compatible VCS.
+jjq is a lightweight, local merge queue tool for
+[jj](https://martinvonz.github.io/jj/) (Jujutsu), the Git-compatible VCS.
 
 ## What it does
 
-jjq lets you queue revisions for merging to your trunk branch. Each queued item is merged with the current trunk and a configurable check command is run. If the check passes, the trunk bookmark advances. If it fails, the item is marked as failed for you to investigate.
+jjq lets you queue revisions for merging to your trunk branch (eg., `main`
+bookmark). Each queued item is merged with the current trunk and a configurable
+check command is run. If the check passes, the trunk bookmark advances. If it
+fails, the item is marked as failed for you to investigate.
 
-This prevents the "it worked on my branch" problem by ensuring every merge passes checks against the latest trunk.
+This prevents the "it worked on my branch" problem by ensuring every merge
+passes checks against the latest trunk.
 
 ## Installation
+
+Prerequisite: make sure `jj` is installed.
 
 Copy `jjq` to somewhere in your `$PATH`:
 
 ```sh
 cp jjq ~/.local/bin/
-chmod +x ~/.local/bin/jjq
 ```
-
-Requires: bash, jj
 
 ## Usage
 
 ### Push a revision to the queue
+
+Any revset will do so long as it resolves to a single revision.
 
 ```sh
 jjq push @      # push current revision
@@ -71,16 +77,10 @@ jjq clean 3           # clean workspace for failed item 3
 jjq clean all         # clean all failed workspaces
 ```
 
-### View history
-
-```sh
-jjq log               # show recent operations
-jjq log 50            # show last 50 operations
-```
-
 ## How it works
 
-jjq stores its state in your jj repository using bookmarks and an isolated branch:
+jjq stores its state in your jj repository using bookmarks and an isolated
+branch:
 
 - Queue items: `jjq/queue/000001`, `jjq/queue/000002`, ...
 - Failed items: `jjq/failed/000001`, ...
@@ -103,6 +103,6 @@ log = "~ ::jjq/_/_"
 | `check_command` | `sh -c 'exit 1'` | Command to run on merge candidates |
 | `max_failures` | `3` | Number of recent failures to show in status |
 
-## License
+## Copying
 
-MIT
+[BSD](./COPYING)
