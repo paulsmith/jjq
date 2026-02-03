@@ -168,8 +168,6 @@ enum RunResult {
 
 fn run_all() -> Result<()> {
     let mut merged_count = 0u32;
-    let mut failed_count = 0u32;
-    let mut first_failure: Option<i32> = None;
 
     loop {
         match run_one()? {
@@ -179,37 +177,17 @@ fn run_all() -> Result<()> {
             RunResult::Empty => {
                 break;
             }
-            RunResult::Failure(code, _msg) => {
-                if code == exit_codes::LOCK_HELD {
-                    // Can't process anything while another runner is active
-                    if merged_count > 0 || failed_count > 0 {
-                        prefout(&format!(
-                            "processed {} item(s), {} failed (lock held, stopping)",
-                            merged_count, failed_count
-                        ));
-                    }
-                    return Err(ExitError::new(exit_codes::LOCK_HELD, "run lock unavailable").into());
+            RunResult::Failure(_code, msg) => {
+                if merged_count > 0 {
+                    prefout(&format!("processed {} item(s) before failure", merged_count));
                 }
-                // Conflict or check failure — skip and continue
-                failed_count += 1;
-                if first_failure.is_none() {
-                    first_failure = Some(code);
-                }
+                return Err(ExitError::new(exit_codes::CONFLICT, msg).into());
             }
         }
     }
 
-    let total = merged_count + failed_count;
-    if total > 0 {
-        if failed_count == 0 {
-            prefout(&format!("processed {} item(s)", merged_count));
-        } else {
-            prefout(&format!("processed {} item(s), {} failed", merged_count, failed_count));
-        }
-    }
-
-    if let Some(code) = first_failure {
-        return Err(ExitError::new(code, "one or more items failed").into());
+    if merged_count > 0 {
+        prefout(&format!("processed {} item(s)", merged_count));
     }
     Ok(())
 }
@@ -234,7 +212,7 @@ fn run_one() -> Result<RunResult> {
         None => {
             preferr("check_command not configured (use 'jjq config check_command <cmd>')");
             return Ok(RunResult::Failure(
-                exit_codes::USAGE,
+                exit_codes::CONFLICT,
                 "check_command not configured".to_string(),
             ));
         }
@@ -245,7 +223,7 @@ fn run_one() -> Result<RunResult> {
         Some(lock) => lock,
         None => {
             preferr("queue runner lock already held");
-            return Ok(RunResult::Failure(exit_codes::LOCK_HELD, "run lock unavailable".to_string()));
+            return Ok(RunResult::Failure(exit_codes::CONFLICT, "run lock unavailable".to_string()));
         }
     };
 
@@ -324,7 +302,7 @@ fn run_one() -> Result<RunResult> {
         preferr("To resolve:");
         preferr("  1. Fix the issue and create a new revision");
         preferr("  2. Run: jjq push <fixed-revset>");
-        return Ok(RunResult::Failure(exit_codes::CHECK_FAILED, format!("merge {} check failed", id)));
+        return Ok(RunResult::Failure(exit_codes::CONFLICT, format!("merge {} check failed", id)));
     }
 
     // Verify trunk hasn't moved
@@ -336,7 +314,7 @@ fn run_one() -> Result<RunResult> {
         drop(run_lock);
 
         preferr("trunk bookmark moved during run; queue item left in place, re-run to retry");
-        return Ok(RunResult::Failure(exit_codes::TRUNK_MOVED, "trunk moved during run".to_string()));
+        return Ok(RunResult::Failure(exit_codes::CONFLICT, "trunk moved during run".to_string()));
     }
 
     // Success path
