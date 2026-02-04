@@ -34,6 +34,7 @@ jjq stores all state in the jj repository itself:
 
 | Command | Function |
 |---------|----------|
+| `init [--trunk <bookmark>] [--check <cmd>]` | Initialize jjq, set trunk and check command |
 | `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID) |
 | `run [--all]` | Process next queue item, or all items in batch |
 | `check [--rev <revset>]` | Run check command against a revision (default @) |
