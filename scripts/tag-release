@@ -1,0 +1,45 @@
+#!/bin/sh
+# ABOUTME: Creates and pushes a Git tag for a jjq release from a jj-colocated repo.
+# ABOUTME: Validates version format and checks it matches Cargo.toml before tagging.
+set -eu
+
+usage() {
+    echo "Usage: tag-release <version>" >&2
+    echo "Example: tag-release v0.1.0" >&2
+    exit 1
+}
+
+if [ $# -ne 1 ]; then
+    usage
+fi
+
+tag="$1"
+
+# Validate version format
+if ! echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "Error: version must match v<major>.<minor>.<patch>" >&2
+    exit 1
+fi
+
+version="${tag#v}"
+
+# Verify Cargo.toml version matches
+cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+if [ "$cargo_version" != "$version" ]; then
+    echo "Error: tag $tag does not match Cargo.toml version ($cargo_version)" >&2
+    echo "Update Cargo.toml first, then re-run." >&2
+    exit 1
+fi
+
+# Check tag doesn't already exist
+if git tag -l "$tag" | grep -q .; then
+    echo "Error: tag $tag already exists" >&2
+    exit 1
+fi
+
+# Export jj state to git, tag, and push
+jj git export
+git tag "$tag"
+git push origin "$tag"
+
+echo "Tagged and pushed $tag"

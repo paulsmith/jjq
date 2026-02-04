@@ -1,6 +1,6 @@
 .\" ABOUTME: Man page for jjq, a local merge queue for jj (Jujutsu VCS).
 .\" ABOUTME: Covers all commands, configuration, data model, and workflows.
-.TH JJQ 1 "2026-02-03" "jjq" "General Commands Manual"
+.TH JJQ 1 "2026-02-04" "jjq" "General Commands Manual"
 .SH NAME
 jjq \- local merge queue for jj
 .SH SYNOPSIS
@@ -15,6 +15,7 @@ jjq \- local merge queue for jj
 .br
 .B jjq run
 .RB [ \-\-all ]
+.RB [ \-\-stop-on-failure ]
 .br
 .B jjq check
 .RB [ \-\-rev
@@ -37,6 +38,12 @@ jjq \- local merge queue for jj
 .B jjq config
 .RI [ key
 .RI [ value ]]
+.br
+.B jjq tail
+.RB [ \-\-all ]
+.RB [ \-\-no-follow ]
+.br
+.B jjq quickstart
 .SH DESCRIPTION
 .B jjq
 is a local merge queue for
