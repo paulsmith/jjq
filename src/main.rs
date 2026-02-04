@@ -43,6 +43,8 @@ enum Commands {
     },
     /// Remove jjq workspaces
     Clean,
+    /// Validate configuration and environment
+    Doctor,
     /// Get or set configuration
     Config {
         /// Configuration key
@@ -75,6 +77,7 @@ fn run() -> Result<()> {
         Commands::Status => commands::status(),
         Commands::Delete { id } => commands::delete(&id),
         Commands::Clean => commands::clean(),
+        Commands::Doctor => commands::doctor(),
         Commands::Config { key, value } => commands::config(key.as_deref(), value.as_deref()),
     }
 }

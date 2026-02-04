@@ -237,6 +237,14 @@ Runner workspaces are short-lived and shall be garbage collected upon success.
 Failed workspaces shall persist, to permit user debugging, and can be manually
 cleaned up by the user with the jjq `clean` command.
 
+### Diagnostics
+
+The jjq `doctor` command validates the environment before queue items are
+processed. It checks that the trunk bookmark exists, the check command is
+configured, no stale locks are present, and no orphaned workspaces remain. Each
+check is reported as ok, WARN, or FAIL, with suggested fixes for actionable
+issues.
+
 ### User configuration
 
 Users may configure jjq via a jjq `config` command. The store of the

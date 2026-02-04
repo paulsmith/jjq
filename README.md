@@ -89,6 +89,15 @@ jjq clean 3           # clean workspace for failed item 3
 jjq clean all         # clean all failed workspaces
 ```
 
+### Validate your setup
+
+```sh
+jjq doctor
+```
+
+Checks trunk bookmark, check command, lock state, and workspace
+preconditions. Catches common config errors before queue items fail.
+
 ## How it works
 
 jjq stores its state in your jj repository using bookmarks and an isolated

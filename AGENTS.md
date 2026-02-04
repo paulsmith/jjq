@@ -40,6 +40,7 @@ jjq stores all state in the jj repository itself:
 | `delete <id>` | Remove item from queue/failed |
 | `config [key] [value]` | Get/set configuration |
 | `clean` | Remove failed workspaces |
+| `doctor` | Validate config, locks, and workspace preconditions |
 
 ### Exit Codes
 

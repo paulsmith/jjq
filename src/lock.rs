@@ -4,6 +4,7 @@
 use anyhow::{bail, Result};
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 use crate::jj;
 
@@ -61,6 +62,52 @@ pub fn is_held(name: &str) -> Result<bool> {
     let lock_dir = get_lock_dir()?;
     let lock_path = lock_dir.join(name);
     Ok(lock_path.is_dir())
+}
+
+/// State of a named lock.
+pub enum LockState {
+    Free,
+    HeldAlive(u32),
+    HeldDead(u32),
+    HeldUnknown,
+}
+
+/// Inspect the state of a named lock, including whether the holding process is alive.
+pub fn lock_state(name: &str) -> Result<LockState> {
+    let lock_dir = get_lock_dir()?;
+    let lock_path = lock_dir.join(name);
+
+    if !lock_path.is_dir() {
+        return Ok(LockState::Free);
+    }
+
+    let pid_path = lock_path.join("pid");
+    let pid_str = match fs::read_to_string(&pid_path) {
+        Ok(s) => s,
+        Err(_) => return Ok(LockState::HeldUnknown),
+    };
+
+    let pid: u32 = match pid_str.trim().parse() {
+        Ok(p) => p,
+        Err(_) => return Ok(LockState::HeldUnknown),
+    };
+
+    let alive = Command::new("sh")
+        .args(["-c", &format!("kill -0 {} 2>/dev/null", pid)])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if alive {
+        Ok(LockState::HeldAlive(pid))
+    } else {
+        Ok(LockState::HeldDead(pid))
+    }
+}
+
+/// Get the filesystem path for a named lock (for diagnostic messages).
+pub fn lock_path(name: &str) -> Result<PathBuf> {
+    Ok(get_lock_dir()?.join(name))
 }
 
 /// Get the lock directory path.

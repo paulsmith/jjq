@@ -551,6 +551,147 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
     }
 }
 
+/// Validate configuration and environment.
+pub fn doctor() -> Result<()> {
+    println!("jjq doctor:");
+
+    let mut fails = 0u32;
+    let mut warns = 0u32;
+
+    // 1. jj repository (already verified by main, so this always passes)
+    print_check("ok", "jj repository");
+
+    // 2. jjq initialized
+    let initialized = config::is_initialized()?;
+    if initialized {
+        print_check("ok", "jjq initialized");
+    } else {
+        print_check("WARN", "jjq not initialized (run 'jjq push' to initialize)");
+        warns += 1;
+    }
+
+    // 3. trunk bookmark exists
+    let trunk_bookmark = config::get_trunk_bookmark()?;
+    if jj::bookmark_exists(&trunk_bookmark)? {
+        print_check("ok", &format!("trunk bookmark '{}' exists", trunk_bookmark));
+    } else {
+        print_check("FAIL", &format!("trunk bookmark '{}' does not exist", trunk_bookmark));
+        fails += 1;
+    }
+
+    // 4. check command configured
+    let check_configured = if initialized {
+        config::get_check_command()?.is_some()
+    } else {
+        false
+    };
+    if check_configured {
+        print_check("ok", "check command configured");
+    } else {
+        print_check("FAIL", "check command not configured");
+        print_hint("to fix: jjq config check_command '<command>'");
+        fails += 1;
+    }
+
+    // 5. run lock
+    match lock::lock_state("run")? {
+        lock::LockState::Free => print_check("ok", "run lock is free"),
+        lock::LockState::HeldAlive(pid) => {
+            print_check("WARN", &format!("run lock held by live process (pid {})", pid));
+            warns += 1;
+        }
+        lock::LockState::HeldDead(pid) => {
+            print_check("FAIL", &format!("run lock held by dead process (pid {})", pid));
+            print_hint(&format!("to fix: rm -rf {}", lock::lock_path("run")?.display()));
+            fails += 1;
+        }
+        lock::LockState::HeldUnknown => {
+            print_check("WARN", "run lock held (unknown process)");
+            let path = lock::lock_path("run")?;
+            print_hint(&format!("if stale: rm -rf {}", path.display()));
+            warns += 1;
+        }
+    }
+
+    // 6. id lock
+    match lock::lock_state("id")? {
+        lock::LockState::Free => print_check("ok", "id lock is free"),
+        lock::LockState::HeldAlive(pid) => {
+            print_check("WARN", &format!("id lock held by live process (pid {})", pid));
+            warns += 1;
+        }
+        lock::LockState::HeldDead(pid) => {
+            print_check("FAIL", &format!("id lock held by dead process (pid {})", pid));
+            print_hint(&format!("to fix: rm -rf {}", lock::lock_path("id")?.display()));
+            fails += 1;
+        }
+        lock::LockState::HeldUnknown => {
+            print_check("WARN", "id lock held (unknown process)");
+            let path = lock::lock_path("id")?;
+            print_hint(&format!("if stale: rm -rf {}", path.display()));
+            warns += 1;
+        }
+    }
+
+    // 7. orphaned workspaces
+    let ws_output = jj::workspace_list()?;
+    let orphaned: usize = ws_output
+        .lines()
+        .filter_map(|line| {
+            let name = line.split_whitespace().next()?.trim_end_matches(':');
+            if name.starts_with("jjq-run-")
+                || name.starts_with("jjq-config-")
+                || name.starts_with("jjq-meta-")
+            {
+                Some(())
+            } else {
+                None
+            }
+        })
+        .count();
+    if orphaned == 0 {
+        print_check("ok", "no orphaned workspaces");
+    } else {
+        print_check("WARN", &format!("{} orphaned workspace(s) found", orphaned));
+        print_hint("to fix: jjq clean");
+        warns += 1;
+    }
+
+    // Summary
+    println!();
+    if fails == 0 && warns == 0 {
+        println!("all checks passed");
+    } else {
+        let mut parts = Vec::new();
+        if fails > 0 {
+            parts.push(format!("{} failure(s)", fails));
+        }
+        if warns > 0 {
+            parts.push(format!("{} warning(s)", warns));
+        }
+        println!("{}", parts.join(", "));
+    }
+
+    if fails > 0 {
+        Err(ExitError::new(exit_codes::CONFLICT, "doctor found issues").into())
+    } else {
+        Ok(())
+    }
+}
+
+fn print_check(status: &str, msg: &str) {
+    match status {
+        "ok" => println!("   ok  {}", msg),
+        "WARN" => println!(" WARN  {}", msg),
+        "FAIL" => println!(" FAIL  {}", msg),
+        _ => println!("  {}  {}", status, msg),
+    }
+}
+
+fn print_hint(msg: &str) {
+    println!("       {}", msg);
+}
+
 /// Remove all jjq workspaces and their directories.
 pub fn clean() -> Result<()> {
     let ws_output = jj::workspace_list()?;

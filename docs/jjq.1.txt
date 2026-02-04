@@ -9,6 +9,7 @@
          jjq status
          jjq delete <id>
          jjq clean
+         jjq doctor
          jjq config [<key> [<value>]]
 
   DESCRIPTION
@@ -84,6 +85,15 @@
          Remove jjq workspaces left behind by failed merges. Lists each
          workspace removed. Safe to run at any time -- only removes jjq-owned
          workspaces, never user workspaces.
+
+     doctor
+         Validate that the jjq environment is correctly configured.
+         Checks the trunk bookmark, check command, lock state, and
+         workspace preconditions. Each check is reported as ok, WARN,
+         or FAIL. When a check fails, a suggested fix is shown.
+
+         Exits 0 if no failures are found (warnings are tolerated).
+         Exits 1 if any check fails.
 
      config [<key> [<value>]]
          Get or set configuration. With no arguments, displays all
