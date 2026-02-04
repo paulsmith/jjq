@@ -95,7 +95,6 @@ After initialization, change settings with:
 jjq config                           # show all config
 jjq config check_command "make test" # set check command
 jjq config trunk_bookmark main       # set trunk bookmark name
-jjq config max_failures 5            # set max failures shown in status
 ```
 
 ### Handle failures
@@ -159,7 +158,6 @@ log = "~ ::jjq/_/_"
 |-----|---------|-------------|
 | `trunk_bookmark` | `main` | Bookmark pointing to your trunk |
 | `check_command` | *(set during init)* | Command to run on merge candidates |
-| `max_failures` | `3` | Number of recent failures to show in status |
 
 ## Copying
 

@@ -418,7 +418,6 @@ fn test_config_show_all() {
     insta::assert_snapshot!(output, @r"
     trunk_bookmark = main
     check_command = true
-    max_failures = 3
     ");
 }
 
@@ -442,7 +441,7 @@ fn test_config_invalid_key() {
     let output = repo.jjq_failure(&["config", "invalid_key"]);
     insta::assert_snapshot!(output, @r"
     jjq: unknown config key: invalid_key
-    valid keys: trunk_bookmark, check_command, max_failures
+    valid keys: trunk_bookmark, check_command
     ");
 }
 

@@ -148,8 +148,7 @@ The temporary workspace is always cleaned up, regardless of outcome.
 Exits 0 if the check passes; 1 if it fails.
 .SS status \fR[\fIid\fR] [\fB\-\-json\fR] [\fB\-\-resolve \fIchange_id\fR]
 Display the current queue state: queued items (ascending by sequence ID)
-and recent failures (descending, up to
-.BR max_failures ).
+and recent failures (descending by sequence ID).
 Each entry shows its sequence ID, change ID prefix, and first line of
 the commit description.
 .PP
@@ -238,10 +237,6 @@ Set during
 .B jjq init
 or configured afterward with
 .BR "jjq config" .
-.TP
-.BR max_failures " (default: 3)"
-Number of recent failures shown by
-.BR status .
 .SH EXIT CODES
 .TP
 .B 0

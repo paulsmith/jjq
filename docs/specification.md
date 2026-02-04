@@ -192,7 +192,6 @@ Defined configuration keys:
 |------------------|-----------|-------------------------------------|
 | `trunk_bookmark` | `main`    | Bookmark designating trunk          |
 | `check_command`  | (none)    | Command to validate merge-to-be     |
-| `max_failures`   | `3`       | Recent failures shown in status     |
 
 The `check_command` key has no default. If unconfigured, the `run` command
 MUST fail with an error indicating that configuration is required.
@@ -598,15 +597,13 @@ Display the current state of the queue.
 
 1. If jjq is not initialized, output "not initialized" message and
    exit with code 0.
-2. Acquire the config lock, read `max_failures`, then release the
-   config lock.
-3. Check if the run lock is held. If so, indicate a run is in progress.
-4. List all queued items (bookmarks matching `jjq/queue/??????`) in
+2. Check if the run lock is held. If so, indicate a run is in progress.
+3. List all queued items (bookmarks matching `jjq/queue/??????`) in
    ascending sequence ID order.
-5. List recent failed items (bookmarks matching `jjq/failed/??????`)
-   in descending sequence ID order, limited to `max_failures` entries.
-6. If no queued or failed items exist, output "queue is empty".
-7. Exit with code 0.
+4. List all failed items (bookmarks matching `jjq/failed/??????`)
+   in descending sequence ID order.
+5. If no queued or failed items exist, output "queue is empty".
+6. Exit with code 0.
 
 #### Output
 
@@ -727,7 +724,6 @@ Get or set configuration values.
 |------------------|------------|------------------------------------|
 | `trunk_bookmark` | string     | Bookmark designating trunk         |
 | `check_command`  | string     | Shell command to validate merges   |
-| `max_failures`   | integer    | Recent failures shown in status    |
 
 #### Behavior
 
@@ -749,12 +745,11 @@ Get or set configuration values.
 **Key and value (`jjq config <key> <value>`):**
 1. Ensure jjq is initialized.
 2. Validate key is recognized. If not, fail with exit code 1.
-3. For `max_failures`, validate value is a non-negative integer.
-4. Acquire the config lock.
-5. Write value to `config/<key>` on the metadata branch.
-6. Release the config lock.
-7. Output confirmation.
-8. Exit with code 0.
+3. Acquire the config lock.
+4. Write value to `config/<key>` on the metadata branch.
+5. Release the config lock.
+6. Output confirmation.
+7. Exit with code 0.
 
 #### Errors
 

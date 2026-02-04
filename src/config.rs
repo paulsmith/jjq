@@ -14,10 +14,9 @@ pub const JJQ_BOOKMARK: &str = "jjq/_/_";
 
 /// Default configuration values.
 pub const DEFAULT_TRUNK_BOOKMARK: &str = "main";
-pub const DEFAULT_MAX_FAILURES: u32 = 3;
 
 /// Valid configuration keys.
-pub const VALID_KEYS: &[&str] = &["trunk_bookmark", "check_command", "max_failures"];
+pub const VALID_KEYS: &[&str] = &["trunk_bookmark", "check_command"];
 
 /// Check if jjq is initialized (metadata bookmark exists).
 pub fn is_initialized() -> Result<bool> {
@@ -86,12 +85,6 @@ pub fn get_check_command() -> Result<Option<String>> {
     get("check_command")
 }
 
-/// Get max failures to display.
-pub fn get_max_failures() -> Result<u32> {
-    let val = get_or_default("max_failures", &DEFAULT_MAX_FAILURES.to_string())?;
-    Ok(val.parse().unwrap_or(DEFAULT_MAX_FAILURES))
-}
-
 /// Set a config value on the metadata branch.
 pub fn set(key: &str, value: &str) -> Result<()> {
     // Validate key
@@ -101,11 +94,6 @@ pub fn set(key: &str, value: &str) -> Result<()> {
             key,
             VALID_KEYS.join(", ")
         );
-    }
-
-    // Validate max_failures is numeric
-    if key == "max_failures" && value.parse::<u32>().is_err() {
-        bail!("max_failures must be a non-negative integer");
     }
 
     ensure_initialized()?;
