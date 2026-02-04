@@ -395,6 +395,80 @@ fn run_one() -> Result<RunResult> {
     Ok(RunResult::Success)
 }
 
+/// Run check command against a revision in a temporary workspace.
+pub fn check(revset: &str, verbose: bool) -> Result<()> {
+    // Resolve the revision
+    let change_id = jj::resolve_revset(revset)
+        .map_err(|e| ExitError::new(exit_codes::USAGE, e.to_string()))?;
+
+    // Read check command
+    let check_command = match config::get_check_command()? {
+        Some(cmd) => cmd,
+        None => {
+            return Err(ExitError::new(
+                exit_codes::USAGE,
+                "check_command not configured (use 'jjq config check_command <cmd>')",
+            )
+            .into());
+        }
+    };
+
+    prefout(&format!("checking revision {} with: {}", change_id, check_command));
+
+    // Create temporary workspace
+    let workspace_dir = TempDir::new()?;
+    let workspace_name = format!("jjq-check-{}", std::process::id());
+
+    jj::workspace_add(
+        workspace_dir.path().to_str().unwrap(),
+        &workspace_name,
+        &[revset],
+    )?;
+
+    let orig_dir = env::current_dir()?;
+    env::set_current_dir(workspace_dir.path())?;
+
+    if verbose {
+        prefout(&format!("workspace: {}", workspace_dir.path().display()));
+        prefout("shell: /bin/sh");
+        prefout("env:");
+        let mut vars: Vec<(String, String)> = env::vars().collect();
+        vars.sort();
+        for (key, value) in &vars {
+            prefout(&format!("  {}={}", key, value));
+        }
+    }
+
+    // Run check command
+    let check_output = Command::new("sh")
+        .arg("-c")
+        .arg(&check_command)
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&check_output.stdout);
+    let stderr = String::from_utf8_lossy(&check_output.stderr);
+
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+    }
+
+    let success = check_output.status.success();
+
+    // Always clean up
+    env::set_current_dir(&orig_dir)?;
+    jj::workspace_forget(&workspace_name)?;
+
+    if success {
+        prefout("check passed");
+        Ok(())
+    } else {
+        Err(ExitError::new(exit_codes::CONFLICT, "check failed").into())
+    }
+}
+
 /// Display queue status.
 pub fn status() -> Result<()> {
     if !config::is_initialized()? {

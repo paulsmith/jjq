@@ -237,6 +237,12 @@ Runner workspaces are short-lived and shall be garbage collected upon success.
 Failed workspaces shall persist, to permit user debugging, and can be manually
 cleaned up by the user with the jjq `clean` command.
 
+### Dry-run checking
+
+The `check` command runs the configured check command against a revision in a
+temporary workspace, without any queue processing. This lets users verify their
+check command is sane before queuing items. The workspace is always cleaned up.
+
 ### Diagnostics
 
 The jjq `doctor` command validates the environment before queue items are

@@ -34,6 +34,15 @@ enum Commands {
         #[arg(long)]
         stop_on_failure: bool,
     },
+    /// Run check command against a revision without queue processing
+    Check {
+        /// Revset to check
+        #[arg(long, default_value = "@")]
+        rev: String,
+        /// Show workspace path, shell, and environment before running
+        #[arg(long, short)]
+        verbose: bool,
+    },
     /// Display current queue state
     Status,
     /// Remove an item from queue or failed list
@@ -74,6 +83,7 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Push { revset } => commands::push(&revset),
         Commands::Run { all, stop_on_failure } => commands::run(all, stop_on_failure),
+        Commands::Check { rev, verbose } => commands::check(&rev, verbose),
         Commands::Status => commands::status(),
         Commands::Delete { id } => commands::delete(&id),
         Commands::Clean => commands::clean(),

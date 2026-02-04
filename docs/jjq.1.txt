@@ -6,6 +6,7 @@
   SYNOPSIS
          jjq push <revset>
          jjq run [--all] [--stop-on-failure]
+         jjq check [--rev <revset>] [-v]
          jjq status
          jjq delete <id>
          jjq clean
@@ -66,6 +67,20 @@
          Returns 0 if all items merged successfully (or the queue was empty).
          Returns 1 if --stop-on-failure is set and an item fails. Returns 2
          if some items succeeded and some failed.
+
+     check [--rev <revset>] [-v]
+         Run the configured check command against a revision in a temporary
+         workspace without any queue processing. Useful for verifying that
+         the check command works before queuing items.
+
+         Defaults to the current working copy (@) if --rev is not specified.
+
+         With -v (--verbose), prints the workspace path, shell, and all
+         environment variables before running the check command. Useful for
+         diagnosing path or environment issues.
+
+         The temporary workspace is always cleaned up, regardless of
+         outcome. Exits 0 if the check passes; 1 if it fails.
 
      status
          Display the current queue state: queued items (ascending by sequence

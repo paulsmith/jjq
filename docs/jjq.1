@@ -10,6 +10,11 @@ jjq \- local merge queue for jj
 .B jjq run
 .RB [ \-\-all ]
 .br
+.B jjq check
+.RB [ \-\-rev
+.IR revset ]
+.RB [ \-v ]
+.br
 .B jjq status
 .br
 .B jjq delete
@@ -84,6 +89,25 @@ Reports the count of successes and failures.
 Returns 0 if at least one item was processed successfully (or the queue
 was empty).
 Returns 1 if any item failed.
+.SS check \fR[\fB\-\-rev \fIrevset\fR] [\fB\-v\fR]
+Run the configured check command against a revision in a temporary
+workspace without any queue processing.
+Useful for verifying that the check command works before queuing items.
+.PP
+Defaults to the current working copy
+.RB ( @ )
+if
+.B \-\-rev
+is not specified.
+.PP
+With
+.BR \-v " (" \-\-verbose ),
+prints the workspace path, shell, and all environment variables before
+running the check command.
+Useful for diagnosing path or environment issues.
+.PP
+The temporary workspace is always cleaned up, regardless of outcome.
+Exits 0 if the check passes; 1 if it fails.
 .SS status
 Display the current queue state: queued items (ascending by sequence ID)
 and recent failures (descending, up to

@@ -89,6 +89,14 @@ jjq clean 3           # clean workspace for failed item 3
 jjq clean all         # clean all failed workspaces
 ```
 
+### Test your check command
+
+```sh
+jjq check              # run check against current working copy
+jjq check --rev main   # run check against a specific revision
+jjq check -v           # show workspace path, shell, and env vars
+```
+
 ### Validate your setup
 
 ```sh
