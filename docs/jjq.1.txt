@@ -1,239 +1,250 @@
-  JJQ(1)                      General Commands Manual                     JJQ(1)
+JJQ(1)                      General Commands Manual                      JJQ(1)
 
-  NAME
-         jjq - local merge queue for jj
+NAME
+       jjq - local merge queue for jj
 
-  SYNOPSIS
-         jjq push <revset>
-         jjq run [--all] [--stop-on-failure]
-         jjq check [--rev <revset>] [-v]
-         jjq status [id] [--json] [--resolve <change_id>]
-         jjq delete <id>
-         jjq clean
-         jjq doctor
-         jjq config [<key> [<value>]]
+SYNOPSIS
+       jjq init [--trunk bookmark] [--check command]
+       jjq push revset
+       jjq run [--all]
+       jjq check [--rev revset] [-v]
+       jjq status [id] [--json] [--resolve change_id]
+       jjq delete id
+       jjq clean
+       jjq doctor
+       jjq config [key [value]]
 
-  DESCRIPTION
-         jjq is a local merge queue for jj (Jujutsu VCS). It queues revisions
-         for merging to a trunk bookmark, processes them in FIFO order, and
-         gates each merge on a configurable check command. This prevents the
-         "works on my branch" problem where changes pass checks individually
-         but fail when combined with concurrent work.
+DESCRIPTION
+       jjq is a local merge queue for jj(1) (Jujutsu VCS).  It queues revisions
+       for merging to a trunk bookmark, processes them in FIFO order, and gates
+       each merge on a configurable check command.  This prevents the “works on
+       my  branch” problem where changes pass checks individually but fail when
+       combined with concurrent work.
 
-         jjq stores all state inside the jj repository using bookmarks and an
-         isolated metadata branch. No external database or service is required.
+       jjq stores all state inside the jj repository  using  bookmarks  and  an
+       isolated metadata branch.  No external database or service is required.
 
-  COMMANDS
-     push <revset>
-         Queue a revision for merging to trunk. The revset must resolve to
-         exactly one revision.
+COMMANDS
+   init [--trunk bookmark] [--check command]
+       Initialize  jjq  in the current repository.  Sets up the metadata branch
+       and configures the trunk bookmark and check command.
 
-         Before queuing, jjq creates a temporary merge commit between the
-         trunk and the candidate to check for textual conflicts. If conflicts
-         are detected, the push is rejected with exit code 1.
+       With --trunk and --check flags, runs non-interactively.  Without  flags,
+       prompts  for  each  value.   The trunk bookmark defaults to main if that
+       bookmark exists, or master as a fallback.
 
-         Push is idempotent for the same change ID: if the change is already
-         queued or failed, the stale entry is cleared and the revision is
-         re-queued. However, if the same change ID is already queued at a
-         different commit ID (i.e., the revision has been amended), the push
-         is rejected with exit code 10.
+       If stdin is not a terminal and required flags are missing, exits with an
+       error.
 
-         Examples:
-             jjq push @              Queue the working copy revision
-             jjq push feat-xyz@      Queue a workspace's working copy
-             jjq push abc123         Queue by change ID
+       Refuses to run if jjq is already initialized.  Use jjq config to  change
+       settings after initialization.
 
-     run [--all] [--stop-on-failure]
-         Process the next queued item. Creates a temporary jj workspace with
-         two parents (trunk and candidate), then runs the configured check
-         command inside it.
+       After configuration, runs jjq doctor to validate the setup.
 
-         On success, the trunk bookmark advances to the merge commit and
-         the temporary workspace is cleaned up.
+   push revset
+       Queue  a  revision for merging to trunk.  The revset must resolve to ex‐
+       actly one revision.
 
-         On failure (conflicts or check command failure), the item moves to
-         the failed list. The temporary workspace is preserved for debugging.
+       Before queuing, jjq creates a temporary merge commit between  the  trunk
+       and  the candidate to check for textual conflicts.  If conflicts are de‐
+       tected, the push is rejected with exit code 1.
 
-         If the trunk bookmark moves during processing (e.g., another runner
-         advanced it), the run aborts and instructs the user to retry.
+       Push is idempotent for the same change ID:  if  the  change  is  already
+       queued  or  failed,  the  stale  entry  is  cleared  and the revision is
+       re-queued.  However, if the same change ID is already queued at  a  dif‐
+       ferent  commit ID (i.e., the revision has been amended), the push is re‐
+       jected with exit code 10.
 
-         With --all, processes items in a loop until the queue is empty.
-         Failed items are moved to the failed list and processing continues
-         with the next item. Reports the count of successes and failures.
+              jjq push @              # queue the working copy
+              jjq push feat-xyz@      # queue a workspace's working copy
+              jjq push abc123         # queue by change ID
 
-         With --all --stop-on-failure, stops at the first failure instead
-         of continuing.
+   run [--all]
+       Process the next queued item.  Creates a temporary jj workspace with two
+       parents (trunk and candidate), then runs the  configured  check  command
+       inside it.
 
-         Returns 0 if all items merged successfully (or the queue was empty).
-         Returns 1 if --stop-on-failure is set and an item fails. Returns 2
-         if some items succeeded and some failed.
+       On success, the trunk bookmark advances to the merge commit and the tem‐
+       porary workspace is cleaned up.
 
-     check [--rev <revset>] [-v]
-         Run the configured check command against a revision in a temporary
-         workspace without any queue processing. Useful for verifying that
-         the check command works before queuing items.
+       On  failure  (conflicts or check command failure), the item moves to the
+       failed list.  The temporary workspace is preserved for debugging.
 
-         Defaults to the current working copy (@) if --rev is not specified.
+       If the trunk bookmark moves during processing (e.g., another runner  ad‐
+       vanced it), the run aborts and instructs the user to retry.
 
-         With -v (--verbose), prints the workspace path, shell, and all
-         environment variables before running the check command. Useful for
-         diagnosing path or environment issues.
+       With  --all,  processes  items  in a loop until the queue is empty or an
+       item fails.  Reports the count of successes and failures.
 
-         The temporary workspace is always cleaned up, regardless of
-         outcome. Exits 0 if the check passes; 1 if it fails.
+       Returns 0 if at least one item was processed successfully (or the  queue
+       was empty).  Returns 1 if any item failed.
 
-     status [id] [--json] [--resolve <change_id>]
-         Display the current queue state: queued items (ascending by sequence
-         ID) and recent failures (descending, up to max_failures). Each entry
-         shows its sequence ID, change ID prefix, and first line of the
-         commit description.
+   check [--rev revset] [-v]
+       Run the configured check command against a revision in a temporary work‐
+       space without any queue processing.  Useful for verifying that the check
+       command works before queuing items.
 
-         Also indicates if a run lock is currently held (another jjq run is
-         in progress).
+       Defaults to the current working copy (@) if --rev is not specified.
 
-         With --json, outputs structured JSON with running, queue, and failed
-         fields. Queue items include change_id, commit_id, and description.
-         Failed items include candidate_change_id, candidate_commit_id,
-         description (original candidate message), trunk_commit_id,
-         workspace_path, and failure_reason.
+       With  -v (--verbose), prints the workspace path, shell, and all environ‐
+       ment variables before running the check command.  Useful for  diagnosing
+       path or environment issues.
 
-         With a positional id, displays a single item's detail view (from
-         either queue or failed). With --resolve, looks up an item by its
-         candidate change ID. id and --resolve are mutually exclusive.
+       The  temporary  workspace  is  always cleaned up, regardless of outcome.
+       Exits 0 if the check passes; 1 if it fails.
 
-     delete <id>
-         Remove an item from the queue or the failed list by its sequence ID.
-         The sequence ID is the number shown in status output and push
-         confirmation messages.
+   status [id] [--json] [--resolve change_id]
+       Display the current queue state: queued items (ascending by sequence ID)
+       and recent failures (descending, up to max_failures).  Each entry  shows
+       its sequence ID, change ID prefix, and first line of the commit descrip‐
+       tion.
 
-     clean
-         Remove jjq workspaces left behind by failed merges. Lists each
-         workspace removed. Safe to run at any time -- only removes jjq-owned
-         workspaces, never user workspaces.
+       Also  indicates  if  a run lock is currently held (another jjq run is in
+       progress).
 
-     doctor
-         Validate that the jjq environment is correctly configured.
-         Checks the trunk bookmark, check command, lock state, and
-         workspace preconditions. Each check is reported as ok, WARN,
-         or FAIL. When a check fails, a suggested fix is shown.
+       With --json, outputs structured JSON with  running,  queue,  and  failed
+       fields.   Queue  items  include  change_id,  commit_id, and description.
+       Failed items include candidate_change_id, candidate_commit_id,  descrip‐
+       tion  (original candidate message), trunk_commit_id, workspace_path, and
+       failure_reason.
 
-         Exits 0 if no failures are found (warnings are tolerated).
-         Exits 1 if any check fails.
+       With a positional id, displays a single item's detail view (from  either
+       queue  or  failed).   With  --resolve, looks up an item by its candidate
+       change ID.  id and --resolve are mutually exclusive.
 
-     config [<key> [<value>]]
-         Get or set configuration. With no arguments, displays all
-         configuration values. With one argument, displays that key's value.
-         With two arguments, sets the key to the given value.
+   delete id
+       Remove an item from the queue or the failed list  by  its  sequence  ID.
+       The  sequence ID is the number shown in status output and push confirma‐
+       tion messages.
 
-         Valid keys:
+   clean
+       Remove jjq workspaces left behind by failed merges.   Lists  each  work‐
+       space  removed.   Safe to run at any time — only removes jjq-owned work‐
+       spaces, never user workspaces.
 
-         trunk_bookmark (default: "main")
-             The bookmark that jjq treats as the protected trunk. All merges
-             target this bookmark.
+   doctor
+       Validate that the jjq environment is correctly configured.   Checks  the
+       trunk  bookmark, check command, lock state, and workspace preconditions.
+       Each check is reported as ok, WARN, or FAIL.  When a check fails, a sug‐
+       gested fix is shown.
 
-         check_command (required)
-             Shell command to run in the merge workspace to validate a
-             candidate. Should run tests, lints, type checks, or whatever
-             gates your trunk. Exit 0 means pass; non-zero means fail.
+       Exits 0 if no failures are found (warnings are tolerated).  Exits  1  if
+       any check fails.
 
-             Must be configured before running jjq push or jjq run.
+   config [key [value]]
+       Get or set configuration.  With no arguments, displays all configuration
+       values.   With  one argument, displays that key's value.  With two argu‐
+       ments, sets the key to the given value.
 
-         max_failures (default: 3)
-             Number of recent failures shown by status.
+       Valid keys:
 
-  EXIT CODES
-         0    Success.
+       trunk_bookmark (default: “main”)
+              The bookmark that jjq treats as the protected trunk.  All  merges
+              target this bookmark.
 
-         1    Merge conflict or check command failure.
+       check_command (required)
+              Shell  command to run in the merge workspace to validate a candi‐
+              date.  Should run tests, lints, type checks,  or  whatever  gates
+              your trunk.  Exit 0 means pass; non-zero means fail.
 
-         2    Partial success. Some items merged, some failed (run --all
-              without --stop-on-failure).
+              Set during jjq init or configured afterward with jjq config.
 
-         3    Lock held. Another jjq process is running. Retry later.
+       max_failures (default: 3)
+              Number of recent failures shown by status.
 
-         10   Usage error. Bad arguments, ambiguous revset, duplicate push
-              of an amended revision, etc.
+EXIT CODES
+       0      Success.
 
-  CONFIGURATION
-         jjq stores configuration on an isolated metadata branch (jjq/_/_)
-         parented to the repository root. This branch never appears in normal
-         jj log output and does not pollute user history.
+       1      Merge conflict or check command failure.
 
-         Always configure check_command before using jjq run.
+       3      Lock held.  Another jjq process is running.  Retry later.
 
-  LOCKING
-         jjq uses filesystem-based locks (atomic mkdir) in .jj/jjq-locks/
-         to coordinate concurrent access:
+       10     Usage  error.  Bad arguments, ambiguous revset, duplicate push of
+              an amended revision, etc.
 
-         id     Protects sequence ID allocation (brief, during push).
+CONFIGURATION
+       jjq stores configuration on an isolated metadata branch  (jjq/_/_)  par‐
+       ented  to  the  repository root.  This branch never appears in normal jj
+       log output and does not pollute user history.
 
-         config Protects configuration reads and writes.
+       Always configure check_command before using jjq run.  The default  check
+       command rejects everything.
 
-         run    Ensures only one jjq run processes the queue at a time.
+LOCKING
+       jjq  uses flock-based file locks in .jj/jjq-locks/ to coordinate concur‐
+       rent access.  Locks are released automatically by the OS when the  hold‐
+       ing process exits, so stale locks cannot occur.
 
-         If a lock is stale (e.g., from a crashed process), delete the
-         corresponding directory under .jj/jjq-locks/.
+       id     Protects sequence ID allocation (brief, during push).
 
-  DATA MODEL
-         Queue items are jj bookmarks named jjq/queue/NNNNNN where NNNNNN
-         is a zero-padded sequence ID. Failed items use jjq/failed/NNNNNN.
-         The metadata branch at jjq/_/_ stores the last allocated ID and
-         all configuration.
+       config Protects configuration reads and writes.
 
-         Successful merges are ordinary jj commits with two parents (trunk
-         and candidate) and descriptions like "Success: merge N". Failed
-         merges are preserved as conflicted commits with descriptions like
-         "Failed: merge N (conflicts)".
+       run    Ensures only one jjq run processes the queue at a time.
 
-  TYPICAL WORKFLOW
-         Initialize a project:
-             jjq config trunk_bookmark main
-             jjq config check_command "make test && make lint"
+DATA MODEL
+       Queue  items  are  jj bookmarks named jjq/queue/NNNNNN where NNNNNN is a
+       zero-padded sequence ID.  Failed items use jjq/failed/NNNNNN.  The meta‐
+       data branch at jjq/_/_ stores the last allocated ID and  all  configura‐
+       tion.
 
-         Developer queues work:
-             jjq push @
+       Successful  merges  are  ordinary jj commits with two parents (trunk and
+       candidate) and descriptions like “Success: merge N”.  Failed merges  are
+       preserved  as conflicted commits with descriptions like “Failed: merge N
+       (conflicts)”.
 
-         Process the queue:
-             jjq run          # one item
-             jjq run --all    # drain the queue
+TYPICAL WORKFLOW
+       Initialize a project:
 
-         Handle a failure:
-             jjq status                    # see what failed
-             jj rebase -r <rev> -d main    # rebase onto current trunk
-             # ... resolve conflicts ...
-             jjq push <rev>                # re-queue
-             jjq run                       # retry
+              jjq init --trunk main --check "make test && make lint"
 
-         Clean up:
-             jjq clean         # remove failed merge workspaces
+       Developer queues work:
 
-  ENVIRONMENT
-         jjq must be run from within a jj repository. It invokes jj as a
-         subprocess and expects it to be on PATH.
+              jjq push @
 
-  TIPS
-         o  Configure jj log to hide jjq metadata bookmarks:
+       Process the queue:
 
-                jj config set --repo 'revset-aliases."trunk()"' \
-                    'main | ancestors(main, 2)'
+              jjq run          # one item
+              jjq run --all    # drain the queue
 
-         o  The check command runs in a temporary workspace that has the
-            merged state of trunk + candidate. Any command that works in
-            a normal checkout works here.
+       Handle a failure:
 
-         o  Push is cheap. If you're unsure whether your revision will
-            conflict, just push it -- jjq checks for conflicts up front
-            and rejects the push if it would conflict.
+              jjq status                    # see what failed
+              jj rebase -r <rev> -d main    # rebase onto current trunk
+              ... resolve conflicts ...
+              jjq push <rev>                # re-queue
+              jjq run                       # retry
 
-         o  For parallel development with multiple agents or developers,
-            use jj workspaces. Each workspace gets its own isolated working
-            copy branched from trunk. Push from each workspace independently
-            and let jjq serialize the merges.
+       Clean up:
 
-  SEE ALSO
-         jj(1)
+              jjq clean
 
-  AUTHORS
-         Paul Smith
+ENVIRONMENT
+       jjq must be run from within a jj repository.  It invokes jj  as  a  sub‐
+       process and expects it to be on PATH.
 
-  JJQ                              2026-02-03                             JJQ(1)
+TIPS
+       Configure jj log to hide jjq metadata bookmarks:
+
+              jj config set --repo 'revset-aliases."trunk()"' \
+                  'main | ancestors(main, 2)'
+
+       The  check  command  runs  in  a temporary workspace that has the merged
+       state of trunk + candidate.  Any command that works in a normal checkout
+       works here.
+
+       Push is cheap.  If you're unsure whether your  revision  will  conflict,
+       just  push  it  — jjq checks for conflicts up front and rejects the push
+       immediately.
+
+       For parallel development with multiple  agents  or  developers,  use  jj
+       workspaces.   Each workspace gets its own isolated working copy branched
+       from trunk.  Push from each workspace independently and let jjq  serial‐
+       ize the merges.
+
+SEE ALSO
+       jj(1)
+
+AUTHORS
+       Paul Smith
+
+jjq                                2026-02-03                            JJQ(1)

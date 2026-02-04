@@ -1,7 +1,7 @@
 // ABOUTME: Command implementations for jjq CLI.
 // ABOUTME: Each function implements one jjq subcommand per the specification.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -50,6 +50,18 @@ fn prefout(msg: &str) {
 /// Output with jjq: prefix to stderr.
 fn preferr(msg: &str) {
     eprintln!("jjq: {}", msg);
+}
+
+/// Require jjq to be initialized, or error with instructions.
+fn require_initialized() -> Result<()> {
+    if !config::is_initialized()? {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            "jjq is not initialized. Run 'jjq init' first.",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Extract the numeric ID from a bookmark name like "jjq/queue/000042".
@@ -145,6 +157,135 @@ fn record_workspace_metadata(id: u32, workspace_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Initialize jjq in this repository.
+pub fn init(trunk: Option<&str>, check: Option<&str>) -> Result<()> {
+    use std::io::{self, IsTerminal};
+
+    // Refuse if already initialized
+    if config::is_initialized()? {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            "jjq is already initialized. Use 'jjq config' to change settings.",
+        )
+        .into());
+    }
+
+    println!("Initializing jjq in this repository.");
+    println!();
+
+    let is_tty = io::stdin().is_terminal();
+
+    // Determine trunk bookmark
+    let trunk_value = if let Some(t) = trunk {
+        t.to_string()
+    } else if !is_tty {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            "--trunk and --check are required in non-interactive mode.",
+        )
+        .into());
+    } else {
+        // Auto-detect default from existing bookmarks
+        let bookmarks = jj::list_bookmarks().unwrap_or_default();
+        let default = if bookmarks.iter().any(|b| b == "main") {
+            Some("main")
+        } else if bookmarks.iter().any(|b| b == "master") {
+            Some("master")
+        } else {
+            None
+        };
+
+        prompt_with_default("Trunk bookmark", default)?
+    };
+
+    // Determine check command
+    let check_value = if let Some(c) = check {
+        c.to_string()
+    } else if !is_tty {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            "--trunk and --check are required in non-interactive mode.",
+        )
+        .into());
+    } else {
+        prompt_required(
+            "Check command",
+            "A check command is required (e.g., 'make test', 'cargo test').",
+        )?
+    };
+
+    // Initialize metadata branch
+    config::initialize()?;
+
+    // Set config values
+    config::set("trunk_bookmark", &trunk_value)?;
+    config::set("check_command", &check_value)?;
+
+    println!();
+    println!("Initialized jjq:");
+    println!("  trunk_bookmark = {}", trunk_value);
+    println!("  check_command  = {}", check_value);
+    println!();
+
+    // Run doctor
+    println!("Running doctor...");
+    let _ = doctor();
+
+    println!();
+    println!("Ready to go! Queue revisions with 'jjq push <revset>'.");
+
+    Ok(())
+}
+
+/// Prompt for a value with an optional default. Loops until non-empty input.
+fn prompt_with_default(label: &str, default: Option<&str>) -> Result<String> {
+    use std::io::{self, BufRead, Write};
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    loop {
+        if let Some(d) = default {
+            print!("{} [{}]: ", label, d);
+        } else {
+            print!("{}: ", label);
+        }
+        io::stdout().flush()?;
+
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            if let Some(d) = default {
+                return Ok(d.to_string());
+            }
+            // No default, re-prompt
+            continue;
+        }
+        return Ok(trimmed.to_string());
+    }
+}
+
+/// Prompt for a required value (no default). Loops until non-empty input, showing hint on empty.
+fn prompt_required(label: &str, hint: &str) -> Result<String> {
+    use std::io::{self, BufRead, Write};
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    loop {
+        print!("{}: ", label);
+        io::stdout().flush()?;
+
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            println!("{}", hint);
+            continue;
+        }
+        return Ok(trimmed.to_string());
+    }
+}
+
 /// Push a revision onto the merge queue.
 pub fn push(revset: &str) -> Result<()> {
     // Resolve both change ID and commit ID
@@ -156,7 +297,11 @@ pub fn push(revset: &str) -> Result<()> {
 
     // Verify trunk bookmark exists
     if !jj::bookmark_exists(&trunk_bookmark)? {
-        return Err(ExitError::new(exit_codes::USAGE, format!("trunk bookmark '{}' not found", trunk_bookmark)).into());
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            format!("trunk bookmark '{}' not found", trunk_bookmark),
+        )
+        .into());
     }
 
     // Idempotent push: clean up existing queue/failed entries for this change
@@ -209,7 +354,7 @@ pub fn push(revset: &str) -> Result<()> {
         return Err(ExitError::new(exit_codes::CONFLICT, "revision conflicts with trunk").into());
     }
 
-    config::ensure_initialized()?;
+    require_initialized()?;
 
     let id = queue::next_id()?;
     let bookmark = queue::queue_bookmark(id);
@@ -226,6 +371,8 @@ pub fn push(revset: &str) -> Result<()> {
 
 /// Process queue items.
 pub fn run(all: bool, stop_on_failure: bool) -> Result<()> {
+    require_initialized()?;
+
     if all {
         run_all(stop_on_failure)
     } else {
@@ -258,7 +405,10 @@ fn run_all(stop_on_failure: bool) -> Result<()> {
             RunResult::Failure(_code, msg) => {
                 if stop_on_failure {
                     if merged_count > 0 {
-                        prefout(&format!("processed {} item(s) before failure", merged_count));
+                        prefout(&format!(
+                            "processed {} item(s) before failure",
+                            merged_count
+                        ));
                     }
                     return Err(ExitError::new(exit_codes::CONFLICT, msg).into());
                 }
@@ -269,11 +419,18 @@ fn run_all(stop_on_failure: bool) -> Result<()> {
 
     if merged_count > 0 || failed_count > 0 {
         if failed_count > 0 {
-            prefout(&format!("processed {} item(s), {} failed", merged_count, failed_count));
+            prefout(&format!(
+                "processed {} item(s), {} failed",
+                merged_count, failed_count
+            ));
             return Err(ExitError::new(
                 exit_codes::PARTIAL,
-                format!("processed {} item(s), {} failed", merged_count, failed_count),
-            ).into());
+                format!(
+                    "processed {} item(s), {} failed",
+                    merged_count, failed_count
+                ),
+            )
+            .into());
         }
         prefout(&format!("processed {} item(s)", merged_count));
     }
@@ -290,8 +447,6 @@ fn run_one() -> Result<RunResult> {
     };
 
     prefout(&format!("processing queue item {}", id));
-
-    config::ensure_initialized()?;
 
     // Acquire config lock to read settings
     let config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
@@ -314,7 +469,10 @@ fn run_one() -> Result<RunResult> {
         Some(lock) => lock,
         None => {
             preferr("queue runner lock already held");
-            return Ok(RunResult::Failure(exit_codes::CONFLICT, "run lock unavailable".to_string()));
+            return Ok(RunResult::Failure(
+                exit_codes::CONFLICT,
+                "run lock unavailable".to_string(),
+            ));
         }
     };
 
@@ -323,7 +481,8 @@ fn run_one() -> Result<RunResult> {
 
     // Capture candidate change ID before creating workspace
     let queue_bookmark = queue::queue_bookmark(id);
-    let (candidate_change_id, candidate_commit_id) = jj::resolve_revset_full(&format!("bookmarks(exact:{})", queue_bookmark))?;
+    let (candidate_change_id, candidate_commit_id) =
+        jj::resolve_revset_full(&format!("bookmarks(exact:{})", queue_bookmark))?;
 
     // Create workspace for merge
     let runner_workspace = TempDir::new()?;
@@ -353,7 +512,10 @@ fn run_one() -> Result<RunResult> {
             &workspace_rev,
             &format!(
                 "Failed: merge {} (conflicts)\n\njjq-candidate: {}\njjq-candidate-commit: {}\njjq-trunk: {}\njjq-workspace: {}\njjq-failure: conflicts",
-                id, candidate_change_id, candidate_commit_id, trunk_commit_id,
+                id,
+                candidate_change_id,
+                candidate_commit_id,
+                trunk_commit_id,
                 runner_workspace.path().display()
             ),
         )?;
@@ -366,18 +528,21 @@ fn run_one() -> Result<RunResult> {
         preferr(&format!("workspace: {}", ws_path.display()));
         preferr("");
         preferr("To resolve:");
-        preferr(&format!("  1. Rebase your revision onto {} and resolve conflicts", trunk_bookmark));
+        preferr(&format!(
+            "  1. Rebase your revision onto {} and resolve conflicts",
+            trunk_bookmark
+        ));
         preferr("  2. Run: jjq push <fixed-revset>");
-        return Ok(RunResult::Failure(exit_codes::CONFLICT, format!("merge {} has conflicts", id)));
+        return Ok(RunResult::Failure(
+            exit_codes::CONFLICT,
+            format!("merge {} has conflicts", id),
+        ));
     }
 
     jj::describe(&workspace_rev, &format!("WIP: attempting merge {}", id))?;
 
     // Run check command
-    let check_output = Command::new("sh")
-        .arg("-c")
-        .arg(&check_command)
-        .output()?;
+    let check_output = Command::new("sh").arg("-c").arg(&check_command).output()?;
 
     if !check_output.status.success() {
         eprintln!("{}", String::from_utf8_lossy(&check_output.stdout));
@@ -389,7 +554,10 @@ fn run_one() -> Result<RunResult> {
             &workspace_rev,
             &format!(
                 "Failed: merge {} (check)\n\njjq-candidate: {}\njjq-candidate-commit: {}\njjq-trunk: {}\njjq-workspace: {}\njjq-failure: check",
-                id, candidate_change_id, candidate_commit_id, trunk_commit_id,
+                id,
+                candidate_change_id,
+                candidate_commit_id,
+                trunk_commit_id,
                 runner_workspace.path().display()
             ),
         )?;
@@ -404,7 +572,10 @@ fn run_one() -> Result<RunResult> {
         preferr("To resolve:");
         preferr("  1. Fix the issue and create a new revision");
         preferr("  2. Run: jjq push <fixed-revset>");
-        return Ok(RunResult::Failure(exit_codes::CONFLICT, format!("merge {} check failed", id)));
+        return Ok(RunResult::Failure(
+            exit_codes::CONFLICT,
+            format!("merge {} check failed", id),
+        ));
     }
 
     // Verify trunk hasn't moved
@@ -416,7 +587,10 @@ fn run_one() -> Result<RunResult> {
         drop(run_lock);
 
         preferr("trunk bookmark moved during run; queue item left in place, re-run to retry");
-        return Ok(RunResult::Failure(exit_codes::CONFLICT, "trunk moved during run".to_string()));
+        return Ok(RunResult::Failure(
+            exit_codes::CONFLICT,
+            "trunk moved during run".to_string(),
+        ));
     }
 
     // Success path
@@ -440,8 +614,8 @@ fn run_one() -> Result<RunResult> {
 /// Run check command against a revision in a temporary workspace.
 pub fn check(revset: &str, verbose: bool) -> Result<()> {
     // Resolve the revision
-    let change_id = jj::resolve_revset(revset)
-        .map_err(|e| ExitError::new(exit_codes::USAGE, e.to_string()))?;
+    let change_id =
+        jj::resolve_revset(revset).map_err(|e| ExitError::new(exit_codes::USAGE, e.to_string()))?;
 
     // Read check command
     let check_command = match config::get_check_command()? {
@@ -455,7 +629,10 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
         }
     };
 
-    prefout(&format!("checking revision {} with: {}", change_id, check_command));
+    prefout(&format!(
+        "checking revision {} with: {}",
+        change_id, check_command
+    ));
 
     // Create temporary workspace
     let workspace_dir = TempDir::new()?;
@@ -482,10 +659,7 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
     }
 
     // Run check command
-    let check_output = Command::new("sh")
-        .arg("-c")
-        .arg(&check_command)
-        .output()?;
+    let check_output = Command::new("sh").arg("-c").arg(&check_command).output()?;
 
     let stdout = String::from_utf8_lossy(&check_output.stdout);
     let stderr = String::from_utf8_lossy(&check_output.stderr);
@@ -518,7 +692,12 @@ fn build_queue_item(id: u32) -> Result<QueueItem> {
     let (change_id, commit_id) = jj::resolve_revset_full(&revset)?;
     let description = jj::get_description(&revset)?;
     let description = description.lines().next().unwrap_or("").to_string();
-    Ok(QueueItem { id, change_id, commit_id, description })
+    Ok(QueueItem {
+        id,
+        change_id,
+        commit_id,
+        description,
+    })
 }
 
 /// Build a FailedItem by parsing trailers from the bookmark target description.
@@ -529,7 +708,10 @@ fn build_failed_item(id: u32) -> Result<FailedItem> {
     let trailers = extract_trailers(&desc);
 
     let candidate_change_id = trailers.get("candidate").cloned().unwrap_or_default();
-    let candidate_commit_id = trailers.get("candidate-commit").cloned().unwrap_or_default();
+    let candidate_commit_id = trailers
+        .get("candidate-commit")
+        .cloned()
+        .unwrap_or_default();
     let trunk_commit_id = trailers.get("trunk").cloned().unwrap_or_default();
     let workspace_path = trailers.get("workspace").cloned().unwrap_or_default();
     let failure_reason = trailers.get("failure").cloned().unwrap_or_default();
@@ -570,7 +752,7 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
             };
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
-            prefout("jjq not initialized (run 'jjq push <revset>' to start)");
+            prefout("jjq not initialized. Run 'jjq init' first.");
         }
         return Ok(());
     }
@@ -626,7 +808,10 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
             }
             prefout("Failed (recent):");
             for item in &failed_items {
-                println!("  {}: {} {}", item.id, item.candidate_change_id, item.description);
+                println!(
+                    "  {}: {} {}",
+                    item.id, item.candidate_change_id, item.description
+                );
             }
         }
     }
@@ -666,7 +851,10 @@ fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<
             println!("{}", serde_json::to_string_pretty(&item)?);
         } else {
             println!("Failed item {}", item.id);
-            println!("  Candidate:   {} ({})", item.candidate_change_id, item.candidate_commit_id);
+            println!(
+                "  Candidate:   {} ({})",
+                item.candidate_change_id, item.candidate_commit_id
+            );
             println!("  Description: {}", item.description);
             println!("  Failure:     {}", item.failure_reason);
             println!("  Trunk:       {}", item.trunk_commit_id);
@@ -716,7 +904,7 @@ fn find_by_change_id(change_id: &str) -> Result<(u32, bool)> {
 pub fn delete(id_str: &str) -> Result<()> {
     let id = queue::parse_seq_id(id_str)?;
 
-    config::ensure_initialized()?;
+    require_initialized()?;
 
     // Check queue first
     if queue::queue_item_exists(id)? {
@@ -759,7 +947,7 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
     match (key, value) {
         (None, None) => {
             // Show all config
-            config::ensure_initialized()?;
+            require_initialized()?;
             let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
             let trunk = config::get_trunk_bookmark()?;
             let check = config::get_check_command()?;
@@ -833,8 +1021,8 @@ pub fn doctor() -> Result<()> {
     if initialized {
         print_check("ok", "jjq initialized");
     } else {
-        print_check("WARN", "jjq not initialized (run 'jjq push' to initialize)");
-        warns += 1;
+        print_check("FAIL", "jjq not initialized (run 'jjq init')");
+        fails += 1;
     }
 
     // 3. trunk bookmark exists
@@ -842,7 +1030,10 @@ pub fn doctor() -> Result<()> {
     if jj::bookmark_exists(&trunk_bookmark)? {
         print_check("ok", &format!("trunk bookmark '{}' exists", trunk_bookmark));
     } else {
-        print_check("FAIL", &format!("trunk bookmark '{}' does not exist", trunk_bookmark));
+        print_check(
+            "FAIL",
+            &format!("trunk bookmark '{}' does not exist", trunk_bookmark),
+        );
         fails += 1;
     }
 
@@ -863,19 +1054,8 @@ pub fn doctor() -> Result<()> {
     // 5. run lock
     match lock::lock_state("run")? {
         lock::LockState::Free => print_check("ok", "run lock is free"),
-        lock::LockState::HeldAlive(pid) => {
-            print_check("WARN", &format!("run lock held by live process (pid {})", pid));
-            warns += 1;
-        }
-        lock::LockState::HeldDead(pid) => {
-            print_check("FAIL", &format!("run lock held by dead process (pid {})", pid));
-            print_hint(&format!("to fix: rm -rf {}", lock::lock_path("run")?.display()));
-            fails += 1;
-        }
-        lock::LockState::HeldUnknown => {
-            print_check("WARN", "run lock held (unknown process)");
-            let path = lock::lock_path("run")?;
-            print_hint(&format!("if stale: rm -rf {}", path.display()));
+        lock::LockState::Held => {
+            print_check("WARN", "run lock held by another process");
             warns += 1;
         }
     }
@@ -883,19 +1063,8 @@ pub fn doctor() -> Result<()> {
     // 6. id lock
     match lock::lock_state("id")? {
         lock::LockState::Free => print_check("ok", "id lock is free"),
-        lock::LockState::HeldAlive(pid) => {
-            print_check("WARN", &format!("id lock held by live process (pid {})", pid));
-            warns += 1;
-        }
-        lock::LockState::HeldDead(pid) => {
-            print_check("FAIL", &format!("id lock held by dead process (pid {})", pid));
-            print_hint(&format!("to fix: rm -rf {}", lock::lock_path("id")?.display()));
-            fails += 1;
-        }
-        lock::LockState::HeldUnknown => {
-            print_check("WARN", "id lock held (unknown process)");
-            let path = lock::lock_path("id")?;
-            print_hint(&format!("if stale: rm -rf {}", path.display()));
+        lock::LockState::Held => {
+            print_check("WARN", "id lock held by another process");
             warns += 1;
         }
     }

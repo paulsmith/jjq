@@ -52,6 +52,34 @@ stores all state inside the jj repository using bookmarks and an
 isolated metadata branch.
 No external database or service is required.
 .SH COMMANDS
+.SS init \fR[\fB\-\-trunk \fIbookmark\fR] [\fB\-\-check \fIcommand\fR]
+Initialize jjq in the current repository.
+Sets up the metadata branch and configures the trunk bookmark and check
+command.
+.PP
+With
+.B \-\-trunk
+and
+.B \-\-check
+flags, runs non\-interactively.
+Without flags, prompts for each value.
+The trunk bookmark defaults to
+.B main
+if that bookmark exists, or
+.B master
+as a fallback.
+.PP
+If stdin is not a terminal and required flags are missing, exits with
+an error.
+.PP
+Refuses to run if jjq is already initialized.
+Use
+.B jjq config
+to change settings after initialization.
+.PP
+After configuration, runs
+.B jjq doctor
+to validate the setup.
 .SS push \fIrevset\fR
 Queue a revision for merging to trunk.
 The revset must resolve to exactly one revision.
@@ -206,10 +234,10 @@ Shell command to run in the merge workspace to validate a candidate.
 Should run tests, lints, type checks, or whatever gates your trunk.
 Exit 0 means pass; non\-zero means fail.
 .IP
-Must be configured before running
-.B jjq push
-or
-.BR "jjq run" .
+Set during
+.B jjq init
+or configured afterward with
+.BR "jjq config" .
 .TP
 .BR max_failures " (default: 3)"
 Number of recent failures shown by
@@ -249,11 +277,11 @@ before using
 The default check command rejects everything.
 .SH LOCKING
 .B jjq
-uses filesystem\-based locks (atomic
-.BR mkdir (2))
-in
+uses flock\-based file locks in
 .I .jj/jjq\-locks/
-to coordinate concurrent access:
+to coordinate concurrent access.
+Locks are released automatically by the OS when the holding process
+exits, so stale locks cannot occur.
 .TP
 .B id
 Protects sequence ID allocation (brief, during push).
@@ -265,10 +293,6 @@ Protects configuration reads and writes.
 Ensures only one
 .B jjq run
 processes the queue at a time.
-.PP
-If a lock is stale (e.g., from a crashed process), delete the
-corresponding directory under
-.IR .jj/jjq\-locks/ .
 .SH DATA MODEL
 Queue items are jj bookmarks named
 .BI jjq/queue/ NNNNNN
@@ -290,8 +314,7 @@ Initialize a project:
 .PP
 .RS
 .nf
-jjq config trunk_bookmark main
-jjq config check_command "make test && make lint"
+jjq init \-\-trunk main \-\-check "make test && make lint"
 .fi
 .RE
 .PP

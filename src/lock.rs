@@ -71,11 +71,6 @@ pub fn is_held(name: &str) -> Result<bool> {
     Ok(matches!(lock_state(name)?, LockState::Held))
 }
 
-/// Get the filesystem path for a named lock (for diagnostic messages).
-pub fn lock_path(name: &str) -> Result<PathBuf> {
-    lock_file_path(name)
-}
-
 /// Get the lock file path for a named lock.
 fn lock_file_path(name: &str) -> Result<PathBuf> {
     let root = jj::repo_root()?;

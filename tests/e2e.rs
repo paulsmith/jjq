@@ -224,11 +224,7 @@ func main() {
 
     /// Run jjq and return normalized output for snapshots.
     fn jjq_output(&self, args: &[&str]) -> String {
-        let output = self
-            .jjq()
-            .args(args)
-            .output()
-            .expect("failed to run jjq");
+        let output = self.jjq().args(args).output().expect("failed to run jjq");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -311,6 +307,16 @@ func main() {
         let combined = format!("{}{}", stdout, stderr);
         normalize_output(&combined, &self.path)
     }
+
+    /// Initialize jjq with default settings (check command = "true").
+    fn init_jjq(&self) {
+        self.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
+    }
+
+    /// Initialize jjq with a specific check command.
+    fn init_jjq_with_check(&self, check_cmd: &str) {
+        self.jjq_success(&["init", "--trunk", "main", "--check", check_cmd]);
+    }
 }
 
 /// Run a jj command in the given directory.
@@ -350,15 +356,13 @@ fn normalize_output(output: &str, repo_path: &Path) -> String {
     result = result.replace(&*repo_str, "<REPO>");
 
     // Replace temp directory paths (various formats)
-    let re_temp = regex::Regex::new(r"/var/folders/[^\s]+|/tmp/[^\s]+|/private/var/folders/[^\s]+")
-        .unwrap();
+    let re_temp =
+        regex::Regex::new(r"/var/folders/[^\s]+|/tmp/[^\s]+|/private/var/folders/[^\s]+").unwrap();
     result = re_temp.replace_all(&result, "<TEMP_PATH>").to_string();
 
     // Replace change IDs (12 lowercase letters)
     let re_change_id = regex::Regex::new(r"\b[a-z]{12}\b").unwrap();
-    result = re_change_id
-        .replace_all(&result, "<CHANGE_ID>")
-        .to_string();
+    result = re_change_id.replace_all(&result, "<CHANGE_ID>").to_string();
 
     // Replace short change IDs in "now at <id>" pattern
     let re_now_at = regex::Regex::new(r"\(now at [a-z]+\)").unwrap();
@@ -389,16 +393,16 @@ fn normalize_output(output: &str, repo_path: &Path) -> String {
 fn test_status_uninitialized() {
     let repo = TestRepo::new();
     let output = repo.jjq_success(&["status"]);
-    insta::assert_snapshot!(output, @"jjq: jjq not initialized (run 'jjq push <revset>' to start)");
+    insta::assert_snapshot!(output, @"jjq: jjq not initialized. Run 'jjq init' first.");
 }
 
 #[test]
 fn test_push_no_trunk() {
     let repo = TestRepo::new();
-    // Create a commit but no main bookmark
     fs::write(repo.path().join("file.txt"), "content").unwrap();
     run_jj(repo.path(), &["desc", "-m", "test commit"]);
-
+    // Init with default trunk "main" which doesn't exist in this bare repo
+    repo.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
     let output = repo.jjq_failure(&["push", "@"]);
     insta::assert_snapshot!(output, @"jjq: trunk bookmark 'main' not found");
 }
@@ -406,12 +410,11 @@ fn test_push_no_trunk() {
 #[test]
 fn test_config_show_all() {
     let repo = TestRepo::with_go_project();
-    // Push something to initialize jjq
-    repo.jjq_success(&["push", "main"]);
+    repo.init_jjq();
     let output = repo.jjq_success(&["config"]);
     insta::assert_snapshot!(output, @r"
     trunk_bookmark = main
-    check_command = (not set)
+    check_command = true
     max_failures = 3
     ");
 }
@@ -419,7 +422,7 @@ fn test_config_show_all() {
 #[test]
 fn test_config_set_and_get() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["push", "main"]);
+    repo.init_jjq();
 
     let set_output = repo.jjq_success(&["config", "check_command", "make test"]);
     insta::assert_snapshot!(set_output, @"jjq: check_command = make test");
@@ -431,7 +434,7 @@ fn test_config_set_and_get() {
 #[test]
 fn test_config_invalid_key() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["push", "main"]);
+    repo.init_jjq();
 
     let output = repo.jjq_failure(&["config", "invalid_key"]);
     insta::assert_snapshot!(output, @r"
@@ -443,6 +446,7 @@ fn test_config_invalid_key() {
 #[test]
 fn test_push_and_status() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     // Create a branch to push
     run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
@@ -462,6 +466,7 @@ fn test_push_and_status() {
 #[test]
 fn test_push_conflict_detection() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     // Create a branch that modifies main.go one way
     run_jj(repo.path(), &["new", "-m", "trunk advance", "main"]);
@@ -507,35 +512,23 @@ func main() {
 #[test]
 fn test_run_empty_queue() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.init_jjq();
 
     let output = repo.jjq_success(&["run"]);
     insta::assert_snapshot!(output, @"jjq: queue is empty");
 }
 
 #[test]
-fn test_run_no_check_command() {
+fn test_run_without_init() {
     let repo = TestRepo::with_go_project();
-
-    // Push something first
-    run_jj(repo.path(), &["new", "-m", "test", "main"]);
-    fs::write(repo.path().join("test.txt"), "test").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "test-branch"]);
-    repo.jjq_success(&["push", "test-branch"]);
-
-    // Run without check_command configured
     let output = repo.jjq_failure(&["run"]);
-    insta::assert_snapshot!(output, @r"
-    jjq: processing queue item 1
-    jjq: check_command not configured (use 'jjq config check_command <cmd>')
-    jjq: check_command not configured
-    ");
+    insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
 }
 
 #[test]
 fn test_run_success() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.init_jjq();
 
     // Create and push a simple branch
     run_jj(repo.path(), &["new", "-m", "add file", "main"]);
@@ -553,7 +546,7 @@ fn test_run_success() {
 #[test]
 fn test_run_check_failure() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "false"]);
+    repo.init_jjq_with_check("false");
 
     // Create and push a branch
     run_jj(repo.path(), &["new", "-m", "will fail check", "main"]);
@@ -585,7 +578,7 @@ fn test_run_check_failure() {
 #[test]
 fn test_run_all() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.init_jjq();
 
     // Create multiple branches
     run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
@@ -632,6 +625,7 @@ fn test_run_all() {
 #[test]
 fn test_delete_queued() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     run_jj(repo.path(), &["new", "-m", "to delete", "main"]);
     fs::write(repo.path().join("delete.txt"), "delete me").unwrap();
@@ -654,7 +648,7 @@ fn test_delete_queued() {
 #[test]
 fn test_delete_failed() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "false"]);
+    repo.init_jjq_with_check("false");
 
     run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
     fs::write(repo.path().join("fail.txt"), "fail").unwrap();
@@ -683,8 +677,7 @@ fn test_delete_failed() {
 #[test]
 fn test_delete_not_found() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["push", "main"]); // Initialize jjq
-    repo.jjq_success(&["delete", "1"]); // Delete the item we just pushed
+    repo.init_jjq();
 
     let output = repo.jjq_failure(&["delete", "999"]);
     insta::assert_snapshot!(output, @"jjq: item 999 not found in queue or failed");
@@ -693,7 +686,8 @@ fn test_delete_not_found() {
 #[test]
 fn test_sequence_id_validation() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["push", "main"]); // Initialize
+    repo.init_jjq();
+    repo.jjq_success(&["push", "main"]); // Need an item to delete
 
     // Test invalid IDs
     let empty = repo.jjq_failure(&["delete", ""]);
@@ -727,7 +721,7 @@ fn test_sequence_id_validation() {
 #[test]
 fn test_full_workflow_with_prs() {
     let repo = TestRepo::with_prs();
-    repo.jjq_success(&["config", "check_command", "make"]);
+    repo.init_jjq_with_check("make");
 
     // Push all PRs
     let push1 = repo.jjq_success(&["push", "pr1"]);
@@ -786,6 +780,7 @@ fn test_full_workflow_with_prs() {
 #[test]
 fn test_multiple_push_same_revision() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     // Push main once - should succeed
     let push1 = repo.jjq_success(&["push", "main"]);
@@ -793,12 +788,17 @@ fn test_multiple_push_same_revision() {
 
     // Push same commit ID again - should be rejected as duplicate
     let push2 = repo.jjq_output(&["push", "main"]);
-    assert!(push2.contains("already queued at 1"), "should reject duplicate: {}", push2);
+    assert!(
+        push2.contains("already queued at 1"),
+        "should reject duplicate: {}",
+        push2
+    );
 }
 
 #[test]
 fn test_log_hint_not_shown_in_non_tty() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     // Push should succeed without showing hint (non-TTY mode)
     let output = repo.jjq_success(&["push", "main"]);
@@ -823,6 +823,7 @@ fn test_log_hint_not_shown_in_non_tty() {
 #[test]
 fn test_log_hint_shown_once_when_forced() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     // First push with forced hint - should show hint
     let output1 = repo.jjq_with_env(&["push", "main"], &[("JJQTEST_FORCE_HINT", "1")]);
@@ -852,7 +853,7 @@ fn test_log_hint_shown_once_when_forced() {
 #[test]
 fn test_run_all_stop_on_failure_flag() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.init_jjq();
 
     // f1: modifies main.go (will merge cleanly against trunk)
     run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
@@ -883,14 +884,34 @@ fn test_run_all_stop_on_failure_flag() {
 
     // run --all should process f1, fail on f2 (conflict), and STOP (not process f3)
     let output = repo.jjq_output(&["run", "--all", "--stop-on-failure"]);
-    assert!(output.contains("merged 1 to main"), "f1 should merge: {}", output);
-    assert!(output.contains("merge 2 has conflicts"), "f2 should conflict: {}", output);
-    assert!(!output.contains("merged 3 to main"), "f3 should NOT be processed: {}", output);
-    assert!(output.contains("processed 1 item(s) before failure"), "summary should show 1 processed before failure: {}", output);
+    assert!(
+        output.contains("merged 1 to main"),
+        "f1 should merge: {}",
+        output
+    );
+    assert!(
+        output.contains("merge 2 has conflicts"),
+        "f2 should conflict: {}",
+        output
+    );
+    assert!(
+        !output.contains("merged 3 to main"),
+        "f3 should NOT be processed: {}",
+        output
+    );
+    assert!(
+        output.contains("processed 1 item(s) before failure"),
+        "summary should show 1 processed before failure: {}",
+        output
+    );
 
     // f3 should still be in the queue
     let status = repo.jjq_success(&["status"]);
-    assert!(status.contains("feature 3"), "f3 should still be queued: {}", status);
+    assert!(
+        status.contains("feature 3"),
+        "f3 should still be queued: {}",
+        status
+    );
 }
 
 #[test]
@@ -927,10 +948,26 @@ fn test_run_all_continues_on_failure() {
 
     // run --all should process f1, fail on f2 (conflict), CONTINUE, and process f3
     let output = repo.jjq_output(&["run", "--all"]);
-    assert!(output.contains("merged 1 to main"), "f1 should merge: {}", output);
-    assert!(output.contains("merge 2 has conflicts"), "f2 should conflict: {}", output);
-    assert!(output.contains("merged 3 to main"), "f3 SHOULD be processed: {}", output);
-    assert!(output.contains("processed 2 item(s), 1 failed"), "summary should show mixed results: {}", output);
+    assert!(
+        output.contains("merged 1 to main"),
+        "f1 should merge: {}",
+        output
+    );
+    assert!(
+        output.contains("merge 2 has conflicts"),
+        "f2 should conflict: {}",
+        output
+    );
+    assert!(
+        output.contains("merged 3 to main"),
+        "f3 SHOULD be processed: {}",
+        output
+    );
+    assert!(
+        output.contains("processed 2 item(s), 1 failed"),
+        "summary should show mixed results: {}",
+        output
+    );
 }
 
 #[test]
@@ -966,10 +1003,7 @@ fn test_run_all_partial_failure_exit_code() {
     repo.jjq_success(&["push", "f3"]);
 
     // Exit code should be 2 (PARTIAL) — some succeeded, some failed
-    repo.jjq()
-        .args(["run", "--all"])
-        .assert()
-        .code(2);
+    repo.jjq().args(["run", "--all"]).assert().code(2);
 }
 
 #[test]
@@ -977,7 +1011,10 @@ fn test_log_hint_skipped_when_filter_configured() {
     let repo = TestRepo::with_go_project();
 
     // Configure the log filter first
-    run_jj(repo.path(), &["config", "set", "--repo", "revsets.log", "~ ::jjq/_/_"]);
+    run_jj(
+        repo.path(),
+        &["config", "set", "--repo", "revsets.log", "~ ::jjq/_/_"],
+    );
 
     // Push with forced hint - should skip because filter already configured
     let output = repo.jjq_with_env(&["push", "main"], &[("JJQTEST_FORCE_HINT", "1")]);
@@ -996,12 +1033,17 @@ fn test_log_hint_skipped_when_filter_configured() {
 #[test]
 fn test_push_exact_duplicate_rejected() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     repo.jjq_success(&["push", "main"]);
 
     // Same commit ID should be rejected
     let output = repo.jjq_output(&["push", "main"]);
-    assert!(output.contains("already queued"), "should reject exact duplicate: {}", output);
+    assert!(
+        output.contains("already queued"),
+        "should reject exact duplicate: {}",
+        output
+    );
 }
 
 #[test]
@@ -1020,7 +1062,11 @@ fn test_push_idempotent_clears_failed() {
 
     // Verify failed item exists
     let status = repo.jjq_success(&["status"]);
-    assert!(status.contains("Failed"), "should have failed item: {}", status);
+    assert!(
+        status.contains("Failed"),
+        "should have failed item: {}",
+        status
+    );
 
     // Amend the revision (changes commit ID, keeps change ID)
     run_jj(repo.path(), &["edit", "fb"]);
@@ -1028,7 +1074,11 @@ fn test_push_idempotent_clears_failed() {
 
     // Re-push should clear the failed entry
     let repush = repo.jjq_success(&["push", "fb"]);
-    assert!(repush.contains("clearing failed entry"), "should clear failed entry: {}", repush);
+    assert!(
+        repush.contains("clearing failed entry"),
+        "should clear failed entry: {}",
+        repush
+    );
 }
 
 #[test]
@@ -1053,17 +1103,24 @@ fn test_clean_removes_failed_workspaces() {
 
     // Clean should find and remove the workspace
     let output = repo.jjq_success(&["clean"]);
-    assert!(output.contains("removed 1 workspace"), "should remove workspace: {}", output);
+    assert!(
+        output.contains("removed 1 workspace"),
+        "should remove workspace: {}",
+        output
+    );
 }
 
 #[test]
 fn test_status_json_empty() {
     let repo = TestRepo::new();
     let (stdout, _stderr, success) = repo.jjq_raw_output(&["status", "--json"]);
-    assert!(success, "status --json should succeed on uninitialized repo");
+    assert!(
+        success,
+        "status --json should succeed on uninitialized repo"
+    );
 
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("status --json should return valid JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("status --json should return valid JSON");
     assert_eq!(parsed["running"], false);
     assert_eq!(parsed["queue"], serde_json::json!([]));
     assert_eq!(parsed["failed"], serde_json::json!([]));
@@ -1090,32 +1147,52 @@ fn test_status_json_with_items() {
     let (stdout, _stderr, success) = repo.jjq_raw_output(&["status", "--json"]);
     assert!(success, "status --json should succeed");
 
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("status --json should return valid JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("status --json should return valid JSON");
 
     // Verify queue structure
-    let queue = parsed["queue"].as_array().expect("queue should be an array");
+    let queue = parsed["queue"]
+        .as_array()
+        .expect("queue should be an array");
     assert_eq!(queue.len(), 1, "should have 1 queued item");
     let q_item = &queue[0];
     assert!(q_item["id"].is_u64(), "queue item should have numeric id");
-    assert!(q_item["change_id"].is_string(), "queue item should have change_id");
-    assert!(q_item["commit_id"].is_string(), "queue item should have commit_id");
-    assert!(q_item["description"].is_string(), "queue item should have description");
+    assert!(
+        q_item["change_id"].is_string(),
+        "queue item should have change_id"
+    );
+    assert!(
+        q_item["commit_id"].is_string(),
+        "queue item should have commit_id"
+    );
+    assert!(
+        q_item["description"].is_string(),
+        "queue item should have description"
+    );
     assert_eq!(q_item["description"], "queued feature");
 
     // Verify failed structure
-    let failed = parsed["failed"].as_array().expect("failed should be an array");
+    let failed = parsed["failed"]
+        .as_array()
+        .expect("failed should be an array");
     assert_eq!(failed.len(), 1, "should have 1 failed item");
     let f_item = &failed[0];
     assert!(f_item["id"].is_u64(), "failed item should have numeric id");
-    assert!(f_item["candidate_change_id"].is_string(), "failed item should have candidate_change_id");
-    assert!(f_item["failure_reason"].is_string(), "failed item should have failure_reason");
+    assert!(
+        f_item["candidate_change_id"].is_string(),
+        "failed item should have candidate_change_id"
+    );
+    assert!(
+        f_item["failure_reason"].is_string(),
+        "failed item should have failure_reason"
+    );
     assert_eq!(f_item["failure_reason"], "check");
 }
 
 #[test]
 fn test_status_single_queued() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     run_jj(repo.path(), &["new", "-m", "my queued feature", "main"]);
     fs::write(repo.path().join("feature.txt"), "content").unwrap();
@@ -1123,10 +1200,26 @@ fn test_status_single_queued() {
     repo.jjq_success(&["push", "feature-branch"]);
 
     let output = repo.jjq_success(&["status", "1"]);
-    assert!(output.contains("Queue item 1"), "should show Queue item header: {}", output);
-    assert!(output.contains("Change ID:"), "should show Change ID: {}", output);
-    assert!(output.contains("Commit ID:"), "should show Commit ID: {}", output);
-    assert!(output.contains("Description: my queued feature"), "should show description: {}", output);
+    assert!(
+        output.contains("Queue item 1"),
+        "should show Queue item header: {}",
+        output
+    );
+    assert!(
+        output.contains("Change ID:"),
+        "should show Change ID: {}",
+        output
+    );
+    assert!(
+        output.contains("Commit ID:"),
+        "should show Commit ID: {}",
+        output
+    );
+    assert!(
+        output.contains("Description: my queued feature"),
+        "should show description: {}",
+        output
+    );
 }
 
 #[test]
@@ -1141,18 +1234,43 @@ fn test_status_single_failed() {
     repo.jjq_failure(&["run"]);
 
     let output = repo.jjq_success(&["status", "1"]);
-    assert!(output.contains("Failed item 1"), "should show Failed item header: {}", output);
-    assert!(output.contains("Candidate:"), "should show Candidate: {}", output);
-    assert!(output.contains("Description: will fail check"), "should show description: {}", output);
-    assert!(output.contains("Failure:"), "should show Failure: {}", output);
+    assert!(
+        output.contains("Failed item 1"),
+        "should show Failed item header: {}",
+        output
+    );
+    assert!(
+        output.contains("Candidate:"),
+        "should show Candidate: {}",
+        output
+    );
+    assert!(
+        output.contains("Description: will fail check"),
+        "should show description: {}",
+        output
+    );
+    assert!(
+        output.contains("Failure:"),
+        "should show Failure: {}",
+        output
+    );
     assert!(output.contains("Trunk:"), "should show Trunk: {}", output);
-    assert!(output.contains("Workspace:"), "should show Workspace: {}", output);
-    assert!(output.contains("To resolve:"), "should show resolution hints: {}", output);
+    assert!(
+        output.contains("Workspace:"),
+        "should show Workspace: {}",
+        output
+    );
+    assert!(
+        output.contains("To resolve:"),
+        "should show resolution hints: {}",
+        output
+    );
 }
 
 #[test]
 fn test_status_single_json() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     run_jj(repo.path(), &["new", "-m", "json feature", "main"]);
     fs::write(repo.path().join("feature.txt"), "content").unwrap();
@@ -1162,8 +1280,8 @@ fn test_status_single_json() {
     let (stdout, _stderr, success) = repo.jjq_raw_output(&["status", "1", "--json"]);
     assert!(success, "status 1 --json should succeed");
 
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("status 1 --json should return valid JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("status 1 --json should return valid JSON");
     assert_eq!(parsed["id"], 1);
     assert!(parsed["change_id"].is_string(), "should have change_id");
     assert_eq!(parsed["description"], "json feature");
@@ -1172,9 +1290,78 @@ fn test_status_single_json() {
 #[test]
 fn test_status_not_found() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["push", "main"]); // Initialize jjq
-    repo.jjq_success(&["delete", "1"]); // Clear
+    repo.init_jjq();
 
     let output = repo.jjq_failure(&["status", "999"]);
-    assert!(output.contains("item 999 not found"), "should report not found: {}", output);
+    assert!(
+        output.contains("item 999 not found"),
+        "should report not found: {}",
+        output
+    );
+}
+
+#[test]
+fn test_init_with_flags() {
+    let repo = TestRepo::with_go_project();
+    let output = repo.jjq_success(&["init", "--trunk", "main", "--check", "make test"]);
+    assert!(
+        output.contains("Initialized jjq"),
+        "should show init confirmation: {}",
+        output
+    );
+    assert!(
+        output.contains("trunk_bookmark = main"),
+        "should show trunk: {}",
+        output
+    );
+    assert!(
+        output.contains("check_command  = make test"),
+        "should show check cmd: {}",
+        output
+    );
+    assert!(
+        output.contains("Ready to go!"),
+        "should show ready message: {}",
+        output
+    );
+}
+
+#[test]
+fn test_init_already_initialized() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
+
+    let output = repo.jjq_failure(&["init", "--trunk", "main", "--check", "true"]);
+    insta::assert_snapshot!(output, @"jjq: jjq is already initialized. Use 'jjq config' to change settings.");
+}
+
+#[test]
+fn test_init_runs_doctor() {
+    let repo = TestRepo::with_go_project();
+    let output = repo.jjq_success(&["init", "--trunk", "main", "--check", "make test"]);
+    // Doctor output should be present
+    assert!(
+        output.contains("jj repository"),
+        "should run doctor: {}",
+        output
+    );
+    assert!(
+        output.contains("ok"),
+        "doctor checks should pass: {}",
+        output
+    );
+}
+
+#[test]
+fn test_push_without_init_fails() {
+    let repo = TestRepo::with_go_project();
+    let output = repo.jjq_failure(&["push", "main"]);
+    insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
+}
+
+#[test]
+fn test_config_without_init_fails() {
+    let repo = TestRepo::with_go_project();
+    let output = repo.jjq_failure(&["config"]);
+    insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
 }

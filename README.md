@@ -25,6 +25,20 @@ cp jjq ~/.local/bin/
 
 ## Usage
 
+### Initialize
+
+Set up jjq in your repository:
+
+```sh
+jjq init
+```
+
+Or non-interactively:
+
+```sh
+jjq init --trunk main --check "make test"
+```
+
 ### Push a revision to the queue
 
 Any revset will do so long as it resolves to a single revision.
@@ -65,6 +79,8 @@ jjq status --resolve <change_id>    # look up item by candidate change ID
 ```
 
 ### Configure
+
+After initialization, change settings with:
 
 ```sh
 jjq config                           # show all config
@@ -133,7 +149,7 @@ log = "~ ::jjq/_/_"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `trunk_bookmark` | `main` | Bookmark pointing to your trunk |
-| `check_command` | *(none — must be set before first run)* | Command to run on merge candidates |
+| `check_command` | *(set during init)* | Command to run on merge candidates |
 | `max_failures` | `3` | Number of recent failures to show in status |
 
 ## Copying

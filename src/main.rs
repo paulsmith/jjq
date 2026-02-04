@@ -20,6 +20,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize jjq in this repository
+    Init {
+        /// Trunk bookmark name
+        #[arg(long)]
+        trunk: Option<String>,
+        /// Check command
+        #[arg(long)]
+        check: Option<String>,
+    },
     /// Queue a revision for merging to trunk
     Push {
         /// Revset expression resolving to exactly one revision
@@ -90,6 +99,7 @@ fn run() -> Result<()> {
     jj::verify_repo()?;
 
     match cli.command {
+        Commands::Init { trunk, check } => commands::init(trunk.as_deref(), check.as_deref()),
         Commands::Push { revset } => commands::push(&revset),
         Commands::Run { all, stop_on_failure } => commands::run(all, stop_on_failure),
         Commands::Check { rev, verbose } => commands::check(&rev, verbose),
