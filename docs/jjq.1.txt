@@ -95,7 +95,7 @@ COMMANDS
 
    status [id] [--json] [--resolve change_id]
        Display the current queue state: queued items (ascending by sequence ID)
-       and recent failures (descending, up to max_failures).  Each entry  shows
+       and recent failures (descending by sequence ID).  Each entry shows
        its sequence ID, change ID prefix, and first line of the commit descrip‐
        tion.
 
@@ -148,9 +148,6 @@ COMMANDS
               your trunk.  Exit 0 means pass; non-zero means fail.
 
               Set during jjq init or configured afterward with jjq config.
-
-       max_failures (default: 3)
-              Number of recent failures shown by status.
 
 EXIT CODES
        0      Success.

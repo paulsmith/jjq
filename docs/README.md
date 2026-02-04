@@ -2,10 +2,10 @@
 
 jjq is a merge queue tool for jj (Jujutsu), the Git-compatible VCS. jjq is
 lightweight, in that it can be used on a jj repo with little ceremony or
-distruption and coexist with other processes. jjq is a jj-native merge queue
+disruption and coexist with other processes. jjq is a jj-native merge queue
 tool, in that it uses jj features such as bookmarks and workspaces to operate
-the merge queue. jjq uses the jj repo as a data store for its queue items, work
-logs, and other metadata, while isolating its data from the user's.
+the merge queue. jjq uses the jj repo as a data store for its queue items and
+metadata, while isolating its data from the user's history.
 
 jjq is a CLI. Users issue jjq commands like `push`, `run`, and `status` to
 operate the merge queue and get information about it.
@@ -99,24 +99,13 @@ An empty queue is a normal condition and is a no-op for a jjq run.
 Because jjq is meant to support multiple changes on a single jj repo, it must
 ensure that certain operations are safe from concurrent access.
 
-The sequence ID store must be protected by a OS-portable lock.
+The sequence ID store is protected by an OS file lock (`flock(2)`) on
+`.jj/jjq-locks/id.lock`.
 
-Running the queue must also take a lock - only one merge can be attempted at a
-time. Therefore the jjq run command is a singleton.
+Running the queue also takes a lock — only one merge can be attempted at a
+time. The `run` lock uses `.jj/jjq-locks/run.lock`.
 
-It is normal for multiple users to simultaneously enqueue merge candidates, but
-only one user may run the jjq merge queue.
-
-The namespaced jj bookmark `jjq/lock/run` is used as a global lock that a OS
-runner process (the `run` command in jjq CLI) must take. The queue runner
-process will attempt to create this bookmark as means of taking the lock. If it
-succeeds, meaning the bookmark did not already exist, it succeeds and can
-proceed with the merge attempt. If it fails to create the bookmark, that means
-it already exists, and an existing runner process holds the lock (possibly
-already exited and failed to release the lock by deleting the bookmark).
-
-Similarly, the bookmark `jjq/lock/id` is used to protect concurrent access to
-the sequence ID store.
+Configuration reads/writes are serialized via `.jj/jjq-locks/config.lock`.
 
 ### Merge-to-be
 
@@ -190,56 +179,45 @@ bookmark that points to the head of the isolated branch.
 
 ### Failed merge attempts
 
-When a merge attempt from a queue run fails, either due to a conflict when
-creating the merge-to-be, or a failed check, that queue item is marked as
-"failed".
+When a merge attempt fails (conflict or check failure), that queue item is
+marked as "failed" with a bookmark `jjq/failed/NNNNNN` pointing at the
+conflicted or failed merge commit. The runner workspace directory is preserved
+for debugging.
 
-The user must then take action to resolve the failure: fix the revision (rebase
-onto trunk, resolve conflicts), then push it again. Push is idempotent —
-re-pushing the same change ID clears any stale queue or failed entries for that
-change and queues the updated revision.
+To resolve, fix the revision (rebase onto trunk, resolve conflicts) and push it
+again. Push is idempotent — re-pushing the same change ID clears any stale
+queue or failed entries for that change and queues the updated revision. If you
+re-push the exact same commit ID that is already queued, the push is rejected
+as a duplicate.
 
 ### Status
 
 jjq users can get a list of the current queue via the CLI's status command,
-including recent failures, 3 by default but configurable by the user.
+including recent failures (all are shown, newest first).
 
-Successful merges and older failures are not included by default in the status
-command.
-
-The status command supports a `--json` flag for machine-readable output,
-intended for agent orchestration and automation. It also supports single-item
-lookup by sequence ID or candidate change ID via the `--resolve` flag.
+The status command supports a `--json` flag for machine-readable output.
+It also supports single-item lookup by sequence ID or candidate change ID via
+the `--resolve` flag.
 
 Status is intended as a helpful tool for jjq users, not as a comprehensive
-history of jjq's operation. For a history, users should explore jjq's log
-command.
+history of jjq's operation.
 
-### The log
+### Check output
 
-jjq records all its actions in a log. The log is stored in the jj repo
-alongside the sequence ID store. The log is meant to capture the sequence of
-logical actions jjq takes as it executes its commands, as well as to record
-notable output and summaries for future analysis and debugging, especially of
-failures. For example, the output of the check command shall be recorded in the
-log.
-
-The log should help users reconstruct jjq operational histories, supporting
-additional tooling like timeline visualization.
-
-The storage format of the jjq log is left as a detail to conforming
-implementations.
+jjq writes the check command's combined stdout/stderr to `.jj/jjq-run.log` and
+provides `jjq tail` to view it (optionally following updates during a run).
 
 ### Deleting queued and failed items.
 
-The jjq command `delete` take an ID argument and removes the item from the
-queue, or for a failed item, its bookmark.
+The jjq command `delete` takes an ID argument and removes the item from the
+queue, or for a failed item, its bookmark. If the failed workspace directory is
+found, it is removed as well.
 
 ### Cleaning up
 
-Runner workspaces are short-lived and shall be garbage collected upon success.
-Failed workspaces shall persist, to permit user debugging, and can be manually
-cleaned up by the user with the jjq `clean` command.
+Runner workspaces are short-lived and are garbage collected upon success.
+Failed workspaces persist for debugging and can be cleaned with `jjq clean`
+(removes all `jjq-run-*` workspaces it finds).
 
 ### Dry-run checking
 
@@ -249,9 +227,8 @@ check command is sane before queuing items. The workspace is always cleaned up.
 
 ### Diagnostics
 
-The jjq `doctor` command validates the environment before queue items are
-processed. It checks that the trunk bookmark exists, the check command is
-configured, no stale locks are present, and no orphaned workspaces remain. Each
+The jjq `doctor` command validates the environment: trunk bookmark exists,
+check command configured, locks not held, and no orphaned workspaces. Each
 check is reported as ok, WARN, or FAIL, with suggested fixes for actionable
 issues.
 
@@ -265,41 +242,15 @@ Users may configure:
 
   - the check command (required — must be set before first run)
   - the name of the trunk bookmark (default "main")
-  - the number of most recent failed merges to display via the status command (default 3)
+  - (status shows all failed items)
 
 ### Use of jj bookmarks
 
-jj bookmarks are the way that jjq indicates what items are in the queue, what
-have failed, where the latest metadata (sequence ID, user config) lives, and the
-working copy of the runner workspace.
+jj bookmarks indicate queue and failed items and the metadata branch head:
 
-jj bookmarks are also used to gain a global lock for running the jjq merge
-queue. Only one OS process may be trying to process the queue at a time. The
-existence of a well-known stable jj bookmark indicates the fact that a lock is
-taken.
-
-jjq must use the following conventions for its jj bookmarks:
-
-  - All jjq bookmarks are "namespaced" starting with `jjq`, followed by a scope,
-    then details on that scope, all delimited with the solidus `/`. This looks
-    like the pattern `jjq/SCOPE/DETAILS`.
-  - Valid scopes are:
-    - `queue` - used for queue items. The zero-padded sequence ID is the
-      details field. eg., `jjq/queue/000001`.
-    - `failed` - used for failed merge attempts. The zero-padded sequence ID is
-      the details field. eg., `jjq/failed/000001`.
-    - `run` - used for merge-to-be workspace. The zero-padded sequence ID is
-      the details field. eg., `jjq/run/000001`.
-    - `lock` - used for mutex-style locking. The type of lock is the details
-      field. eg., `jjq/lock/run`.
-  - A special bookmark `jjq/_/_` is used to point to the latest revision of its
-    isolated (i.e., parented to 'root()') branch of metadata stores.
-
-The `jjq/XXX/XXX` pattern must be adhered to - since Git is the practically
-speaking only backing store for jj, and jj exports its bookmarks to the
-underlying Git as branches, we can't have bookmark names that look like
-"parents" to others in a filesystem-like way. This explains why `jjq/_/_` looks
-the way it does.
+- `jjq/queue/NNNNNN` — queued items (zero-padded sequence ID)
+- `jjq/failed/NNNNNN` — failed merge attempts
+- `jjq/_/_` — head of the isolated metadata branch (last_id, config, ops log)
 
 ### Using `jj`
 
