@@ -9,6 +9,7 @@ mod lock;
 mod queue;
 mod runlog;
 mod runner;
+mod tail;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -81,6 +82,15 @@ enum Commands {
         /// Value to set
         value: Option<String>,
     },
+    /// View check command output
+    Tail {
+        /// Show output from the beginning (default: last 20 lines)
+        #[arg(long)]
+        all: bool,
+        /// Don't follow output, just dump and exit
+        #[arg(long)]
+        no_follow: bool,
+    },
 }
 
 fn main() {
@@ -110,5 +120,6 @@ fn run() -> Result<()> {
         Commands::Clean => commands::clean(),
         Commands::Doctor => commands::doctor(),
         Commands::Config { key, value } => commands::config(key.as_deref(), value.as_deref()),
+        Commands::Tail { all, no_follow } => tail::tail(all, !no_follow),
     }
 }
