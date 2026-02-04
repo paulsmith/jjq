@@ -619,12 +619,15 @@ fn run_one() -> Result<RunResult> {
         ));
     }
 
-    // Success path
+    // Success path — order matters for crash safety:
+    // 1. Move trunk first (most critical; if this fails, queue item is preserved for retry)
+    // 2. Delete queue bookmark (if we crash here, next run handles the orphan)
+    // 3. Describe last (commit only claims "Success" after everything actually succeeded)
     let merge_change_id = jj::resolve_revset("@")?;
 
+    jj::bookmark_move(&trunk_bookmark)?;
     jj::bookmark_delete(&queue_bookmark)?;
     jj::describe("@", &format!("Success: merge {}", id))?;
-    jj::bookmark_move(&trunk_bookmark)?;
 
     env::set_current_dir(&orig_dir)?;
     jj::workspace_forget(&run_name)?;
