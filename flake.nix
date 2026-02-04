@@ -15,18 +15,37 @@
         "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
     in
     {
-      packages = forAllSystems (pkgs: {
-        default = pkgs.rustPlatform.buildRustPackage {
-          pname = "jjq";
-          version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          # e2e tests require jj, git, and go; skip in sandbox build
-          doCheck = false;
-        };
-      });
+      packages = forAllSystems (pkgs:
+        let
+          jjq = pkgs.rustPlatform.buildRustPackage {
+            pname = "jjq";
+            inherit version;
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = [ pkgs.installShellFiles ];
+            postInstall = ''
+              installManPage docs/jjq.1
+            '';
+            # e2e tests require jj, git, and go; skip in sandbox build
+            doCheck = false;
+          };
+        in
+        {
+          default = jjq;
+
+          tarball = pkgs.runCommand "jjq-tarball" { } ''
+            dir="jjq-${version}-${pkgs.stdenv.hostPlatform.system}"
+            mkdir -p "$dir/bin" "$dir/share/man/man1"
+            cp ${jjq}/bin/jjq "$dir/bin/"
+            cp ${jjq}/share/man/man1/jjq.1.gz "$dir/share/man/man1/"
+            cp ${./install.sh} "$dir/install"
+            chmod 755 "$dir/install"
+            tar czf "$out" "$dir"
+          '';
+        });
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
