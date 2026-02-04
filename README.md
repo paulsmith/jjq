@@ -17,10 +17,19 @@ passes checks against the latest trunk.
 
 Prerequisite: make sure `jj` is installed.
 
-Copy `jjq` to somewhere in your `$PATH`:
+Download the tarball for your platform and run the included install script:
 
 ```sh
-cp jjq ~/.local/bin/
+curl -LO https://FIXME/jjq-0.1.0-aarch64-darwin.tar.gz
+tar xzf jjq-0.1.0-aarch64-darwin.tar.gz
+cd jjq-0.1.0-aarch64-darwin
+sudo ./install                    # installs to /usr/local
+```
+
+To install to a different prefix (no sudo needed):
+
+```sh
+PREFIX=$HOME/.local ./install
 ```
 
 ## Usage

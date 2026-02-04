@@ -89,6 +89,8 @@ The test script creates a temporary jj repository with 4 PR branches (some with 
 
 ## Development Notes
 
+- jjq is implemented in Rust
+- use the Nix flake here for a development shell `nix develop` and to build the artifacts `nix build` -> `./result/bin/jjq`
 - All jj interaction is via the `jj` CLI (no API)
 - Uses `jj log -T'...'` templates for structured output parsing
 - `run_quiet` helper suppresses output on success, shows on failure
