@@ -7,6 +7,8 @@ mod exit_codes;
 mod jj;
 mod lock;
 mod queue;
+mod runlog;
+mod runner;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

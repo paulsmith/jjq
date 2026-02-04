@@ -560,8 +560,6 @@ fn test_run_check_failure() {
     let run_output = repo.jjq_failure(&["run"]);
     insta::assert_snapshot!(run_output, @r"
     jjq: processing queue item 1
-
-
     jjq: merge 1 failed check, marked as failed
     jjq: workspace: <TEMP_PATH>
     jjq:
