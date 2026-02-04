@@ -103,7 +103,7 @@ jjq config max_failures 5            # set max failures shown in status
 When a merge fails, fix the issue and re-push:
 
 ```sh
-jj rebase -r mychange -d main  # rebase onto current trunk
+jj rebase -b mychange -o main  # rebase onto current trunk
 # resolve any conflicts
 jjq push mychange              # clears old failure, re-queues
 ```
