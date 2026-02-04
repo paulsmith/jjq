@@ -37,7 +37,7 @@ jjq stores all state in the jj repository itself:
 | `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID) |
 | `run [--all]` | Process next queue item, or all items in batch |
 | `check [--rev <revset>]` | Run check command against a revision (default @) |
-| `status` | Show queue and recent failures |
+| `status [id] [--json] [--resolve]` | Show queue and recent failures; supports JSON output and single-item detail view |
 | `delete <id>` | Remove item from queue/failed |
 | `config [key] [value]` | Get/set configuration |
 | `clean` | Remove failed workspaces |

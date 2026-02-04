@@ -207,6 +207,10 @@ including recent failures, 3 by default but configurable by the user.
 Successful merges and older failures are not included by default in the status
 command.
 
+The status command supports a `--json` flag for machine-readable output,
+intended for agent orchestration and automation. It also supports single-item
+lookup by sequence ID or candidate change ID via the `--resolve` flag.
+
 Status is intended as a helpful tool for jjq users, not as a comprehensive
 history of jjq's operation. For a history, users should explore jjq's log
 command.

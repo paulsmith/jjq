@@ -16,6 +16,10 @@ jjq \- local merge queue for jj
 .RB [ \-v ]
 .br
 .B jjq status
+.RI [ id ]
+.RB [ \-\-json ]
+.RB [ \-\-resolve
+.IR change_id ]
 .br
 .B jjq delete
 .I id
@@ -108,7 +112,7 @@ Useful for diagnosing path or environment issues.
 .PP
 The temporary workspace is always cleaned up, regardless of outcome.
 Exits 0 if the check passes; 1 if it fails.
-.SS status
+.SS status \fR[\fIid\fR] [\fB\-\-json\fR] [\fB\-\-resolve \fIchange_id\fR]
 Display the current queue state: queued items (ascending by sequence ID)
 and recent failures (descending, up to
 .BR max_failures ).
@@ -118,6 +122,40 @@ the commit description.
 Also indicates if a run lock is currently held (another
 .B jjq run
 is in progress).
+.PP
+With
+.BR \-\-json ,
+outputs structured JSON with
+.BR running ,
+.BR queue ,
+and
+.B failed
+fields.
+Queue items include
+.BR change_id ,
+.BR commit_id ,
+and
+.BR description .
+Failed items include
+.BR candidate_change_id ,
+.BR candidate_commit_id ,
+.BR description
+(original candidate message),
+.BR trunk_commit_id ,
+.BR workspace_path ,
+and
+.BR failure_reason .
+.PP
+With a positional
+.IR id ,
+displays a single item's detail view (from either queue or failed).
+With
+.BR \-\-resolve ,
+looks up an item by its candidate change ID.
+.I id
+and
+.B \-\-resolve
+are mutually exclusive.
 .SS delete \fIid\fR
 Remove an item from the queue or the failed list by its sequence ID.
 The sequence ID is the number shown in

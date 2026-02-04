@@ -57,7 +57,11 @@ jjq run --all --stop-on-failure
 ### Check status
 
 ```sh
-jjq status
+jjq status                          # overview of queue and recent failures
+jjq status --json                   # machine-readable JSON output
+jjq status 42                       # detail view of item 42
+jjq status 42 --json                # detail view as JSON
+jjq status --resolve <change_id>    # look up item by candidate change ID
 ```
 
 ### Configure

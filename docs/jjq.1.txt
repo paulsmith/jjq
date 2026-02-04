@@ -7,7 +7,7 @@
          jjq push <revset>
          jjq run [--all] [--stop-on-failure]
          jjq check [--rev <revset>] [-v]
-         jjq status
+         jjq status [id] [--json] [--resolve <change_id>]
          jjq delete <id>
          jjq clean
          jjq doctor
@@ -82,7 +82,7 @@
          The temporary workspace is always cleaned up, regardless of
          outcome. Exits 0 if the check passes; 1 if it fails.
 
-     status
+     status [id] [--json] [--resolve <change_id>]
          Display the current queue state: queued items (ascending by sequence
          ID) and recent failures (descending, up to max_failures). Each entry
          shows its sequence ID, change ID prefix, and first line of the
@@ -90,6 +90,16 @@
 
          Also indicates if a run lock is currently held (another jjq run is
          in progress).
+
+         With --json, outputs structured JSON with running, queue, and failed
+         fields. Queue items include change_id, commit_id, and description.
+         Failed items include candidate_change_id, candidate_commit_id,
+         description (original candidate message), trunk_commit_id,
+         workspace_path, and failure_reason.
+
+         With a positional id, displays a single item's detail view (from
+         either queue or failed). With --resolve, looks up an item by its
+         candidate change ID. id and --resolve are mutually exclusive.
 
      delete <id>
          Remove an item from the queue or the failed list by its sequence ID.
