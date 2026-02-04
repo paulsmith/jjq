@@ -23,6 +23,18 @@ fn preferr(msg: &str) {
     eprintln!("jjq: {}", msg);
 }
 
+/// Require jjq to be initialized, or error with instructions.
+fn require_initialized() -> Result<()> {
+    if !config::is_initialized()? {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            "jjq is not initialized. Run 'jjq init' first.",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Extract the numeric ID from a bookmark name like "jjq/queue/000042".
 fn extract_id_from_bookmark(bookmark: &str) -> u32 {
     bookmark
@@ -112,6 +124,132 @@ fn record_workspace_metadata(id: u32, workspace_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Initialize jjq in this repository.
+pub fn init(trunk: Option<&str>, check: Option<&str>) -> Result<()> {
+    use std::io::{self, IsTerminal};
+
+    // Refuse if already initialized
+    if config::is_initialized()? {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            "jjq is already initialized. Use 'jjq config' to change settings.",
+        )
+        .into());
+    }
+
+    println!("Initializing jjq in this repository.");
+    println!();
+
+    let is_tty = io::stdin().is_terminal();
+
+    // Determine trunk bookmark
+    let trunk_value = if let Some(t) = trunk {
+        t.to_string()
+    } else if !is_tty {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            "--trunk and --check are required in non-interactive mode.",
+        )
+        .into());
+    } else {
+        // Auto-detect default from existing bookmarks
+        let bookmarks = jj::list_bookmarks().unwrap_or_default();
+        let default = if bookmarks.iter().any(|b| b == "main") {
+            Some("main")
+        } else if bookmarks.iter().any(|b| b == "master") {
+            Some("master")
+        } else {
+            None
+        };
+
+        prompt_with_default("Trunk bookmark", default)?
+    };
+
+    // Determine check command
+    let check_value = if let Some(c) = check {
+        c.to_string()
+    } else if !is_tty {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            "--trunk and --check are required in non-interactive mode.",
+        )
+        .into());
+    } else {
+        prompt_required("Check command", "A check command is required (e.g., 'make test', 'cargo test').")?
+    };
+
+    // Initialize metadata branch
+    config::initialize()?;
+
+    // Set config values
+    config::set("trunk_bookmark", &trunk_value)?;
+    config::set("check_command", &check_value)?;
+
+    println!();
+    println!("Initialized jjq:");
+    println!("  trunk_bookmark = {}", trunk_value);
+    println!("  check_command  = {}", check_value);
+    println!();
+
+    // Run doctor
+    println!("Running doctor...");
+    let _ = doctor();
+
+    println!();
+    println!("Ready to go! Queue revisions with 'jjq push <revset>'.");
+
+    Ok(())
+}
+
+/// Prompt for a value with an optional default. Loops until non-empty input.
+fn prompt_with_default(label: &str, default: Option<&str>) -> Result<String> {
+    use std::io::{self, BufRead, Write};
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    loop {
+        if let Some(d) = default {
+            print!("{} [{}]: ", label, d);
+        } else {
+            print!("{}: ", label);
+        }
+        io::stdout().flush()?;
+
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            if let Some(d) = default {
+                return Ok(d.to_string());
+            }
+            // No default, re-prompt
+            continue;
+        }
+        return Ok(trimmed.to_string());
+    }
+}
+
+/// Prompt for a required value (no default). Loops until non-empty input, showing hint on empty.
+fn prompt_required(label: &str, hint: &str) -> Result<String> {
+    use std::io::{self, BufRead, Write};
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    loop {
+        print!("{}: ", label);
+        io::stdout().flush()?;
+
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            println!("{}", hint);
+            continue;
+        }
+        return Ok(trimmed.to_string());
+    }
+}
+
 /// Push a revision onto the merge queue.
 pub fn push(revset: &str) -> Result<()> {
     // Resolve both change ID and commit ID
@@ -175,7 +313,7 @@ pub fn push(revset: &str) -> Result<()> {
         return Err(ExitError::new(exit_codes::CONFLICT, "revision conflicts with trunk").into());
     }
 
-    config::ensure_initialized()?;
+    require_initialized()?;
 
     let id = queue::next_id()?;
     let bookmark = queue::queue_bookmark(id);
@@ -192,6 +330,8 @@ pub fn push(revset: &str) -> Result<()> {
 
 /// Process queue items.
 pub fn run(all: bool, stop_on_failure: bool) -> Result<()> {
+    require_initialized()?;
+
     if all {
         run_all(stop_on_failure)
     } else {
@@ -256,8 +396,6 @@ fn run_one() -> Result<RunResult> {
     };
 
     prefout(&format!("processing queue item {}", id));
-
-    config::ensure_initialized()?;
 
     // Acquire config lock to read settings
     let config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
@@ -398,7 +536,7 @@ fn run_one() -> Result<RunResult> {
 /// Display queue status.
 pub fn status() -> Result<()> {
     if !config::is_initialized()? {
-        prefout("jjq not initialized (run 'jjq push <revset>' to start)");
+        prefout("jjq not initialized. Run 'jjq init' first.");
         return Ok(());
     }
 
@@ -449,7 +587,7 @@ pub fn status() -> Result<()> {
 pub fn delete(id_str: &str) -> Result<()> {
     let id = queue::parse_seq_id(id_str)?;
 
-    config::ensure_initialized()?;
+    require_initialized()?;
 
     // Check queue first
     if queue::queue_item_exists(id)? {
@@ -492,7 +630,7 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
     match (key, value) {
         (None, None) => {
             // Show all config
-            config::ensure_initialized()?;
+            require_initialized()?;
             let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
             let trunk = config::get_trunk_bookmark()?;
             let check = config::get_check_command()?;
@@ -566,8 +704,8 @@ pub fn doctor() -> Result<()> {
     if initialized {
         print_check("ok", "jjq initialized");
     } else {
-        print_check("WARN", "jjq not initialized (run 'jjq push' to initialize)");
-        warns += 1;
+        print_check("FAIL", "jjq not initialized (run 'jjq init')");
+        fails += 1;
     }
 
     // 3. trunk bookmark exists
@@ -596,19 +734,8 @@ pub fn doctor() -> Result<()> {
     // 5. run lock
     match lock::lock_state("run")? {
         lock::LockState::Free => print_check("ok", "run lock is free"),
-        lock::LockState::HeldAlive(pid) => {
-            print_check("WARN", &format!("run lock held by live process (pid {})", pid));
-            warns += 1;
-        }
-        lock::LockState::HeldDead(pid) => {
-            print_check("FAIL", &format!("run lock held by dead process (pid {})", pid));
-            print_hint(&format!("to fix: rm -rf {}", lock::lock_path("run")?.display()));
-            fails += 1;
-        }
-        lock::LockState::HeldUnknown => {
-            print_check("WARN", "run lock held (unknown process)");
-            let path = lock::lock_path("run")?;
-            print_hint(&format!("if stale: rm -rf {}", path.display()));
+        lock::LockState::Held => {
+            print_check("WARN", "run lock held by another process");
             warns += 1;
         }
     }
@@ -616,19 +743,8 @@ pub fn doctor() -> Result<()> {
     // 6. id lock
     match lock::lock_state("id")? {
         lock::LockState::Free => print_check("ok", "id lock is free"),
-        lock::LockState::HeldAlive(pid) => {
-            print_check("WARN", &format!("id lock held by live process (pid {})", pid));
-            warns += 1;
-        }
-        lock::LockState::HeldDead(pid) => {
-            print_check("FAIL", &format!("id lock held by dead process (pid {})", pid));
-            print_hint(&format!("to fix: rm -rf {}", lock::lock_path("id")?.display()));
-            fails += 1;
-        }
-        lock::LockState::HeldUnknown => {
-            print_check("WARN", "id lock held (unknown process)");
-            let path = lock::lock_path("id")?;
-            print_hint(&format!("if stale: rm -rf {}", path.display()));
+        lock::LockState::Held => {
+            print_check("WARN", "id lock held by another process");
             warns += 1;
         }
     }

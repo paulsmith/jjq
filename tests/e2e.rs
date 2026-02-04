@@ -303,6 +303,16 @@ func main() {
         let combined = format!("{}{}", stdout, stderr);
         normalize_output(&combined, &self.path)
     }
+
+    /// Initialize jjq with default settings (check command = "true").
+    fn init_jjq(&self) {
+        self.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
+    }
+
+    /// Initialize jjq with a specific check command.
+    fn init_jjq_with_check(&self, check_cmd: &str) {
+        self.jjq_success(&["init", "--trunk", "main", "--check", check_cmd]);
+    }
 }
 
 /// Run a jj command in the given directory.
@@ -381,16 +391,16 @@ fn normalize_output(output: &str, repo_path: &Path) -> String {
 fn test_status_uninitialized() {
     let repo = TestRepo::new();
     let output = repo.jjq_success(&["status"]);
-    insta::assert_snapshot!(output, @"jjq: jjq not initialized (run 'jjq push <revset>' to start)");
+    insta::assert_snapshot!(output, @"jjq: jjq not initialized. Run 'jjq init' first.");
 }
 
 #[test]
 fn test_push_no_trunk() {
     let repo = TestRepo::new();
-    // Create a commit but no main bookmark
     fs::write(repo.path().join("file.txt"), "content").unwrap();
     run_jj(repo.path(), &["desc", "-m", "test commit"]);
-
+    // Init with default trunk "main" which doesn't exist in this bare repo
+    repo.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
     let output = repo.jjq_failure(&["push", "@"]);
     insta::assert_snapshot!(output, @"jjq: trunk bookmark 'main' not found");
 }
@@ -398,12 +408,11 @@ fn test_push_no_trunk() {
 #[test]
 fn test_config_show_all() {
     let repo = TestRepo::with_go_project();
-    // Push something to initialize jjq
-    repo.jjq_success(&["push", "main"]);
+    repo.init_jjq();
     let output = repo.jjq_success(&["config"]);
     insta::assert_snapshot!(output, @r"
     trunk_bookmark = main
-    check_command = (not set)
+    check_command = true
     max_failures = 3
     ");
 }
@@ -411,7 +420,7 @@ fn test_config_show_all() {
 #[test]
 fn test_config_set_and_get() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["push", "main"]);
+    repo.init_jjq();
 
     let set_output = repo.jjq_success(&["config", "check_command", "make test"]);
     insta::assert_snapshot!(set_output, @"jjq: check_command = make test");
@@ -423,7 +432,7 @@ fn test_config_set_and_get() {
 #[test]
 fn test_config_invalid_key() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["push", "main"]);
+    repo.init_jjq();
 
     let output = repo.jjq_failure(&["config", "invalid_key"]);
     insta::assert_snapshot!(output, @r"
@@ -435,6 +444,7 @@ fn test_config_invalid_key() {
 #[test]
 fn test_push_and_status() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     // Create a branch to push
     run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
@@ -454,6 +464,7 @@ fn test_push_and_status() {
 #[test]
 fn test_push_conflict_detection() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     // Create a branch that modifies main.go one way
     run_jj(repo.path(), &["new", "-m", "trunk advance", "main"]);
@@ -499,35 +510,23 @@ func main() {
 #[test]
 fn test_run_empty_queue() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.init_jjq();
 
     let output = repo.jjq_success(&["run"]);
     insta::assert_snapshot!(output, @"jjq: queue is empty");
 }
 
 #[test]
-fn test_run_no_check_command() {
+fn test_run_without_init() {
     let repo = TestRepo::with_go_project();
-
-    // Push something first
-    run_jj(repo.path(), &["new", "-m", "test", "main"]);
-    fs::write(repo.path().join("test.txt"), "test").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "test-branch"]);
-    repo.jjq_success(&["push", "test-branch"]);
-
-    // Run without check_command configured
     let output = repo.jjq_failure(&["run"]);
-    insta::assert_snapshot!(output, @r"
-    jjq: processing queue item 1
-    jjq: check_command not configured (use 'jjq config check_command <cmd>')
-    jjq: check_command not configured
-    ");
+    insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
 }
 
 #[test]
 fn test_run_success() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.init_jjq();
 
     // Create and push a simple branch
     run_jj(repo.path(), &["new", "-m", "add file", "main"]);
@@ -545,7 +544,7 @@ fn test_run_success() {
 #[test]
 fn test_run_check_failure() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "false"]);
+    repo.init_jjq_with_check("false");
 
     // Create and push a branch
     run_jj(repo.path(), &["new", "-m", "will fail check", "main"]);
@@ -577,7 +576,7 @@ fn test_run_check_failure() {
 #[test]
 fn test_run_all() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.init_jjq();
 
     // Create multiple branches
     run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
@@ -624,6 +623,7 @@ fn test_run_all() {
 #[test]
 fn test_delete_queued() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     run_jj(repo.path(), &["new", "-m", "to delete", "main"]);
     fs::write(repo.path().join("delete.txt"), "delete me").unwrap();
@@ -646,7 +646,7 @@ fn test_delete_queued() {
 #[test]
 fn test_delete_failed() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "false"]);
+    repo.init_jjq_with_check("false");
 
     run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
     fs::write(repo.path().join("fail.txt"), "fail").unwrap();
@@ -675,8 +675,7 @@ fn test_delete_failed() {
 #[test]
 fn test_delete_not_found() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["push", "main"]); // Initialize jjq
-    repo.jjq_success(&["delete", "1"]); // Delete the item we just pushed
+    repo.init_jjq();
 
     let output = repo.jjq_failure(&["delete", "999"]);
     insta::assert_snapshot!(output, @"jjq: item 999 not found in queue or failed");
@@ -685,7 +684,8 @@ fn test_delete_not_found() {
 #[test]
 fn test_sequence_id_validation() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["push", "main"]); // Initialize
+    repo.init_jjq();
+    repo.jjq_success(&["push", "main"]); // Need an item to delete
 
     // Test invalid IDs
     let empty = repo.jjq_failure(&["delete", ""]);
@@ -719,7 +719,7 @@ fn test_sequence_id_validation() {
 #[test]
 fn test_full_workflow_with_prs() {
     let repo = TestRepo::with_prs();
-    repo.jjq_success(&["config", "check_command", "make"]);
+    repo.init_jjq_with_check("make");
 
     // Push all PRs
     let push1 = repo.jjq_success(&["push", "pr1"]);
@@ -778,6 +778,7 @@ fn test_full_workflow_with_prs() {
 #[test]
 fn test_multiple_push_same_revision() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     // Push main once - should succeed
     let push1 = repo.jjq_success(&["push", "main"]);
@@ -791,6 +792,7 @@ fn test_multiple_push_same_revision() {
 #[test]
 fn test_log_hint_not_shown_in_non_tty() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     // Push should succeed without showing hint (non-TTY mode)
     let output = repo.jjq_success(&["push", "main"]);
@@ -815,6 +817,7 @@ fn test_log_hint_not_shown_in_non_tty() {
 #[test]
 fn test_log_hint_shown_once_when_forced() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     // First push with forced hint - should show hint
     let output1 = repo.jjq_with_env(&["push", "main"], &[("JJQTEST_FORCE_HINT", "1")]);
@@ -844,7 +847,7 @@ fn test_log_hint_shown_once_when_forced() {
 #[test]
 fn test_run_all_stop_on_failure_flag() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.init_jjq();
 
     // f1: modifies main.go (will merge cleanly against trunk)
     run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
@@ -988,6 +991,7 @@ fn test_log_hint_skipped_when_filter_configured() {
 #[test]
 fn test_push_exact_duplicate_rejected() {
     let repo = TestRepo::with_go_project();
+    repo.init_jjq();
 
     repo.jjq_success(&["push", "main"]);
 
@@ -1046,4 +1050,46 @@ fn test_clean_removes_failed_workspaces() {
     // Clean should find and remove the workspace
     let output = repo.jjq_success(&["clean"]);
     assert!(output.contains("removed 1 workspace"), "should remove workspace: {}", output);
+}
+
+#[test]
+fn test_init_with_flags() {
+    let repo = TestRepo::with_go_project();
+    let output = repo.jjq_success(&["init", "--trunk", "main", "--check", "make test"]);
+    assert!(output.contains("Initialized jjq"), "should show init confirmation: {}", output);
+    assert!(output.contains("trunk_bookmark = main"), "should show trunk: {}", output);
+    assert!(output.contains("check_command  = make test"), "should show check cmd: {}", output);
+    assert!(output.contains("Ready to go!"), "should show ready message: {}", output);
+}
+
+#[test]
+fn test_init_already_initialized() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
+
+    let output = repo.jjq_failure(&["init", "--trunk", "main", "--check", "true"]);
+    insta::assert_snapshot!(output, @"jjq: jjq is already initialized. Use 'jjq config' to change settings.");
+}
+
+#[test]
+fn test_init_runs_doctor() {
+    let repo = TestRepo::with_go_project();
+    let output = repo.jjq_success(&["init", "--trunk", "main", "--check", "make test"]);
+    // Doctor output should be present
+    assert!(output.contains("jj repository"), "should run doctor: {}", output);
+    assert!(output.contains("ok"), "doctor checks should pass: {}", output);
+}
+
+#[test]
+fn test_push_without_init_fails() {
+    let repo = TestRepo::with_go_project();
+    let output = repo.jjq_failure(&["push", "main"]);
+    insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
+}
+
+#[test]
+fn test_config_without_init_fails() {
+    let repo = TestRepo::with_go_project();
+    let output = repo.jjq_failure(&["config"]);
+    insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
 }

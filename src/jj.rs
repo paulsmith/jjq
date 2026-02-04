@@ -110,6 +110,16 @@ pub fn bookmark_list_glob(pattern: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// List all local bookmark names.
+pub fn list_bookmarks() -> Result<Vec<String>> {
+    let output = run_ok(&["bookmark", "list", "-T", "name ++ \"\\n\""])?;
+    Ok(output
+        .lines()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect())
+}
+
 /// Resolve a revset to a single change ID.
 pub fn resolve_revset(revset: &str) -> Result<String> {
     let output = run(&["log", "-r", revset, "--no-graph", "-T", "change_id.short()"])?;

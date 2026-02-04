@@ -24,12 +24,8 @@ pub fn is_initialized() -> Result<bool> {
     jj::bookmark_exists(JJQ_BOOKMARK)
 }
 
-/// Ensure jjq is initialized, creating metadata branch if needed.
-pub fn ensure_initialized() -> Result<()> {
-    if is_initialized()? {
-        return Ok(());
-    }
-
+/// Create the jjq metadata branch. Errors if already initialized.
+pub fn initialize() -> Result<()> {
     // Create new revision parented to root()
     let change_id = jj::new_rev(&["root()"])?;
     jj::run_quiet(&["bookmark", "create", "-r", &change_id, JJQ_BOOKMARK])?;
@@ -56,6 +52,14 @@ pub fn ensure_initialized() -> Result<()> {
     jj::workspace_forget(&workspace_name)?;
 
     Ok(())
+}
+
+/// Ensure jjq is initialized, creating metadata branch if needed.
+pub fn ensure_initialized() -> Result<()> {
+    if is_initialized()? {
+        return Ok(());
+    }
+    initialize()
 }
 
 /// Get a config value from the metadata branch.
