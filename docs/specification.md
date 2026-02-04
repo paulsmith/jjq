@@ -40,7 +40,8 @@ interpreted as described in RFC 2119.
 - `[optional]` denotes optional elements
 - Bookmark names are shown in monospace: `jjq/queue/000001`
 - Exit codes: 0 indicates success, 1 indicates operational failure,
-  2 indicates usage error
+  2 indicates partial success (some items succeeded, some failed),
+  3 indicates lock contention, 10 indicates usage error
 
 ## jj Dependency
 
@@ -93,7 +94,7 @@ Git branches), which treats `/` as directory separators.
 Note: Workspace names use a different pattern (`jjq-run-<padded-id>`) to
 avoid confusion with bookmarks. See §Workspaces for details.
 
-Note: Locking uses filesystem directories, not bookmarks. See §Locking.
+Note: Locking uses filesystem-based flock locks, not bookmarks. See §Locking.
 
 #### Sequence ID Encoding
 
@@ -213,49 +214,46 @@ be created during initialization.
 
 ## Locking
 
-jjq uses filesystem-based locks to coordinate concurrent access. Locks
-leverage the atomicity of the `mkdir(2)` system call: a directory creation
-either succeeds (lock acquired) or fails because the directory exists
-(lock held by another process).
+jjq uses flock-based file locks to coordinate concurrent access. Each
+lock is a file in `.jj/jjq-locks/` that is locked using the operating
+system's advisory file locking mechanism (flock). The OS automatically
+releases locks when the holding process exits, even abnormally.
 
 > **Note:** Earlier versions of this specification described bookmark-based
-> locking using jj bookmarks. This approach was replaced because jj's
-> optimistic concurrency model does not guarantee mutual exclusion—concurrent
-> `jj bookmark create` commands can both succeed due to jj's automatic
-> reconciliation of divergent operations. See `docs/jj-transaction-model.md`
-> for details.
+> locking (replaced because jj's optimistic concurrency does not guarantee
+> mutual exclusion) and mkdir-based locking (replaced because stale lock
+> directories required manual cleanup after crashes). See
+> `docs/jj-transaction-model.md` for details on why bookmark locking is
+> unsuitable.
 
-### Lock Directory
+### Lock Storage
 
 All locks are stored in the `.jj/jjq-locks/` directory within the repository.
-Each lock is represented by a subdirectory named after the lock.
+Each lock is a file named `<lock-name>.lock`.
 
 ```
 <repo>/.jj/jjq-locks/
-├── id/          # Sequence ID lock
-│   └── pid      # PID of lock holder
-└── run/         # Queue runner lock
-    └── pid      # PID of lock holder
+├── id.lock      # Sequence ID lock
+└── run.lock     # Queue runner lock
 ```
 
 ### Lock Acquisition
 
 To acquire a lock, an implementation MUST:
 
-1. Attempt to create the lock directory using `mkdir`
-2. If `mkdir` succeeds, write the current process ID to a `pid` file
-   within the lock directory
-3. If `mkdir` fails with EEXIST, the lock is held by another process
-   and acquisition MUST fail
-
-The `mkdir` system call is atomic; there is no race window between
-checking for existence and creating the directory.
+1. Open (or create) the lock file at `.jj/jjq-locks/<name>.lock`
+2. Attempt an exclusive flock on the file handle
+3. If the flock succeeds, the lock is acquired
+4. If the flock fails (lock held by another process), acquisition
+   MUST fail
 
 ### Lock Release
 
-To release a lock, an implementation MUST remove the lock directory
-and its contents. Implementations MUST release locks they hold before
-exiting, including on error paths.
+Locks are released by closing the file handle (or by dropping the
+lock guard, depending on implementation). Implementations MUST release
+locks they hold before exiting, including on error paths. If the
+process exits abnormally (crash, signal), the OS releases the lock
+automatically.
 
 ### Defined Locks
 
@@ -276,15 +274,18 @@ MUST be held for the duration of a queue run. Only one process MAY
 process the queue at a time. This lock MUST be acquired before
 processing begins and released after completion (success or failure).
 
+### Lock Probing
+
+Implementations MAY probe lock state (e.g., for `status` display) by
+attempting a non-blocking flock. The result is either Free or Held;
+no information about the lock holder (such as a PID) is available.
+
 ### Stale Locks
 
-If a process terminates abnormally, lock directories may remain. The spec
-does not mandate automatic stale lock detection. Users MAY manually remove
-lock directories to recover from this state.
-
-Implementations MAY optionally check the `pid` file to determine if the
-lock holder is still running, but MUST NOT automatically remove locks
-based solely on PID checks (PIDs can wrap around and be reused).
+Stale locks cannot occur under normal operation. The OS releases flock
+locks when the holding process exits, regardless of whether the exit
+is clean or abnormal. Lock files may remain on disk after release, but
+an empty lock file does not indicate a held lock.
 
 ---
 
@@ -431,15 +432,19 @@ Queue a revision for merging to trunk.
 ### run
 
 ```
-jjq run [--all]
+jjq run [--all] [--stop-on-failure]
 ```
 
 Process the next item in the queue, or all items if `--all` is specified.
 
 #### Options
 
-- `--all`: Process all queued items in sequence until the queue is empty
-  or a failure occurs. On success, outputs a summary of items processed.
+- `--all`: Process all queued items in sequence until the queue is empty.
+  Failed items are moved to the failed list and processing continues with
+  the next item. On completion, outputs a summary of items processed and
+  failures.
+- `--stop-on-failure`: Only meaningful with `--all`. Stops processing at
+  the first failure instead of continuing to the next item.
 
 #### Behavior
 
@@ -510,14 +515,18 @@ Process the next item in the queue, or all items if `--all` is specified.
 **Batch mode (`--all`):**
 
 When invoked with `--all`, the run command processes items repeatedly
-until the queue is empty or a failure occurs:
+until the queue is empty:
 
 1. Execute the single item behavior (steps 1-12 above).
 2. If the item succeeded (step 12), loop back to step 1.
-3. If the queue was empty (step 1), output a summary of items processed
-   (if any) and exit with code 0.
-4. If any failure occurred (steps 8, 10, or 11), output a summary of
-   items processed before the failure (if any) and exit with code 1.
+3. If the item failed (steps 8, 10, or 11):
+   - If `--stop-on-failure` is set, output a summary of items processed
+     before the failure (if any) and exit with code 1.
+   - Otherwise, continue to step 1 (process the next item).
+4. If the queue was empty (step 1), output a summary of items processed
+   and failures (if any):
+   - If all items succeeded, exit with code 0.
+   - If some items succeeded and some failed, exit with code 2.
 
 The run lock is acquired and released for each individual item, not
 held for the entire batch. This allows inspection of intermediate
@@ -533,6 +542,7 @@ states between items if needed.
 | Merge has conflicts                | 1         |
 | Check command exits non-zero       | 1         |
 | Trunk moved during run             | 1         |
+| Partial success (--all, no --stop-on-failure) | 2 |
 
 #### Workspace Behavior
 
@@ -899,7 +909,7 @@ requires strict adherence to:
 - Bookmark naming conventions (§Data Model - Bookmarks)
 - Sequence ID encoding (zero-padded, 6 digits)
 - Metadata branch structure (§Data Model - Metadata Branch)
-- Lock bookmark semantics (§Locking)
+- Lock file semantics (§Locking)
 
 ### Extensions
 

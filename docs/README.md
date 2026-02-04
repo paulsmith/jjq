@@ -1,11 +1,11 @@
 # jjq - merge queue for jj
 
-jjq is a merge queue tool for jj, the Git-compatible VCS. jjq is lightweight,
-in that it can be used on a jj repo with little ceremony or distruption and
-coexist with other processes. jjq is a jj-native merge queue tool, in that it
-uses jj features such as bookmarks and workspaces to operate the merge queue.
-jjq uses the jj repo as a data store for its queue items, work logs, and other
-metadata, while isolating its data from the user's.
+jjq is a merge queue tool for jj (Jujutsu), the Git-compatible VCS. jjq is
+lightweight, in that it can be used on a jj repo with little ceremony or
+distruption and coexist with other processes. jjq is a jj-native merge queue
+tool, in that it uses jj features such as bookmarks and workspaces to operate
+the merge queue. jjq uses the jj repo as a data store for its queue items, work
+logs, and other metadata, while isolating its data from the user's.
 
 jjq is a CLI. Users issue jjq commands like `push`, `run`, and `status` to
 operate the merge queue and get information about it.
@@ -207,6 +207,10 @@ including recent failures, 3 by default but configurable by the user.
 Successful merges and older failures are not included by default in the status
 command.
 
+The status command supports a `--json` flag for machine-readable output,
+intended for agent orchestration and automation. It also supports single-item
+lookup by sequence ID or candidate change ID via the `--resolve` flag.
+
 Status is intended as a helpful tool for jjq users, not as a comprehensive
 history of jjq's operation. For a history, users should explore jjq's log
 command.
@@ -237,6 +241,20 @@ Runner workspaces are short-lived and shall be garbage collected upon success.
 Failed workspaces shall persist, to permit user debugging, and can be manually
 cleaned up by the user with the jjq `clean` command.
 
+### Dry-run checking
+
+The `check` command runs the configured check command against a revision in a
+temporary workspace, without any queue processing. This lets users verify their
+check command is sane before queuing items. The workspace is always cleaned up.
+
+### Diagnostics
+
+The jjq `doctor` command validates the environment before queue items are
+processed. It checks that the trunk bookmark exists, the check command is
+configured, no stale locks are present, and no orphaned workspaces remain. Each
+check is reported as ok, WARN, or FAIL, with suggested fixes for actionable
+issues.
+
 ### User configuration
 
 Users may configure jjq via a jjq `config` command. The store of the
@@ -245,7 +263,7 @@ sequence ID store and log.
 
 Users may configure:
 
-  - the check command (default is "sh -c 'exit 1'", to encourage a new user to configure it)
+  - the check command (required — must be set before first run)
   - the name of the trunk bookmark (default "main")
   - the number of most recent failed merges to display via the status command (default 3)
 

@@ -1,27 +1,47 @@
 # jjq - merge queue for jj
 
-jjq is a lightweight merge queue tool for [jj](https://martinvonz.github.io/jj/), the Git-compatible VCS.
+jjq is a lightweight, local merge queue tool for
+[jj](https://martinvonz.github.io/jj/) (Jujutsu), the Git-compatible VCS.
 
 ## What it does
 
-jjq lets you queue revisions for merging to your trunk branch. Each queued item is merged with the current trunk and a configurable check command is run. If the check passes, the trunk bookmark advances. If it fails, the item is marked as failed for you to investigate.
+jjq lets you queue revisions for merging to your trunk branch (eg., `main`
+bookmark). Each queued item is merged with the current trunk and a configurable
+check command is run. If the check passes, the trunk bookmark advances. If it
+fails, the item is marked as failed for you to investigate.
 
-This prevents the "it worked on my branch" problem by ensuring every merge passes checks against the latest trunk.
+This prevents the "it worked on my branch" problem by ensuring every merge
+passes checks against the latest trunk.
 
 ## Installation
+
+Prerequisite: make sure `jj` is installed.
 
 Copy `jjq` to somewhere in your `$PATH`:
 
 ```sh
 cp jjq ~/.local/bin/
-chmod +x ~/.local/bin/jjq
 ```
-
-Requires: bash, jj
 
 ## Usage
 
+### Initialize
+
+Set up jjq in your repository:
+
+```sh
+jjq init
+```
+
+Or non-interactively:
+
+```sh
+jjq init --trunk main --check "make test"
+```
+
 ### Push a revision to the queue
+
+Any revset will do so long as it resolves to a single revision.
 
 ```sh
 jjq push @      # push current revision
@@ -36,13 +56,31 @@ Process the next item in the queue:
 jjq run
 ```
 
+Drain the entire queue (continues past failures):
+
+```sh
+jjq run --all
+```
+
+Stop at the first failure instead:
+
+```sh
+jjq run --all --stop-on-failure
+```
+
 ### Check status
 
 ```sh
-jjq status
+jjq status                          # overview of queue and recent failures
+jjq status --json                   # machine-readable JSON output
+jjq status 42                       # detail view of item 42
+jjq status 42 --json                # detail view as JSON
+jjq status --resolve <change_id>    # look up item by candidate change ID
 ```
 
 ### Configure
+
+After initialization, change settings with:
 
 ```sh
 jjq config                           # show all config
@@ -71,16 +109,27 @@ jjq clean 3           # clean workspace for failed item 3
 jjq clean all         # clean all failed workspaces
 ```
 
-### View history
+### Test your check command
 
 ```sh
-jjq log               # show recent operations
-jjq log 50            # show last 50 operations
+jjq check              # run check against current working copy
+jjq check --rev main   # run check against a specific revision
+jjq check -v           # show workspace path, shell, and env vars
 ```
+
+### Validate your setup
+
+```sh
+jjq doctor
+```
+
+Checks trunk bookmark, check command, lock state, and workspace
+preconditions. Catches common config errors before queue items fail.
 
 ## How it works
 
-jjq stores its state in your jj repository using bookmarks and an isolated branch:
+jjq stores its state in your jj repository using bookmarks and an isolated
+branch:
 
 - Queue items: `jjq/queue/000001`, `jjq/queue/000002`, ...
 - Failed items: `jjq/failed/000001`, ...
@@ -100,9 +149,9 @@ log = "~ ::jjq/_/_"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `trunk_bookmark` | `main` | Bookmark pointing to your trunk |
-| `check_command` | `sh -c 'exit 1'` | Command to run on merge candidates |
+| `check_command` | *(set during init)* | Command to run on merge candidates |
 | `max_failures` | `3` | Number of recent failures to show in status |
 
-## License
+## Copying
 
-MIT
+[BSD](./COPYING)

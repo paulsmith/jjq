@@ -2,12 +2,12 @@
 
 ## Project Overview
 
-jjq is a merge queue CLI tool for jj (Jujutsu VCS). It's implemented as a single bash script.
+jjq is a merge queue CLI tool for jj (Jujutsu VCS).
 
-## Key Files
+## Key Files / Paths
 
-- `jjq` - The entire implementation (bash script)
-- `ABOUT.md` - about jjq document
+- `src` - root of the Rust implementation
+- `docs/README.md` - high-level overview
 - `docs/specification.md` - RFC-style specification
 - `jjq-test` - End-to-end test script
 
@@ -34,12 +34,15 @@ jjq stores all state in the jj repository itself:
 
 | Command | Function |
 |---------|----------|
+| `init [--trunk <bookmark>] [--check <cmd>]` | Initialize jjq, set trunk and check command |
 | `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID) |
 | `run [--all]` | Process next queue item, or all items in batch |
-| `status` | Show queue and recent failures |
+| `check [--rev <revset>]` | Run check command against a revision (default @) |
+| `status [id] [--json] [--resolve]` | Show queue and recent failures; supports JSON output and single-item detail view |
 | `delete <id>` | Remove item from queue/failed |
 | `config [key] [value]` | Get/set configuration |
 | `clean` | Remove failed workspaces |
+| `doctor` | Validate config, locks, and workspace preconditions |
 
 ### Exit Codes
 
@@ -106,12 +109,4 @@ jj workspace add -r "$jjq_bookmark" --name "workspace-name" "$d"
 # ... do work in $d ...
 jj workspace forget "workspace-name"
 rm -rf "$d"
-```
-
-### Logging operations
-```bash
-log_op "" "operation: summary" \
-    "Operation: name" \
-    "Key: value" \
-    "Timestamp: $(timestamp)"
 ```

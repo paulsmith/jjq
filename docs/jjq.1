@@ -1,0 +1,394 @@
+.\" ABOUTME: Man page for jjq, a local merge queue for jj (Jujutsu VCS).
+.\" ABOUTME: Covers all commands, configuration, data model, and workflows.
+.TH JJQ 1 "2026-02-03" "jjq" "General Commands Manual"
+.SH NAME
+jjq \- local merge queue for jj
+.SH SYNOPSIS
+.B jjq init
+.RB [ \-\-trunk
+.IR bookmark ]
+.RB [ \-\-check
+.IR command ]
+.br
+.B jjq push
+.I revset
+.br
+.B jjq run
+.RB [ \-\-all ]
+.br
+.B jjq check
+.RB [ \-\-rev
+.IR revset ]
+.RB [ \-v ]
+.br
+.B jjq status
+.RI [ id ]
+.RB [ \-\-json ]
+.RB [ \-\-resolve
+.IR change_id ]
+.br
+.B jjq delete
+.I id
+.br
+.B jjq clean
+.br
+.B jjq doctor
+.br
+.B jjq config
+.RI [ key
+.RI [ value ]]
+.SH DESCRIPTION
+.B jjq
+is a local merge queue for
+.BR jj (1)
+(Jujutsu VCS).
+It queues revisions for merging to a trunk bookmark, processes them in
+FIFO order, and gates each merge on a configurable check command.
+This prevents the \(lqworks on my branch\(rq problem where changes pass
+checks individually but fail when combined with concurrent work.
+.PP
+.B jjq
+stores all state inside the jj repository using bookmarks and an
+isolated metadata branch.
+No external database or service is required.
+.SH COMMANDS
+.SS init \fR[\fB\-\-trunk \fIbookmark\fR] [\fB\-\-check \fIcommand\fR]
+Initialize jjq in the current repository.
+Sets up the metadata branch and configures the trunk bookmark and check
+command.
+.PP
+With
+.B \-\-trunk
+and
+.B \-\-check
+flags, runs non\-interactively.
+Without flags, prompts for each value.
+The trunk bookmark defaults to
+.B main
+if that bookmark exists, or
+.B master
+as a fallback.
+.PP
+If stdin is not a terminal and required flags are missing, exits with
+an error.
+.PP
+Refuses to run if jjq is already initialized.
+Use
+.B jjq config
+to change settings after initialization.
+.PP
+After configuration, runs
+.B jjq doctor
+to validate the setup.
+.SS push \fIrevset\fR
+Queue a revision for merging to trunk.
+The revset must resolve to exactly one revision.
+.PP
+Before queuing,
+.B jjq
+creates a temporary merge commit between the trunk and the candidate to
+check for textual conflicts.
+If conflicts are detected, the push is rejected with exit code 1.
+.PP
+Push is idempotent for the same change ID: if the change is already
+queued or failed, the stale entry is cleared and the revision is
+re\-queued.
+However, if the same change ID is already queued at a different commit
+ID (i.e., the revision has been amended), the push is rejected with
+exit code 10.
+.PP
+.RS
+.nf
+jjq push @              # queue the working copy
+jjq push feat\-xyz@      # queue a workspace's working copy
+jjq push abc123         # queue by change ID
+.fi
+.RE
+.SS run \fR[\fB\-\-all\fR]
+Process the next queued item.
+Creates a temporary jj workspace with two parents (trunk and candidate),
+then runs the configured check command inside it.
+.PP
+On success, the trunk bookmark advances to the merge commit and the
+temporary workspace is cleaned up.
+.PP
+On failure (conflicts or check command failure), the item moves to the
+failed list.
+The temporary workspace is preserved for debugging.
+.PP
+If the trunk bookmark moves during processing (e.g., another runner
+advanced it), the run aborts and instructs the user to retry.
+.PP
+With
+.BR \-\-all ,
+processes items in a loop until the queue is empty or an item fails.
+Reports the count of successes and failures.
+.PP
+Returns 0 if at least one item was processed successfully (or the queue
+was empty).
+Returns 1 if any item failed.
+.SS check \fR[\fB\-\-rev \fIrevset\fR] [\fB\-v\fR]
+Run the configured check command against a revision in a temporary
+workspace without any queue processing.
+Useful for verifying that the check command works before queuing items.
+.PP
+Defaults to the current working copy
+.RB ( @ )
+if
+.B \-\-rev
+is not specified.
+.PP
+With
+.BR \-v " (" \-\-verbose ),
+prints the workspace path, shell, and all environment variables before
+running the check command.
+Useful for diagnosing path or environment issues.
+.PP
+The temporary workspace is always cleaned up, regardless of outcome.
+Exits 0 if the check passes; 1 if it fails.
+.SS status \fR[\fIid\fR] [\fB\-\-json\fR] [\fB\-\-resolve \fIchange_id\fR]
+Display the current queue state: queued items (ascending by sequence ID)
+and recent failures (descending, up to
+.BR max_failures ).
+Each entry shows its sequence ID, change ID prefix, and first line of
+the commit description.
+.PP
+Also indicates if a run lock is currently held (another
+.B jjq run
+is in progress).
+.PP
+With
+.BR \-\-json ,
+outputs structured JSON with
+.BR running ,
+.BR queue ,
+and
+.B failed
+fields.
+Queue items include
+.BR change_id ,
+.BR commit_id ,
+and
+.BR description .
+Failed items include
+.BR candidate_change_id ,
+.BR candidate_commit_id ,
+.BR description
+(original candidate message),
+.BR trunk_commit_id ,
+.BR workspace_path ,
+and
+.BR failure_reason .
+.PP
+With a positional
+.IR id ,
+displays a single item's detail view (from either queue or failed).
+With
+.BR \-\-resolve ,
+looks up an item by its candidate change ID.
+.I id
+and
+.B \-\-resolve
+are mutually exclusive.
+.SS delete \fIid\fR
+Remove an item from the queue or the failed list by its sequence ID.
+The sequence ID is the number shown in
+.B status
+output and
+.B push
+confirmation messages.
+.SS clean
+Remove jjq workspaces left behind by failed merges.
+Lists each workspace removed.
+Safe to run at any time \(em only removes jjq\-owned workspaces, never
+user workspaces.
+.SS doctor
+Validate that the jjq environment is correctly configured.
+Checks the trunk bookmark, check command, lock state, and workspace
+preconditions.
+Each check is reported as
+.BR ok ,
+.BR WARN ,
+or
+.BR FAIL .
+When a check fails, a suggested fix is shown.
+.PP
+Exits 0 if no failures are found (warnings are tolerated).
+Exits 1 if any check fails.
+.SS config \fR[\fIkey\fR [\fIvalue\fR]]
+Get or set configuration.
+With no arguments, displays all configuration values.
+With one argument, displays that key's value.
+With two arguments, sets the key to the given value.
+.PP
+Valid keys:
+.TP
+.BR trunk_bookmark " (default: \(lqmain\(rq)"
+The bookmark that
+.B jjq
+treats as the protected trunk.
+All merges target this bookmark.
+.TP
+.BR check_command " (required)"
+Shell command to run in the merge workspace to validate a candidate.
+Should run tests, lints, type checks, or whatever gates your trunk.
+Exit 0 means pass; non\-zero means fail.
+.IP
+Set during
+.B jjq init
+or configured afterward with
+.BR "jjq config" .
+.TP
+.BR max_failures " (default: 3)"
+Number of recent failures shown by
+.BR status .
+.SH EXIT CODES
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Merge conflict or check command failure.
+.TP
+.B 3
+Lock held.
+Another
+.B jjq
+process is running.
+Retry later.
+.TP
+.B 10
+Usage error.
+Bad arguments, ambiguous revset, duplicate push of an amended revision,
+etc.
+.SH CONFIGURATION
+.B jjq
+stores configuration on an isolated metadata branch
+.RB ( jjq/_/_ )
+parented to the repository root.
+This branch never appears in normal
+.B jj log
+output and does not pollute user history.
+.PP
+Always configure
+.B check_command
+before using
+.BR "jjq run" .
+The default check command rejects everything.
+.SH LOCKING
+.B jjq
+uses flock\-based file locks in
+.I .jj/jjq\-locks/
+to coordinate concurrent access.
+Locks are released automatically by the OS when the holding process
+exits, so stale locks cannot occur.
+.TP
+.B id
+Protects sequence ID allocation (brief, during push).
+.TP
+.B config
+Protects configuration reads and writes.
+.TP
+.B run
+Ensures only one
+.B jjq run
+processes the queue at a time.
+.SH DATA MODEL
+Queue items are jj bookmarks named
+.BI jjq/queue/ NNNNNN
+where
+.I NNNNNN
+is a zero\-padded sequence ID.
+Failed items use
+.BI jjq/failed/ NNNNNN .
+The metadata branch at
+.B jjq/_/_
+stores the last allocated ID and all configuration.
+.PP
+Successful merges are ordinary jj commits with two parents (trunk and
+candidate) and descriptions like \(lqSuccess: merge N\(rq.
+Failed merges are preserved as conflicted commits with descriptions like
+\(lqFailed: merge N (conflicts)\(rq.
+.SH TYPICAL WORKFLOW
+Initialize a project:
+.PP
+.RS
+.nf
+jjq init \-\-trunk main \-\-check "make test && make lint"
+.fi
+.RE
+.PP
+Developer queues work:
+.PP
+.RS
+.nf
+jjq push @
+.fi
+.RE
+.PP
+Process the queue:
+.PP
+.RS
+.nf
+jjq run          # one item
+jjq run \-\-all    # drain the queue
+.fi
+.RE
+.PP
+Handle a failure:
+.PP
+.RS
+.nf
+jjq status                    # see what failed
+jj rebase \-r <rev> \-d main    # rebase onto current trunk
+\&... resolve conflicts ...
+jjq push <rev>                # re\-queue
+jjq run                       # retry
+.fi
+.RE
+.PP
+Clean up:
+.PP
+.RS
+.nf
+jjq clean
+.fi
+.RE
+.SH ENVIRONMENT
+.B jjq
+must be run from within a jj repository.
+It invokes
+.B jj
+as a subprocess and expects it to be on
+.BR PATH .
+.SH TIPS
+Configure
+.B jj log
+to hide jjq metadata bookmarks:
+.PP
+.RS
+.nf
+jj config set \-\-repo \(aqrevset\-aliases."trunk()"\(aq \e
+    \(aqmain | ancestors(main, 2)\(aq
+.fi
+.RE
+.PP
+The check command runs in a temporary workspace that has the merged
+state of trunk + candidate.
+Any command that works in a normal checkout works here.
+.PP
+Push is cheap.
+If you're unsure whether your revision will conflict, just push it \(em
+.B jjq
+checks for conflicts up front and rejects the push immediately.
+.PP
+For parallel development with multiple agents or developers, use jj
+workspaces.
+Each workspace gets its own isolated working copy branched from trunk.
+Push from each workspace independently and let
+.B jjq
+serialize the merges.
+.SH SEE ALSO
+.BR jj (1)
+.SH AUTHORS
+Paul Smith
