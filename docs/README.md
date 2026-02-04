@@ -253,7 +253,7 @@ sequence ID store and log.
 
 Users may configure:
 
-  - the check command (default is "sh -c 'exit 1'", to encourage a new user to configure it)
+  - the check command (required — must be set before first run)
   - the name of the trunk bookmark (default "main")
   - the number of most recent failed merges to display via the status command (default 3)
 

@@ -121,7 +121,7 @@ log = "~ ::jjq/_/_"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `trunk_bookmark` | `main` | Bookmark pointing to your trunk |
-| `check_command` | `sh -c 'exit 1'` | Command to run on merge candidates |
+| `check_command` | *(none — must be set before first run)* | Command to run on merge candidates |
 | `max_failures` | `3` | Number of recent failures to show in status |
 
 ## Copying

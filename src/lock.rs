@@ -1,36 +1,29 @@
-// ABOUTME: Filesystem-based locking using mkdir atomicity.
+// ABOUTME: Filesystem-based locking using flock via the fs2 crate.
 // ABOUTME: Implements the locking protocol from the jjq specification.
 
 use anyhow::{bail, Result};
-use std::fs;
+use fs2::FileExt;
+use std::fs::{self, File};
+use std::io;
 use std::path::PathBuf;
-use std::process::Command;
 
 use crate::jj;
 
-/// A held lock that releases on drop.
+/// A held lock that releases on drop (OS releases flock when File is dropped).
 pub struct Lock {
-    path: PathBuf,
+    _file: File,
 }
 
 impl Lock {
-    /// Try to acquire a named lock.
+    /// Try to acquire a named lock. Returns Ok(Some) if acquired, Ok(None) if
+    /// already held by another process.
     pub fn acquire(name: &str) -> Result<Option<Lock>> {
-        let lock_dir = get_lock_dir()?;
-        let lock_path = lock_dir.join(name);
-
-        // Ensure parent directory exists
-        fs::create_dir_all(&lock_dir)?;
-
-        // Try to create the lock directory atomically
-        match fs::create_dir(&lock_path) {
-            Ok(()) => {
-                // Write PID file
-                let pid_path = lock_path.join("pid");
-                fs::write(&pid_path, std::process::id().to_string())?;
-                Ok(Some(Lock { path: lock_path }))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        let path = lock_file_path(name)?;
+        fs::create_dir_all(path.parent().unwrap())?;
+        let file = File::create(&path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Lock { _file: file })),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -46,72 +39,45 @@ impl Lock {
     /// Release the lock explicitly.
     #[allow(dead_code)]
     pub fn release(self) {
-        // Drop handles this
         drop(self);
     }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-/// Check if a lock is currently held.
-pub fn is_held(name: &str) -> Result<bool> {
-    let lock_dir = get_lock_dir()?;
-    let lock_path = lock_dir.join(name);
-    Ok(lock_path.is_dir())
 }
 
 /// State of a named lock.
 pub enum LockState {
     Free,
-    HeldAlive(u32),
-    HeldDead(u32),
-    HeldUnknown,
+    Held,
 }
 
-/// Inspect the state of a named lock, including whether the holding process is alive.
+/// Inspect the state of a named lock.
 pub fn lock_state(name: &str) -> Result<LockState> {
-    let lock_dir = get_lock_dir()?;
-    let lock_path = lock_dir.join(name);
-
-    if !lock_path.is_dir() {
-        return Ok(LockState::Free);
-    }
-
-    let pid_path = lock_path.join("pid");
-    let pid_str = match fs::read_to_string(&pid_path) {
-        Ok(s) => s,
-        Err(_) => return Ok(LockState::HeldUnknown),
+    let path = lock_file_path(name)?;
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(LockState::Free),
+        Err(e) => return Err(e.into()),
     };
-
-    let pid: u32 = match pid_str.trim().parse() {
-        Ok(p) => p,
-        Err(_) => return Ok(LockState::HeldUnknown),
-    };
-
-    let alive = Command::new("sh")
-        .args(["-c", &format!("kill -0 {} 2>/dev/null", pid)])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if alive {
-        Ok(LockState::HeldAlive(pid))
-    } else {
-        Ok(LockState::HeldDead(pid))
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            file.unlock()?;
+            Ok(LockState::Free)
+        }
+        Err(_) => Ok(LockState::Held),
     }
+}
+
+/// Check if a lock is currently held.
+pub fn is_held(name: &str) -> Result<bool> {
+    Ok(matches!(lock_state(name)?, LockState::Held))
 }
 
 /// Get the filesystem path for a named lock (for diagnostic messages).
 pub fn lock_path(name: &str) -> Result<PathBuf> {
-    Ok(get_lock_dir()?.join(name))
+    lock_file_path(name)
 }
 
-/// Get the lock directory path.
-fn get_lock_dir() -> Result<PathBuf> {
+/// Get the lock file path for a named lock.
+fn lock_file_path(name: &str) -> Result<PathBuf> {
     let root = jj::repo_root()?;
-    Ok(root.join(".jj").join("jjq-locks"))
+    Ok(root.join(".jj").join("jjq-locks").join(format!("{}.lock", name)))
 }

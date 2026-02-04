@@ -133,12 +133,15 @@ The bookmark that
 treats as the protected trunk.
 All merges target this bookmark.
 .TP
-.BR check_command " (default: \(lqsh \-c 'exit 1'\(rq)"
+.BR check_command " (required)"
 Shell command to run in the merge workspace to validate a candidate.
 Should run tests, lints, type checks, or whatever gates your trunk.
 Exit 0 means pass; non\-zero means fail.
 .IP
-The default rejects everything, forcing explicit configuration.
+Must be configured before running
+.B jjq push
+or
+.BR "jjq run" .
 .TP
 .BR max_failures " (default: 3)"
 Number of recent failures shown by

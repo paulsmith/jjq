@@ -106,12 +106,12 @@
              The bookmark that jjq treats as the protected trunk. All merges
              target this bookmark.
 
-         check_command (default: "sh -c 'exit 1'")
+         check_command (required)
              Shell command to run in the merge workspace to validate a
              candidate. Should run tests, lints, type checks, or whatever
              gates your trunk. Exit 0 means pass; non-zero means fail.
 
-             The default rejects everything, forcing explicit configuration.
+             Must be configured before running jjq push or jjq run.
 
          max_failures (default: 3)
              Number of recent failures shown by status.
@@ -134,8 +134,7 @@
          parented to the repository root. This branch never appears in normal
          jj log output and does not pollute user history.
 
-         Always configure check_command before using jjq run. The default
-         check command rejects everything.
+         Always configure check_command before using jjq run.
 
   LOCKING
          jjq uses filesystem-based locks (atomic mkdir) in .jj/jjq-locks/
