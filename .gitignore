@@ -1,7 +1,6 @@
 test/
 .workspaces/
 .jj-*
-.ws/
 /target
 result
 *.pending-snap

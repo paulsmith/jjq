@@ -3,6 +3,15 @@
 # ABOUTME: Generates test repo, queues PRs, and processes merges including conflict handling.
 set -euo pipefail
 
+# Portable in-place sed: GNU sed uses -i, BSD sed uses -i ''
+sedi() {
+    if sed --version 2>&1 | grep -q GNU; then
+        sed -i "$@"
+    else
+        sed -i '' "$@"
+    fi
+}
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 JJQ_BIN="${JJQ_BIN:-jjq}"
 # Resolve relative paths to absolute (needed since test runs in temp dir)
@@ -20,7 +29,7 @@ export PATH="$SCRIPT_DIR:$PATH"
 #=============================================================================
 resolve_jj_conflict() {
     local file="$1"
-    sed -i '' '/^<<<<<<</d; /^+++++++/d; /^%%%%%%%/d; /^\\\\\\\\/d; /^>>>>>>>/d; /^ 	/d; s/^+	/	/' "$file"
+    sedi '/^<<<<<<</d; /^+++++++/d; /^%%%%%%%/d; /^\\\\\\\\/d; /^>>>>>>>/d; /^ 	/d; s/^+	/	/' "$file"
 }
 
 #=============================================================================
@@ -39,8 +48,8 @@ func Greet(name string) string {
     return "Hello, " + name + "!"
 }
 EOF
-    sed -i '' $'/import "fmt"/a\\\nimport "example\/jjdemo/say"' main.go
-    sed -i '' 's/fmt\.Println\(.*\)/fmt.Println(say.Greet("world"))/' main.go
+    sedi $'/import "fmt"/a\\\nimport "example\/jjdemo/say"' main.go
+    sedi 's/fmt\.Println\(.*\)/fmt.Println(say.Greet("world"))/' main.go
     go fmt ./...
 }
 pr1_resolve() { :; }  # No conflicts - merges cleanly
@@ -57,9 +66,9 @@ func Bye() string {
     return "Goodbye."
 }
 EOF
-    sed -i '' $'/import "fmt"/a\\\nimport "example\/jjdemo/say"' main.go
-    sed -i '' $'/fmt\.Println/a\\\n\tfmt.Println(say.Bye())' main.go
-    sed -i '' 's/"Hello, world!\\n"/"Hello, world!\\nGoodbye.\\n"/' main_test.go
+    sedi $'/import "fmt"/a\\\nimport "example\/jjdemo/say"' main.go
+    sedi $'/fmt\.Println/a\\\n\tfmt.Println(say.Bye())' main.go
+    sedi 's/"Hello, world!\\n"/"Hello, world!\\nGoodbye.\\n"/' main_test.go
     go fmt ./...
 }
 pr2_resolve() {
@@ -70,14 +79,14 @@ pr2_resolve() {
 # CONFLICTS: pr1 changed the Println line that pr3's diff references
 # Resolution: Take trunk's main.go, add the comment before first Println
 pr3_create() {
-    sed -i '' $'/func main/a\\\n\t\/\/ say hi' main.go
+    sedi $'/func main/a\\\n\t\/\/ say hi' main.go
     go fmt ./...
 }
 pr3_resolve() {
     # pr3's intent: add "// say hi" before the print statements
     # Take trunk's main.go and insert the comment - this handles any trunk state
     jj file show main.go -r main > main.go
-    sed -i '' 's/fmt\.Println(say\.Greet/\/\/ say hi\'$'\n\tfmt.Println(say.Greet/' main.go
+    sedi 's/fmt\.Println(say\.Greet/\/\/ say hi\'$'\n\tfmt.Println(say.Greet/' main.go
 }
 
 # pr4: Add readme - no code changes
@@ -272,6 +281,10 @@ cmd_run() {
         fi
         echo ""
     done
+
+    echo ""
+    echo "Cleaning up any dangling workspaces"
+    "$JJQ_BIN" clean
 
     echo ""
     echo "=== Final status ==="
