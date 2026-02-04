@@ -15,7 +15,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "jjq", about = "Local merge queue for jj")]
+#[command(name = "jjq", about = "Local merge queue for jj", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
