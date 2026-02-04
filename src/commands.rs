@@ -796,10 +796,6 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
         return Ok(());
     }
 
-    let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
-    let max_failures = config::get_max_failures()?;
-    drop(_config_lock);
-
     let running = lock::is_held("run")?;
 
     let queue_ids = queue::get_queue()?;
@@ -812,7 +808,6 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
 
     let failed_items: Vec<FailedItem> = failed_ids
         .iter()
-        .take(max_failures as usize)
         .map(|&id| build_failed_item(id))
         .collect::<Result<_>>()?;
 
@@ -990,14 +985,12 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
             let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
             let trunk = config::get_trunk_bookmark()?;
             let check = config::get_check_command()?;
-            let max_fail = config::get_max_failures()?;
 
             println!("trunk_bookmark = {}", trunk);
             println!(
                 "check_command = {}",
                 check.unwrap_or_else(|| "(not set)".to_string())
             );
-            println!("max_failures = {}", max_fail);
             Ok(())
         }
         (Some(k), None) => {
@@ -1015,7 +1008,6 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
                 let value = match k {
                     "trunk_bookmark" => config::DEFAULT_TRUNK_BOOKMARK.to_string(),
                     "check_command" => String::new(),
-                    "max_failures" => config::DEFAULT_MAX_FAILURES.to_string(),
                     _ => unreachable!(),
                 };
                 println!("{}", value);
@@ -1026,7 +1018,6 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
             let value = match k {
                 "trunk_bookmark" => config::get_trunk_bookmark()?,
                 "check_command" => config::get_check_command()?.unwrap_or_default(),
-                "max_failures" => config::get_max_failures()?.to_string(),
                 _ => unreachable!(),
             };
             println!("{}", value);
