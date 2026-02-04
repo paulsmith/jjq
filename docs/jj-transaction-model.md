@@ -163,11 +163,12 @@ requiring true mutex semantics must implement external locking.
 
 ---
 
-## jjq's Solution: mkdir-based Locking
+## jjq's Solution: flock-based Locking
 
-jjq uses `mkdir(2)` atomicity for true mutual exclusion. The `mkdir` system
-call is atomic: it either succeeds (directory created, lock acquired) or fails
-(directory exists, lock held by another process). There is no race window.
+jjq uses flock-based file locks for true mutual exclusion. A process acquires
+an exclusive flock on a lock file; the OS guarantees that only one process
+holds the lock at a time. If the holding process exits (even via crash or
+signal), the OS releases the lock automatically.
 
 ### Implementation
 
@@ -175,55 +176,20 @@ Lock files are stored in `.jj/jjq-locks/` within the repository:
 
 ```
 .jj/jjq-locks/
-├── id/          # Sequence ID lock (held during push/retry)
-│   └── pid      # PID of lock holder
-└── run/         # Run lock (held during queue processing)
-    └── pid      # PID of lock holder
+├── id.lock      # Sequence ID lock (held during push/retry)
+└── run.lock     # Run lock (held during queue processing)
 ```
 
-### Lock Acquisition
-
-```bash
-acquire_lock() {
-    local name="$1"
-    local lockdir="${JJQ_LOCK_DIR}/${name}"
-
-    if mkdir "$lockdir" 2>/dev/null; then
-        echo $$ > "$lockdir/pid"
-        return 0
-    fi
-    return 1
-}
-```
-
-The `mkdir` succeeds atomically or fails—no TOCTOU race possible.
+A lock is acquired by opening the file and calling `try_lock_exclusive()`.
+The lock is released when the file handle is closed (explicitly or on process
+exit).
 
 ### Advantages Over Bookmark-based Locking
 
-| Aspect | Bookmark Lock | mkdir Lock |
+| Aspect | Bookmark Lock | flock Lock |
 |--------|---------------|------------|
-| Atomicity | Race window exists | Truly atomic |
-| Portability | Requires jj | POSIX standard |
-| Visibility | `jj log` shows lock | `ls .jj/jjq-locks/` |
-| Stale detection | Manual bookmark delete | PID file enables detection |
-| Complexity | jj transaction overhead | Simple syscall |
-
-### Stale Lock Recovery
-
-If a process crashes while holding a lock, the lock directory remains. Users
-can detect stale locks by checking if the PID in the lock directory is still
-running:
-
-```bash
-# Check if lock holder is still alive
-if [ -f .jj/jjq-locks/run/pid ]; then
-    pid=$(cat .jj/jjq-locks/run/pid)
-    if ! kill -0 "$pid" 2>/dev/null; then
-        echo "Stale lock from dead process $pid"
-        rm -rf .jj/jjq-locks/run
-    fi
-fi
-```
-
-This is left as a manual operation; automatic stale lock detection risks
-incorrectly breaking locks on systems where PIDs wrap around quickly.
+| Atomicity | Race window exists | Kernel-enforced exclusion |
+| Portability | Requires jj | Supported on all major OSes |
+| Stale locks | Manual bookmark delete | Impossible (OS releases on exit) |
+| Holder info | None | None (Free/Held only) |
+| Complexity | jj transaction overhead | Single syscall |

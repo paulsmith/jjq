@@ -181,11 +181,11 @@ before using
 The default check command rejects everything.
 .SH LOCKING
 .B jjq
-uses filesystem\-based locks (atomic
-.BR mkdir (2))
-in
+uses flock\-based file locks in
 .I .jj/jjq\-locks/
-to coordinate concurrent access:
+to coordinate concurrent access.
+Locks are released automatically by the OS when the holding process
+exits, so stale locks cannot occur.
 .TP
 .B id
 Protects sequence ID allocation (brief, during push).
@@ -197,10 +197,6 @@ Protects configuration reads and writes.
 Ensures only one
 .B jjq run
 processes the queue at a time.
-.PP
-If a lock is stale (e.g., from a crashed process), delete the
-corresponding directory under
-.IR .jj/jjq\-locks/ .
 .SH DATA MODEL
 Queue items are jj bookmarks named
 .BI jjq/queue/ NNNNNN

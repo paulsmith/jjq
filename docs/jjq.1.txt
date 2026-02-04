@@ -137,17 +137,15 @@
          Always configure check_command before using jjq run.
 
   LOCKING
-         jjq uses filesystem-based locks (atomic mkdir) in .jj/jjq-locks/
-         to coordinate concurrent access:
+         jjq uses flock-based file locks in .jj/jjq-locks/ to coordinate
+         concurrent access. Locks are released automatically by the OS
+         when the holding process exits, so stale locks cannot occur.
 
          id     Protects sequence ID allocation (brief, during push).
 
          config Protects configuration reads and writes.
 
          run    Ensures only one jjq run processes the queue at a time.
-
-         If a lock is stale (e.g., from a crashed process), delete the
-         corresponding directory under .jj/jjq-locks/.
 
   DATA MODEL
          Queue items are jj bookmarks named jjq/queue/NNNNNN where NNNNNN
