@@ -1415,3 +1415,74 @@ fn test_tail_all_flag() {
     assert!(output.contains("line2"), "should show all output: {}", output);
     assert!(output.contains("line3"), "should show all output: {}", output);
 }
+
+#[test]
+fn test_run_failure_shows_output() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_with_check("echo 'build failed: missing dependency' && exit 1");
+
+    run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
+    fs::write(repo.path().join("file.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "fail-branch"]);
+    repo.jjq_success(&["push", "fail-branch"]);
+
+    let output = repo.jjq_failure(&["run"]);
+    assert!(
+        output.contains("build failed: missing dependency"),
+        "should show check command output on failure: {}",
+        output
+    );
+}
+
+#[test]
+fn test_run_creates_log_file() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
+    fs::write(repo.path().join("newfile.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "simple-branch"]);
+    repo.jjq_success(&["push", "simple-branch"]);
+    repo.jjq_success(&["run"]);
+
+    let log_path = repo.path().join(".jj").join("jjq-run.log");
+    assert!(log_path.exists(), "run log file should exist after run");
+
+    let contents = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        contents.contains("--- jjq: run complete"),
+        "log should contain sentinel: {}",
+        contents
+    );
+}
+
+#[test]
+fn test_log_file_truncated_between_runs() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_with_check("echo run-output-marker");
+
+    // First run
+    run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
+    fs::write(repo.path().join("f1.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f1"]);
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["run"]);
+
+    // Second run
+    run_jj(repo.path(), &["new", "-m", "feature 2", "main"]);
+    fs::write(repo.path().join("f2.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f2"]);
+    repo.jjq_success(&["push", "f2"]);
+    repo.jjq_success(&["run"]);
+
+    let log_path = repo.path().join(".jj").join("jjq-run.log");
+    let contents = fs::read_to_string(&log_path).unwrap();
+
+    // Log should contain exactly one sentinel (file was truncated)
+    let sentinel_count = contents.matches("--- jjq: run complete").count();
+    assert_eq!(
+        sentinel_count, 1,
+        "log should contain exactly one sentinel after truncation, got {}: {}",
+        sentinel_count, contents
+    );
+}
