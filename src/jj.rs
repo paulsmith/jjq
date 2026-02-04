@@ -174,18 +174,6 @@ pub fn has_conflicts(revset: &str) -> Result<bool> {
     Ok(!output.trim().is_empty())
 }
 
-/// Get log info for a revision (change_id + description first line).
-pub fn get_log_info(revset: &str) -> Result<String> {
-    run_ok(&[
-        "log",
-        "-r",
-        revset,
-        "--no-graph",
-        "-T",
-        "change_id.short() ++ \" \" ++ description.first_line()",
-    ])
-    .map(|s| s.trim().to_string())
-}
 
 /// Create a new revision with given parent(s).
 pub fn new_rev(parents: &[&str]) -> Result<String> {

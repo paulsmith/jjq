@@ -8,11 +8,39 @@ use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
+use serde::Serialize;
+
 use crate::config;
 use crate::exit_codes::{self, ExitError};
 use crate::jj;
 use crate::lock::{self, Lock};
 use crate::queue;
+
+#[derive(Serialize)]
+struct StatusOutput {
+    running: bool,
+    queue: Vec<QueueItem>,
+    failed: Vec<FailedItem>,
+}
+
+#[derive(Serialize)]
+struct QueueItem {
+    id: u32,
+    change_id: String,
+    commit_id: String,
+    description: String,
+}
+
+#[derive(Serialize)]
+struct FailedItem {
+    id: u32,
+    candidate_change_id: String,
+    candidate_commit_id: String,
+    description: String,
+    trunk_commit_id: String,
+    workspace_path: String,
+    failure_reason: String,
+}
 
 /// Output with jjq: prefix to stdout.
 fn prefout(msg: &str) {
@@ -38,10 +66,10 @@ fn extract_id_from_bookmark(bookmark: &str) -> u32 {
 fn extract_trailers(description: &str) -> HashMap<String, String> {
     let mut trailers = HashMap::new();
     for line in description.lines() {
-        if let Some(rest) = line.strip_prefix("jjq-") {
-            if let Some((key, value)) = rest.split_once(": ") {
-                trailers.insert(key.to_string(), value.trim().to_string());
-            }
+        if let Some(rest) = line.strip_prefix("jjq-")
+            && let Some((key, value)) = rest.split_once(": ")
+        {
+            trailers.insert(key.to_string(), value.trim().to_string());
         }
     }
     trailers
@@ -483,54 +511,205 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
     }
 }
 
+/// Build a QueueItem by resolving data from the bookmark target.
+fn build_queue_item(id: u32) -> Result<QueueItem> {
+    let bookmark = queue::queue_bookmark(id);
+    let revset = format!("bookmarks(exact:{})", bookmark);
+    let (change_id, commit_id) = jj::resolve_revset_full(&revset)?;
+    let description = jj::get_description(&revset)?;
+    let description = description.lines().next().unwrap_or("").to_string();
+    Ok(QueueItem { id, change_id, commit_id, description })
+}
+
+/// Build a FailedItem by parsing trailers from the bookmark target description.
+fn build_failed_item(id: u32) -> Result<FailedItem> {
+    let bookmark = queue::failed_bookmark(id);
+    let revset = format!("bookmarks(exact:{})", bookmark);
+    let desc = jj::get_description(&revset)?;
+    let trailers = extract_trailers(&desc);
+
+    let candidate_change_id = trailers.get("candidate").cloned().unwrap_or_default();
+    let candidate_commit_id = trailers.get("candidate-commit").cloned().unwrap_or_default();
+    let trunk_commit_id = trailers.get("trunk").cloned().unwrap_or_default();
+    let workspace_path = trailers.get("workspace").cloned().unwrap_or_default();
+    let failure_reason = trailers.get("failure").cloned().unwrap_or_default();
+
+    // Resolve original candidate description from the candidate change ID
+    let description = if !candidate_change_id.is_empty() {
+        jj::get_description(&candidate_change_id)
+            .map(|d| d.lines().next().unwrap_or("").to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    Ok(FailedItem {
+        id,
+        candidate_change_id,
+        candidate_commit_id,
+        description,
+        trunk_commit_id,
+        workspace_path,
+        failure_reason,
+    })
+}
+
 /// Display queue status.
-pub fn status() -> Result<()> {
+pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()> {
+    // Single-item modes
+    if id.is_some() || resolve.is_some() {
+        return status_single(id, json, resolve);
+    }
+
     if !config::is_initialized()? {
-        prefout("jjq not initialized (run 'jjq push <revset>' to start)");
+        if json {
+            let output = StatusOutput {
+                running: false,
+                queue: vec![],
+                failed: vec![],
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            prefout("jjq not initialized (run 'jjq push <revset>' to start)");
+        }
         return Ok(());
     }
 
-    // Acquire config lock to read settings
     let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
     let max_failures = config::get_max_failures()?;
     drop(_config_lock);
 
-    // Check for active run
-    if lock::is_held("run")? {
-        prefout("Run in progress");
-        println!();
-    }
+    let running = lock::is_held("run")?;
 
-    let queue_items = queue::get_queue()?;
-    let failed_items = queue::get_failed()?;
+    let queue_ids = queue::get_queue()?;
+    let failed_ids = queue::get_failed()?;
 
-    if queue_items.is_empty() && failed_items.is_empty() {
-        prefout("queue is empty");
-        return Ok(());
-    }
+    let queue_items: Vec<QueueItem> = queue_ids
+        .iter()
+        .map(|&id| build_queue_item(id))
+        .collect::<Result<_>>()?;
 
-    if !queue_items.is_empty() {
-        prefout("Queued:");
-        for id in &queue_items {
-            let bookmark = queue::queue_bookmark(*id);
-            let info = jj::get_log_info(&format!("bookmarks(exact:{})", bookmark))?;
-            println!("  {}: {}", id, info);
-        }
-    }
+    let failed_items: Vec<FailedItem> = failed_ids
+        .iter()
+        .take(max_failures as usize)
+        .map(|&id| build_failed_item(id))
+        .collect::<Result<_>>()?;
 
-    if !failed_items.is_empty() {
-        if !queue_items.is_empty() {
+    if json {
+        let output = StatusOutput {
+            running,
+            queue: queue_items,
+            failed: failed_items,
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        if running {
+            prefout("Run in progress");
             println!();
         }
-        prefout("Failed (recent):");
-        for id in failed_items.iter().take(max_failures as usize) {
-            let bookmark = queue::failed_bookmark(*id);
-            let info = jj::get_log_info(&format!("bookmarks(exact:{})", bookmark))?;
-            println!("  {}: {}", id, info);
+
+        if queue_items.is_empty() && failed_items.is_empty() {
+            prefout("queue is empty");
+            return Ok(());
+        }
+
+        if !queue_items.is_empty() {
+            prefout("Queued:");
+            for item in &queue_items {
+                println!("  {}: {} {}", item.id, item.change_id, item.description);
+            }
+        }
+
+        if !failed_items.is_empty() {
+            if !queue_items.is_empty() {
+                println!();
+            }
+            prefout("Failed (recent):");
+            for item in &failed_items {
+                println!("  {}: {} {}", item.id, item.candidate_change_id, item.description);
+            }
         }
     }
 
     Ok(())
+}
+
+fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()> {
+    let (item_id, is_queued) = if let Some(id_str) = id {
+        let id = queue::parse_seq_id(id_str)?;
+        if queue::queue_item_exists(id)? {
+            (id, true)
+        } else if queue::failed_item_exists(id)? {
+            (id, false)
+        } else {
+            bail!("item {} not found in queue or failed", id)
+        }
+    } else if let Some(change_id) = resolve {
+        find_by_change_id(change_id)?
+    } else {
+        unreachable!()
+    };
+
+    if is_queued {
+        let item = build_queue_item(item_id)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&item)?);
+        } else {
+            println!("Queue item {}", item.id);
+            println!("  Change ID:   {}", item.change_id);
+            println!("  Commit ID:   {}", item.commit_id);
+            println!("  Description: {}", item.description);
+        }
+    } else {
+        let item = build_failed_item(item_id)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&item)?);
+        } else {
+            println!("Failed item {}", item.id);
+            println!("  Candidate:   {} ({})", item.candidate_change_id, item.candidate_commit_id);
+            println!("  Description: {}", item.description);
+            println!("  Failure:     {}", item.failure_reason);
+            println!("  Trunk:       {}", item.trunk_commit_id);
+            println!("  Workspace:   {}", item.workspace_path);
+            println!();
+            println!("To resolve:");
+            println!("  1. Fix the issue and create a new revision");
+            println!("  2. Run: jjq push <fixed-revset>");
+        }
+    }
+
+    Ok(())
+}
+
+/// Find a queue or failed item by candidate change ID.
+/// Returns (sequence_id, is_queued).
+fn find_by_change_id(change_id: &str) -> Result<(u32, bool)> {
+    // Search queue items
+    let queue_ids = queue::get_queue()?;
+    for id in &queue_ids {
+        let bookmark = queue::queue_bookmark(*id);
+        let revset = format!("bookmarks(exact:{})", bookmark);
+        if let Ok(item_change_id) = jj::resolve_revset(&revset)
+            && item_change_id == change_id
+        {
+            return Ok((*id, true));
+        }
+    }
+
+    // Search failed items
+    let failed_ids = queue::get_failed()?;
+    for id in &failed_ids {
+        let bookmark = queue::failed_bookmark(*id);
+        let revset = format!("bookmarks(exact:{})", bookmark);
+        if let Ok(desc) = jj::get_description(&revset) {
+            let trailers = extract_trailers(&desc);
+            if trailers.get("candidate").map(|s| s.as_str()) == Some(change_id) {
+                return Ok((*id, false));
+            }
+        }
+    }
+
+    bail!("no item found with candidate change ID '{}'", change_id)
 }
 
 /// Delete an item from queue or failed list.
