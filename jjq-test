@@ -247,7 +247,7 @@ cmd_run() {
             echo "  Conflicts detected (was: $original_pr) - resolving..."
 
             # Rebase the original PR onto current main
-            jj rebase -r "$original_pr" -d main >/dev/null 2>&1
+            jj rebase -b "$original_pr" -o main >/dev/null 2>&1
 
             # Resolve conflicts on the rebased revision
             fix_dir=$(mktemp -d)

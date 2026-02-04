@@ -23,7 +23,7 @@ AS AN AGENT
 
 RESOLVING FAILURES
   If your push was marked failed (conflict or check failure):
-    1. jj rebase -r <your-rev> -d <trunk-bookmark>
+    1. jj rebase -b <your-rev> -o <trunk-bookmark>
     2. Resolve any conflict markers in the affected files
     3. Verify: run the project's check command
     4. jjq push @        Re-push (automatically clears the failed entry)
