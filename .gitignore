@@ -4,3 +4,4 @@ test/
 .ws/
 /target
 result
+*.pending-snap

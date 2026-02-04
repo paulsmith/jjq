@@ -30,6 +30,9 @@ enum Commands {
         /// Process all queued items until empty or failure
         #[arg(long)]
         all: bool,
+        /// Stop processing on first failure (only with --all)
+        #[arg(long)]
+        stop_on_failure: bool,
     },
     /// Display current queue state
     Status,
@@ -68,7 +71,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Push { revset } => commands::push(&revset),
-        Commands::Run { all } => commands::run(all),
+        Commands::Run { all, stop_on_failure } => commands::run(all, stop_on_failure),
         Commands::Status => commands::status(),
         Commands::Delete { id } => commands::delete(&id),
         Commands::Clean => commands::clean(),

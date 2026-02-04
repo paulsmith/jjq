@@ -42,6 +42,18 @@ Process the next item in the queue:
 jjq run
 ```
 
+Drain the entire queue (continues past failures):
+
+```sh
+jjq run --all
+```
+
+Stop at the first failure instead:
+
+```sh
+jjq run --all --stop-on-failure
+```
+
 ### Check status
 
 ```sh

@@ -1,0 +1,45 @@
+ Highest Impact
+
+  - Add jjq retry <failed-id> [--rev <revset>] [--rebase]:
+      - Automates the common recovery loop: find failed item → rebase onto trunk → requeue.
+      - This would have removed most of the manual work from failures 3, 4, and 6.
+  - Add jjq run --all --continue-on-failure (or make it default, with --stop-on-failure):
+      - In my run, --all stopped at first failure, which slowed queue draining.
+      - Pick one semantics and make docs/man/spec all match it.
+  - Add jjq doctor:
+      - Validates trunk bookmark, check command, lock state, and workspace preconditions.
+      - Catches common config errors before queue items fail.
+
+  Check Command / Validation UX
+
+  - Add jjq check [--rev <revset>]:
+      - Runs configured check command once outside queue processing to verify it’s sane.
+      - Would have caught my GOCACHE path problem before queue item 1 failed.
+  - Improve check failure diagnostics:
+      - Parse and classify known setup errors (env/path/tooling) and print “likely config
+        issue” vs “code issue”.
+  - Document check runtime environment clearly:
+      - Exact cwd, shell, env inheritance, and path requirements (absolute vs relative).
+
+  Status / Observability
+
+  - Make status show richer metadata for queue+failed items:
+      - candidate change ID, candidate commit ID, trunk-at-queue-time, and failed workspace
+        path.
+  - Add jjq status --json:
+      - Essential for agent orchestration and reliable automation.
+  - Add jjq show <id>:
+      - Single-item deep view (history, failure reason, recovery hints).
+
+  Docs / Onboarding
+
+  - Add jjq init wizard:
+      - Sets trunk_bookmark, check_command, runs jjq check, and writes a starter config.
+  - Add an “Agent/Multi-workspace cookbook” section:
+      - Concrete flow for jj workspace add, jjq push, conflict recovery, and re-queue
+        patterns.
+  - Tighten error hints:
+      - Every failure should include the next exact command(s), not just general guidance.
+
+  If I had to pick just 3 to build first: retry, doctor/check, and richer status (+
+  --json).

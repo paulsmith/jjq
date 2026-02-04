@@ -191,9 +191,9 @@ pub fn push(revset: &str) -> Result<()> {
 }
 
 /// Process queue items.
-pub fn run(all: bool) -> Result<()> {
+pub fn run(all: bool, stop_on_failure: bool) -> Result<()> {
     if all {
-        run_all()
+        run_all(stop_on_failure)
     } else {
         match run_one()? {
             RunResult::Success => Ok(()),
@@ -209,8 +209,9 @@ enum RunResult {
     Failure(i32, String),
 }
 
-fn run_all() -> Result<()> {
+fn run_all(stop_on_failure: bool) -> Result<()> {
     let mut merged_count = 0u32;
+    let mut failed_count = 0u32;
 
     loop {
         match run_one()? {
@@ -221,15 +222,25 @@ fn run_all() -> Result<()> {
                 break;
             }
             RunResult::Failure(_code, msg) => {
-                if merged_count > 0 {
-                    prefout(&format!("processed {} item(s) before failure", merged_count));
+                if stop_on_failure {
+                    if merged_count > 0 {
+                        prefout(&format!("processed {} item(s) before failure", merged_count));
+                    }
+                    return Err(ExitError::new(exit_codes::CONFLICT, msg).into());
                 }
-                return Err(ExitError::new(exit_codes::CONFLICT, msg).into());
+                failed_count += 1;
             }
         }
     }
 
-    if merged_count > 0 {
+    if merged_count > 0 || failed_count > 0 {
+        if failed_count > 0 {
+            prefout(&format!("processed {} item(s), {} failed", merged_count, failed_count));
+            return Err(ExitError::new(
+                exit_codes::PARTIAL,
+                format!("processed {} item(s), {} failed", merged_count, failed_count),
+            ).into());
+        }
         prefout(&format!("processed {} item(s)", merged_count));
     }
     Ok(())

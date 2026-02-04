@@ -40,7 +40,8 @@ interpreted as described in RFC 2119.
 - `[optional]` denotes optional elements
 - Bookmark names are shown in monospace: `jjq/queue/000001`
 - Exit codes: 0 indicates success, 1 indicates operational failure,
-  2 indicates usage error
+  2 indicates partial success (some items succeeded, some failed),
+  3 indicates lock contention, 10 indicates usage error
 
 ## jj Dependency
 
@@ -431,15 +432,19 @@ Queue a revision for merging to trunk.
 ### run
 
 ```
-jjq run [--all]
+jjq run [--all] [--stop-on-failure]
 ```
 
 Process the next item in the queue, or all items if `--all` is specified.
 
 #### Options
 
-- `--all`: Process all queued items in sequence until the queue is empty
-  or a failure occurs. On success, outputs a summary of items processed.
+- `--all`: Process all queued items in sequence until the queue is empty.
+  Failed items are moved to the failed list and processing continues with
+  the next item. On completion, outputs a summary of items processed and
+  failures.
+- `--stop-on-failure`: Only meaningful with `--all`. Stops processing at
+  the first failure instead of continuing to the next item.
 
 #### Behavior
 
@@ -510,14 +515,18 @@ Process the next item in the queue, or all items if `--all` is specified.
 **Batch mode (`--all`):**
 
 When invoked with `--all`, the run command processes items repeatedly
-until the queue is empty or a failure occurs:
+until the queue is empty:
 
 1. Execute the single item behavior (steps 1-12 above).
 2. If the item succeeded (step 12), loop back to step 1.
-3. If the queue was empty (step 1), output a summary of items processed
-   (if any) and exit with code 0.
-4. If any failure occurred (steps 8, 10, or 11), output a summary of
-   items processed before the failure (if any) and exit with code 1.
+3. If the item failed (steps 8, 10, or 11):
+   - If `--stop-on-failure` is set, output a summary of items processed
+     before the failure (if any) and exit with code 1.
+   - Otherwise, continue to step 1 (process the next item).
+4. If the queue was empty (step 1), output a summary of items processed
+   and failures (if any):
+   - If all items succeeded, exit with code 0.
+   - If some items succeeded and some failed, exit with code 2.
 
 The run lock is acquired and released for each individual item, not
 held for the entire batch. This allows inspection of intermediate
@@ -533,6 +542,7 @@ states between items if needed.
 | Merge has conflicts                | 1         |
 | Check command exits non-zero       | 1         |
 | Trunk moved during run             | 1         |
+| Partial success (--all, no --stop-on-failure) | 2 |
 
 #### Workspace Behavior
 

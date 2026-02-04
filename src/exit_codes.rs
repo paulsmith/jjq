@@ -4,6 +4,7 @@
 use std::fmt;
 
 pub const CONFLICT: i32 = 1;
+pub const PARTIAL: i32 = 2;
 pub const LOCK_HELD: i32 = 3;
 pub const USAGE: i32 = 10;
 

@@ -842,7 +842,7 @@ fn test_log_hint_shown_once_when_forced() {
 }
 
 #[test]
-fn test_run_all_stops_on_first_failure() {
+fn test_run_all_stop_on_failure_flag() {
     let repo = TestRepo::with_go_project();
     repo.jjq_success(&["config", "check_command", "true"]);
 
@@ -874,7 +874,7 @@ fn test_run_all_stops_on_first_failure() {
     repo.jjq_success(&["push", "f3"]);
 
     // run --all should process f1, fail on f2 (conflict), and STOP (not process f3)
-    let output = repo.jjq_output(&["run", "--all"]);
+    let output = repo.jjq_output(&["run", "--all", "--stop-on-failure"]);
     assert!(output.contains("merged 1 to main"), "f1 should merge: {}", output);
     assert!(output.contains("merge 2 has conflicts"), "f2 should conflict: {}", output);
     assert!(!output.contains("merged 3 to main"), "f3 should NOT be processed: {}", output);
@@ -883,6 +883,85 @@ fn test_run_all_stops_on_first_failure() {
     // f3 should still be in the queue
     let status = repo.jjq_success(&["status"]);
     assert!(status.contains("feature 3"), "f3 should still be queued: {}", status);
+}
+
+#[test]
+fn test_run_all_continues_on_failure() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["config", "check_command", "true"]);
+
+    // f1: modifies main.go (will merge cleanly against trunk)
+    run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
+    fs::write(
+        repo.path().join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 1\")\n}\n",
+    )
+    .unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f1"]);
+
+    // f2: also modifies main.go differently — will conflict after f1 merges
+    run_jj(repo.path(), &["new", "-m", "feature 2", "main"]);
+    fs::write(
+        repo.path().join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 2\")\n}\n",
+    )
+    .unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f2"]);
+
+    // f3: clean merge (just adds a file)
+    run_jj(repo.path(), &["new", "-m", "feature 3", "main"]);
+    fs::write(repo.path().join("f3.txt"), "feature 3").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f3"]);
+
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+    repo.jjq_success(&["push", "f3"]);
+
+    // run --all should process f1, fail on f2 (conflict), CONTINUE, and process f3
+    let output = repo.jjq_output(&["run", "--all"]);
+    assert!(output.contains("merged 1 to main"), "f1 should merge: {}", output);
+    assert!(output.contains("merge 2 has conflicts"), "f2 should conflict: {}", output);
+    assert!(output.contains("merged 3 to main"), "f3 SHOULD be processed: {}", output);
+    assert!(output.contains("processed 2 item(s), 1 failed"), "summary should show mixed results: {}", output);
+}
+
+#[test]
+fn test_run_all_partial_failure_exit_code() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["config", "check_command", "true"]);
+
+    // f1: clean merge
+    run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
+    fs::write(repo.path().join("f1.txt"), "feature 1").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f1"]);
+
+    // f2: will conflict (modifies main.go)
+    run_jj(repo.path(), &["new", "-m", "feature 2", "main"]);
+    fs::write(
+        repo.path().join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 2\")\n}\n",
+    )
+    .unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f2"]);
+
+    // f3: also modifies main.go differently — will conflict after f1 merges
+    run_jj(repo.path(), &["new", "-m", "feature 3", "main"]);
+    fs::write(
+        repo.path().join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 3\")\n}\n",
+    )
+    .unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f3"]);
+
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+    repo.jjq_success(&["push", "f3"]);
+
+    // Exit code should be 2 (PARTIAL) — some succeeded, some failed
+    repo.jjq()
+        .args(["run", "--all"])
+        .assert()
+        .code(2);
 }
 
 #[test]
