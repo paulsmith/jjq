@@ -596,19 +596,8 @@ pub fn doctor() -> Result<()> {
     // 5. run lock
     match lock::lock_state("run")? {
         lock::LockState::Free => print_check("ok", "run lock is free"),
-        lock::LockState::HeldAlive(pid) => {
-            print_check("WARN", &format!("run lock held by live process (pid {})", pid));
-            warns += 1;
-        }
-        lock::LockState::HeldDead(pid) => {
-            print_check("FAIL", &format!("run lock held by dead process (pid {})", pid));
-            print_hint(&format!("to fix: rm -rf {}", lock::lock_path("run")?.display()));
-            fails += 1;
-        }
-        lock::LockState::HeldUnknown => {
-            print_check("WARN", "run lock held (unknown process)");
-            let path = lock::lock_path("run")?;
-            print_hint(&format!("if stale: rm -rf {}", path.display()));
+        lock::LockState::Held => {
+            print_check("WARN", "run lock held by another process");
             warns += 1;
         }
     }
@@ -616,19 +605,8 @@ pub fn doctor() -> Result<()> {
     // 6. id lock
     match lock::lock_state("id")? {
         lock::LockState::Free => print_check("ok", "id lock is free"),
-        lock::LockState::HeldAlive(pid) => {
-            print_check("WARN", &format!("id lock held by live process (pid {})", pid));
-            warns += 1;
-        }
-        lock::LockState::HeldDead(pid) => {
-            print_check("FAIL", &format!("id lock held by dead process (pid {})", pid));
-            print_hint(&format!("to fix: rm -rf {}", lock::lock_path("id")?.display()));
-            fails += 1;
-        }
-        lock::LockState::HeldUnknown => {
-            print_check("WARN", "id lock held (unknown process)");
-            let path = lock::lock_path("id")?;
-            print_hint(&format!("if stale: rm -rf {}", path.display()));
+        lock::LockState::Held => {
+            print_check("WARN", "id lock held by another process");
             warns += 1;
         }
     }
