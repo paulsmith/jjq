@@ -8,6 +8,8 @@ be sure to commit initial changes and set the 'main' bookmark to the appropriate
 
 then come up with 3 simple features to add to the app. keep track of them somehow.
 
+now read the jj-workspace-agents skill - VERY IMPORTANT
+
 then task 3 background software engineer subagents with implementing one task each.
 
 they should each operate in their own separate jj workspace, parented to the protected trunk.
