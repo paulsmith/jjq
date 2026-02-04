@@ -175,15 +175,18 @@ pub fn init(trunk: Option<&str>, check: Option<&str>) -> Result<()> {
 
     let is_tty = io::stdin().is_terminal();
 
-    // Determine trunk bookmark
-    let trunk_value = if let Some(t) = trunk {
-        t.to_string()
-    } else if !is_tty {
+    // Non-interactive mode requires both flags
+    if !is_tty && (trunk.is_none() || check.is_none()) {
         return Err(ExitError::new(
             exit_codes::USAGE,
             "--trunk and --check are required in non-interactive mode.",
         )
         .into());
+    }
+
+    // Determine trunk bookmark
+    let trunk_value = if let Some(t) = trunk {
+        t.to_string()
     } else {
         // Auto-detect default from existing bookmarks
         let bookmarks = jj::list_bookmarks().unwrap_or_default();
@@ -194,23 +197,51 @@ pub fn init(trunk: Option<&str>, check: Option<&str>) -> Result<()> {
         } else {
             None
         };
-
-        prompt_with_default("Trunk bookmark", default)?
+        prompt("Trunk bookmark", default, None)?
     };
+
+    // Verify trunk bookmark exists
+    if !jj::bookmark_exists(&trunk_value)? {
+        if !is_tty {
+            return Err(ExitError::new(
+                exit_codes::USAGE,
+                format!("trunk bookmark '{}' does not exist.", trunk_value),
+            )
+            .into());
+        }
+        // Interactive mode: offer to create it
+        println!("Bookmark '{}' does not exist.", trunk_value);
+        println!("  1) Create it at the parent revision (@-)");
+        println!("  2) Create it at a different revset");
+        println!("  3) Exit");
+        let choice = prompt_choice("Choice", 3)?;
+        let rev = match choice {
+            1 => "@-".to_string(),
+            2 => prompt(
+                "Revset",
+                None,
+                Some("A revset is required (e.g., '@-', 'main', a change ID)."),
+            )?,
+            _ => {
+                return Err(ExitError::new(
+                    exit_codes::USAGE,
+                    format!("trunk bookmark '{}' does not exist.", trunk_value),
+                )
+                .into());
+            }
+        };
+        jj::bookmark_create(&trunk_value, &rev)?;
+        println!("Created bookmark '{}' at '{}'.", trunk_value, rev);
+    }
 
     // Determine check command
     let check_value = if let Some(c) = check {
         c.to_string()
-    } else if !is_tty {
-        return Err(ExitError::new(
-            exit_codes::USAGE,
-            "--trunk and --check are required in non-interactive mode.",
-        )
-        .into());
     } else {
-        prompt_required(
+        prompt(
             "Check command",
-            "A check command is required (e.g., 'make test', 'cargo test').",
+            None,
+            Some("A check command is required (e.g., 'make test', 'cargo test')."),
         )?
     };
 
@@ -229,7 +260,7 @@ pub fn init(trunk: Option<&str>, check: Option<&str>) -> Result<()> {
 
     // Run doctor
     println!("Running doctor...");
-    let _ = doctor();
+    doctor()?;
 
     println!();
     println!("Ready to go! Queue revisions with 'jjq push <revset>'.");
@@ -237,52 +268,47 @@ pub fn init(trunk: Option<&str>, check: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Prompt for a value with an optional default. Loops until non-empty input.
-fn prompt_with_default(label: &str, default: Option<&str>) -> Result<String> {
+/// Print a prompt and read one line of input, returning the trimmed content.
+fn read_prompt(prompt_text: &str) -> Result<String> {
     use std::io::{self, BufRead, Write};
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
+    print!("{}", prompt_text);
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+/// Prompt for a value with optional default and optional empty-input hint. Loops until non-empty.
+fn prompt(label: &str, default: Option<&str>, empty_hint: Option<&str>) -> Result<String> {
     loop {
-        if let Some(d) = default {
-            print!("{} [{}]: ", label, d);
-        } else {
-            print!("{}: ", label);
-        }
-        io::stdout().flush()?;
-
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        let trimmed = line.trim();
-
-        if trimmed.is_empty() {
+        let suffix = match default {
+            Some(d) => format!("{} [{}]: ", label, d),
+            None => format!("{}: ", label),
+        };
+        let input = read_prompt(&suffix)?;
+        if input.is_empty() {
             if let Some(d) = default {
                 return Ok(d.to_string());
             }
-            // No default, re-prompt
+            if let Some(hint) = empty_hint {
+                println!("{}", hint);
+            }
             continue;
         }
-        return Ok(trimmed.to_string());
+        return Ok(input);
     }
 }
 
-/// Prompt for a required value (no default). Loops until non-empty input, showing hint on empty.
-fn prompt_required(label: &str, hint: &str) -> Result<String> {
-    use std::io::{self, BufRead, Write};
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
+/// Prompt for a numbered choice (1..=max). Loops until valid.
+fn prompt_choice(label: &str, max: u32) -> Result<u32> {
     loop {
-        print!("{}: ", label);
-        io::stdout().flush()?;
-
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        let trimmed = line.trim();
-
-        if trimmed.is_empty() {
-            println!("{}", hint);
-            continue;
+        let input = read_prompt(&format!("{} [1-{}]: ", label, max))?;
+        if let Ok(n) = input.parse::<u32>()
+            && n >= 1 && n <= max
+        {
+            return Ok(n);
         }
-        return Ok(trimmed.to_string());
+        println!("Please enter a number between 1 and {}.", max);
     }
 }
 

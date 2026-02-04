@@ -397,14 +397,17 @@ fn test_status_uninitialized() {
 }
 
 #[test]
-fn test_push_no_trunk() {
+fn test_init_no_trunk_bookmark() {
     let repo = TestRepo::new();
     fs::write(repo.path().join("file.txt"), "content").unwrap();
     run_jj(repo.path(), &["desc", "-m", "test commit"]);
-    // Init with default trunk "main" which doesn't exist in this bare repo
-    repo.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
-    let output = repo.jjq_failure(&["push", "@"]);
-    insta::assert_snapshot!(output, @"jjq: trunk bookmark 'main' not found");
+    // Init with trunk "main" which doesn't exist — should fail in non-interactive mode
+    let output = repo.jjq_failure(&["init", "--trunk", "main", "--check", "true"]);
+    insta::assert_snapshot!(output, @r"
+    Initializing jjq in this repository.
+
+    jjq: trunk bookmark 'main' does not exist.
+    ");
 }
 
 #[test]
