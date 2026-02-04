@@ -5,7 +5,6 @@ use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::process::Command;
 use tempfile::TempDir;
 
 use serde::Serialize;
@@ -568,11 +567,18 @@ fn run_one() -> Result<RunResult> {
     jj::describe(&workspace_rev, &format!("WIP: attempting merge {}", id))?;
 
     // Run check command
-    let check_output = Command::new("sh").arg("-c").arg(&check_command).output()?;
+    let log_path = crate::runlog::log_path()?;
+    let check_status = crate::runner::run_check_command(&check_command, &log_path)?;
 
-    if !check_output.status.success() {
-        eprintln!("{}", String::from_utf8_lossy(&check_output.stdout));
-        eprintln!("{}", String::from_utf8_lossy(&check_output.stderr));
+    if !check_status.success() {
+        // Print log output (skipping sentinel lines)
+        if let Ok(log_contents) = fs::read_to_string(&log_path) {
+            for line in log_contents.lines() {
+                if !line.starts_with(crate::runlog::SENTINEL_PREFIX) {
+                    eprintln!("{}", line);
+                }
+            }
+        }
 
         jj::bookmark_delete(&queue_bookmark)?;
         jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
@@ -688,19 +694,19 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
     }
 
     // Run check command
-    let check_output = Command::new("sh").arg("-c").arg(&check_command).output()?;
+    let log_path = crate::runlog::log_path()?;
+    let check_status = crate::runner::run_check_command(&check_command, &log_path)?;
 
-    let stdout = String::from_utf8_lossy(&check_output.stdout);
-    let stderr = String::from_utf8_lossy(&check_output.stderr);
-
-    if !stdout.is_empty() {
-        print!("{}", stdout);
+    // Print log output (skipping sentinel lines)
+    if let Ok(log_contents) = fs::read_to_string(&log_path) {
+        for line in log_contents.lines() {
+            if !line.starts_with(crate::runlog::SENTINEL_PREFIX) {
+                println!("{}", line);
+            }
+        }
     }
-    if !stderr.is_empty() {
-        eprint!("{}", stderr);
-    }
 
-    let success = check_output.status.success();
+    let success = check_status.success();
 
     // Always clean up
     env::set_current_dir(&orig_dir)?;
