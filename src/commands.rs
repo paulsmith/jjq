@@ -509,6 +509,9 @@ fn run_one() -> Result<RunResult> {
     let (candidate_change_id, candidate_commit_id) =
         jj::resolve_revset_full(&format!("bookmarks(exact:{})", queue_bookmark))?;
 
+    // Resolve log path before cd-ing into workspace so it stays in the main repo .jj
+    let log_path = crate::runlog::log_path()?;
+
     // Create workspace for merge
     let runner_workspace = TempDir::new()?;
     let run_name = format!("jjq-run-{}", queue::format_seq_id(id));
@@ -566,8 +569,7 @@ fn run_one() -> Result<RunResult> {
 
     jj::describe(&workspace_rev, &format!("WIP: attempting merge {}", id))?;
 
-    // Run check command
-    let log_path = crate::runlog::log_path()?;
+    // Run check command (log_path resolved before cd to workspace)
     let check_status = crate::runner::run_check_command(&check_command, &log_path)?;
 
     if !check_status.success() {
@@ -669,6 +671,9 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
         change_id, check_command
     ));
 
+    // Resolve log path before changing to workspace directory.
+    let log_path = crate::runlog::log_path()?;
+
     // Create temporary workspace
     let workspace_dir = TempDir::new()?;
     let workspace_name = format!("jjq-check-{}", std::process::id());
@@ -694,7 +699,6 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
     }
 
     // Run check command
-    let log_path = crate::runlog::log_path()?;
     let check_status = crate::runner::run_check_command(&check_command, &log_path)?;
 
     // Print log output (skipping sentinel lines)

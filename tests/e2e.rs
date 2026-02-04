@@ -1366,3 +1366,52 @@ fn test_config_without_init_fails() {
     let output = repo.jjq_failure(&["config"]);
     insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
 }
+
+#[test]
+fn test_tail_no_log_file() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    let output = repo.jjq_output(&["tail", "--no-follow"]);
+    assert!(
+        output.contains("no run output available"),
+        "should report no log file: {}",
+        output
+    );
+}
+
+#[test]
+fn test_tail_after_run() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_with_check("echo hello-from-check");
+
+    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
+    fs::write(repo.path().join("newfile.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "simple-branch"]);
+    repo.jjq_success(&["push", "simple-branch"]);
+    repo.jjq_success(&["run"]);
+
+    let output = repo.jjq_output(&["tail", "--no-follow"]);
+    assert!(
+        output.contains("hello-from-check"),
+        "tail should show check output: {}",
+        output
+    );
+}
+
+#[test]
+fn test_tail_all_flag() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_with_check("echo line1 && echo line2 && echo line3");
+
+    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
+    fs::write(repo.path().join("newfile.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "simple-branch"]);
+    repo.jjq_success(&["push", "simple-branch"]);
+    repo.jjq_success(&["run"]);
+
+    let output = repo.jjq_output(&["tail", "--all", "--no-follow"]);
+    assert!(output.contains("line1"), "should show all output: {}", output);
+    assert!(output.contains("line2"), "should show all output: {}", output);
+    assert!(output.contains("line3"), "should show all output: {}", output);
+}
