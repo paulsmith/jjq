@@ -91,6 +91,8 @@ enum Commands {
         #[arg(long)]
         no_follow: bool,
     },
+    /// Print quickstart guide for LLM agents
+    Quickstart,
 }
 
 fn main() {
@@ -107,19 +109,31 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    // Quickstart doesn't need a repo
+    if let Commands::Quickstart = cli.command {
+        print!("{}", include_str!("quickstart.txt"));
+        return Ok(());
+    }
+
     // Verify we're in a jj repository
     jj::verify_repo()?;
 
     match cli.command {
         Commands::Init { trunk, check } => commands::init(trunk.as_deref(), check.as_deref()),
         Commands::Push { revset } => commands::push(&revset),
-        Commands::Run { all, stop_on_failure } => commands::run(all, stop_on_failure),
+        Commands::Run {
+            all,
+            stop_on_failure,
+        } => commands::run(all, stop_on_failure),
         Commands::Check { rev, verbose } => commands::check(&rev, verbose),
-        Commands::Status { id, json, resolve } => commands::status(id.as_deref(), json, resolve.as_deref()),
+        Commands::Status { id, json, resolve } => {
+            commands::status(id.as_deref(), json, resolve.as_deref())
+        }
         Commands::Delete { id } => commands::delete(&id),
         Commands::Clean => commands::clean(),
         Commands::Doctor => commands::doctor(),
         Commands::Config { key, value } => commands::config(key.as_deref(), value.as_deref()),
         Commands::Tail { all, no_follow } => tail::tail(all, !no_follow),
+        Commands::Quickstart => unreachable!(),
     }
 }
