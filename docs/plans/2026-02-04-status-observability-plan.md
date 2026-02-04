@@ -603,90 +603,347 @@ jj new
 
 ---
 
-### Task 9: Manual integration test
+### Task 9: Add e2e tests for new status features
 
-Verify the full workflow end-to-end in a scratch jj repo.
+Add tests to `tests/e2e.rs` exercising the new status features. Use the existing `TestRepo` harness and `insta` snapshots. Also update existing snapshot tests whose output changes due to the enriched trailer format (the `test_run_check_failure` status snapshot now shows the candidate's original description instead of the jjq failure message).
 
-**Step 1: Create a test repo and run through the workflow**
+**Files:**
+- Modify: `tests/e2e.rs`
 
-```bash
-cd /tmp && mkdir jjq-test && cd jjq-test
-jj git init --colocate
-echo "hello" > file.txt
-jj desc -m "Initial commit"
-jj bookmark create main
-jj new -m "Test change 1"
-echo "change1" > change1.txt
+**Step 1: Update existing `test_run_check_failure` snapshot**
 
-# Configure and push
-jjq config check_command "true"
-jjq push @
-jjq status
-jjq status --json
+The status output for failed items now resolves the original candidate description. Update the snapshot in `test_run_check_failure` where it checks status after failure — the failed item line should now show the candidate's description ("will fail check") instead of the jjq failure message ("Failed: merge 1 (check)").
 
-# Run it (should succeed)
-jjq run
-jjq status
-jjq status --json
+**Step 2: Add `test_status_json_empty`**
 
-# Create a failing change
-jj new -m "Test change 2"
-echo "change2" > change2.txt
-jjq config check_command "false"
-jjq push @
-jjq run
+Test that `status --json` returns valid JSON for an uninitialized repo:
 
-# Now check status with failed items
-jjq status
-jjq status --json
-jjq status 3           # single item by ID
-jjq status 3 --json    # single item JSON
+```rust
+#[test]
+fn test_status_json_empty() {
+    let repo = TestRepo::new();
+    let output = repo.jjq_success(&["status", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    assert_eq!(parsed["running"], false);
+    assert_eq!(parsed["queue"], serde_json::json!([]));
+    assert_eq!(parsed["failed"], serde_json::json!([]));
+}
 ```
 
-Expected:
-- `jjq status` text output shows queue and failed items with readable format
-- `jjq status --json` produces valid JSON with all fields populated
-- `jjq status 3` shows the failed item detail view with all trailer data
-- `jjq status 3 --json` shows single-item JSON
-- Failed items have `candidate_change_id`, `candidate_commit_id`, `trunk_commit_id`, `workspace_path`, and `failure_reason` populated
+**Step 3: Add `test_status_json_with_items`**
 
-**Step 2: Test `--resolve`**
+Test JSON output with queued and failed items:
 
-```bash
-# Use the candidate change ID from the failed item
-jjq status --resolve <change_id_from_above>
-jjq status --resolve <change_id_from_above> --json
+```rust
+#[test]
+fn test_status_json_with_items() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["config", "check_command", "false"]);
+
+    // Create and push two branches
+    run_jj(repo.path(), &["new", "-m", "queued item", "main"]);
+    fs::write(repo.path().join("q.txt"), "queued").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "qb"]);
+    repo.jjq_success(&["push", "qb"]);
+
+    run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
+    fs::write(repo.path().join("f.txt"), "fail").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "fb"]);
+    repo.jjq_success(&["push", "fb"]);
+
+    // Run to fail second item (first one fails too since check is "false")
+    repo.jjq_output(&["run"]);  // fails item 1
+    // Re-push item 1 with passing check and process
+    repo.jjq_success(&["config", "check_command", "true"]);
+    run_jj(repo.path(), &["new", "-m", "queued item 2", "main"]);
+    fs::write(repo.path().join("q2.txt"), "queued2").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "qb2"]);
+    repo.jjq_success(&["push", "qb2"]);
+
+    let output = repo.jjq_success(&["status", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+
+    // Verify structure
+    assert_eq!(parsed["running"], false);
+    assert!(parsed["queue"].is_array());
+    assert!(parsed["failed"].is_array());
+
+    // Queue items should have change_id, commit_id, description
+    for item in parsed["queue"].as_array().unwrap() {
+        assert!(item["id"].is_u64());
+        assert!(item["change_id"].is_string());
+        assert!(item["commit_id"].is_string());
+        assert!(item["description"].is_string());
+    }
+
+    // Failed items should have all trailer fields
+    for item in parsed["failed"].as_array().unwrap() {
+        assert!(item["id"].is_u64());
+        assert!(item["candidate_change_id"].is_string());
+        assert!(item["failure_reason"].is_string());
+    }
+}
 ```
 
-**Step 3: Test edge cases**
+**Step 4: Add `test_status_single_item`**
 
-```bash
-# Empty queue
-jjq status --json   # should return {"running":false,"queue":[],"failed":[]}
+Test `status <id>` for both queued and failed items:
 
-# Item not found
-jjq status 999      # should error with "item 999 not found"
+```rust
+#[test]
+fn test_status_single_item() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["config", "check_command", "true"]);
 
-# Mutually exclusive args
-jjq status 1 --resolve abc  # should error from clap
+    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
+    fs::write(repo.path().join("f.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "fb"]);
+    repo.jjq_success(&["push", "fb"]);
+
+    // Check queued item detail view
+    let output = repo.jjq_success(&["status", "1"]);
+    assert!(output.contains("Queue item 1"));
+    assert!(output.contains("Change ID:"));
+    assert!(output.contains("Commit ID:"));
+    assert!(output.contains("test feature"));
+}
 ```
 
-**Step 4: Clean up**
+**Step 5: Add `test_status_single_failed_item`**
 
-```bash
-cd /tmp && rm -rf jjq-test
+```rust
+#[test]
+fn test_status_single_failed_item() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["config", "check_command", "false"]);
+
+    run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
+    fs::write(repo.path().join("f.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "fb"]);
+    repo.jjq_success(&["push", "fb"]);
+    repo.jjq_failure(&["run"]);
+
+    let output = repo.jjq_success(&["status", "1"]);
+    assert!(output.contains("Failed item 1"));
+    assert!(output.contains("Candidate:"));
+    assert!(output.contains("Failure:"));
+    assert!(output.contains("check"));
+    assert!(output.contains("Trunk:"));
+    assert!(output.contains("Workspace:"));
+    assert!(output.contains("To resolve:"));
+}
 ```
 
-**Step 5: Commit any fixes found during testing**
+**Step 6: Add `test_status_single_json`**
+
+```rust
+#[test]
+fn test_status_single_json() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["config", "check_command", "true"]);
+
+    run_jj(repo.path(), &["new", "-m", "json test", "main"]);
+    fs::write(repo.path().join("f.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "fb"]);
+    repo.jjq_success(&["push", "fb"]);
+
+    let output = repo.jjq_success(&["status", "1", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    assert_eq!(parsed["id"], 1);
+    assert!(parsed["change_id"].is_string());
+    assert!(parsed["description"].as_str().unwrap().contains("json test"));
+}
+```
+
+**Step 7: Add `test_status_not_found`**
+
+```rust
+#[test]
+fn test_status_not_found() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["push", "main"]);
+
+    let output = repo.jjq_failure(&["status", "999"]);
+    assert!(output.contains("item 999 not found"));
+}
+```
+
+**Step 8: Add `serde_json` to `[dev-dependencies]`**
+
+In `Cargo.toml`, add to `[dev-dependencies]`:
+
+```toml
+serde_json = "1"
+```
+
+**Step 9: Run the tests**
+
+Run: `cargo test`
+Expected: all tests pass, including updated snapshots
+
+**Step 10: Commit**
 
 ```
-jj desc -m "Fix issues found during integration testing"
+jj desc -m "Add e2e tests for status --json and single-item filters"
 jj new
 ```
 
 ---
 
-### Task 10: Squash and finalize
+### Task 10: Run `jjq-test` e2e script
+
+Run the bash-based end-to-end test script to verify nothing is broken.
+
+**Step 1: Build the project**
+
+```bash
+cargo build
+```
+
+**Step 2: Run the e2e test script**
+
+```bash
+JJQ_BIN=./target/debug/jjq ./jjq-test
+```
+
+Expected: the full e2e test passes (generate, run, verify). The enriched
+trailers don't affect the bash test's conflict resolution flow because it
+parses the description first line, which is unchanged ("Failed: merge N
+(conflicts)").
+
+**Step 3: Fix any issues and commit**
+
+```
+jj desc -m "Fix issues found during e2e testing"
+jj new
+```
+
+---
+
+### Task 11: Update documentation
+
+Update all docs to reflect the new `status` command features.
+
+**Files:**
+- Modify: `README.md` (usage section for status)
+- Modify: `docs/jjq.1` (man page roff source — status section)
+- Modify: `docs/jjq.1.txt` (plaintext man page — status section)
+- Modify: `docs/README.md` (specification — Status section)
+- Modify: `AGENTS.md` (commands table for status)
+
+**Step 1: Update `README.md`**
+
+In the "Check status" section, expand to show the new features:
+
+```markdown
+### Check status
+
+```sh
+jjq status                          # overview of queue and recent failures
+jjq status --json                   # machine-readable JSON output
+jjq status 42                       # detail view of item 42
+jjq status 42 --json                # detail view as JSON
+jjq status --resolve <change_id>    # look up item by candidate change ID
+```
+```
+
+**Step 2: Update `docs/jjq.1` (man page roff source)**
+
+Replace the `.SS status` section with:
+
+```roff
+.SS status \fR[\fIid\fR] [\fB\-\-json\fR] [\fB\-\-resolve \fIchange_id\fR]
+Display the current queue state: queued items (ascending by sequence ID)
+and recent failures (descending, up to
+.BR max_failures ).
+Each entry shows its sequence ID, change ID prefix, and first line of
+the commit description.
+.PP
+Also indicates if a run lock is currently held (another
+.B jjq run
+is in progress).
+.PP
+With
+.BR \-\-json ,
+outputs structured JSON with
+.BR running ,
+.BR queue ,
+and
+.B failed
+fields.
+Queue items include
+.BR change_id ,
+.BR commit_id ,
+and
+.BR description .
+Failed items include
+.BR candidate_change_id ,
+.BR candidate_commit_id ,
+.BR description
+(original candidate message),
+.BR trunk_commit_id ,
+.BR workspace_path ,
+and
+.BR failure_reason .
+.PP
+With a positional
+.IR id ,
+displays a single item's detail view (from either queue or failed).
+With
+.BR \-\-resolve ,
+looks up an item by its candidate change ID.
+.I id
+and
+.B \-\-resolve
+are mutually exclusive.
+```
+
+**Step 3: Update `docs/jjq.1.txt`**
+
+Regenerate from the roff source or manually update the plaintext status
+section to match.
+
+**Step 4: Update the synopsis in `docs/jjq.1`**
+
+Change:
+```roff
+.B jjq status
+```
+to:
+```roff
+.B jjq status
+.RI [ id ]
+.RB [ \-\-json ]
+.RB [ \-\-resolve
+.IR change_id ]
+```
+
+**Step 5: Update `docs/README.md` (specification)**
+
+In the Status section (around line 202-213), add a paragraph about
+`--json` output and single-item filters.
+
+**Step 6: Update `AGENTS.md`**
+
+In the commands table, change:
+```
+| `status` | Show queue and recent failures |
+```
+to:
+```
+| `status [id] [--json] [--resolve]` | Show queue and recent failures; supports JSON output and single-item detail view |
+```
+
+**Step 7: Commit**
+
+```
+jj desc -m "Update docs for status --json and single-item filters"
+jj new
+```
+
+---
+
+### Task 12: Squash and finalize
 
 Squash the implementation commits into clean, logical units.
 
@@ -700,7 +957,7 @@ jj log
 
 Aim for 2-3 commits:
 1. "Add enriched trailers on failed items" (Tasks 2-3)
-2. "Add status --json and single-item filters" (Tasks 1, 4-8)
+2. "Add status --json and single-item filters" (Tasks 1, 4-8, 9-11)
 
 Or squash everything into a single commit if it reads cleaner.
 
@@ -709,4 +966,6 @@ Or squash everything into a single commit if it reads cleaner.
 ```bash
 cargo build
 cargo clippy
+cargo test
+JJQ_BIN=./target/debug/jjq ./jjq-test
 ```

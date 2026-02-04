@@ -2,6 +2,7 @@
 // ABOUTME: Each function implements one jjq subcommand per the specification.
 
 use anyhow::{bail, Result};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::process::Command;
@@ -32,14 +33,18 @@ fn extract_id_from_bookmark(bookmark: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Extract the change ID from a "jjq-candidate: <id>" trailer in a description.
-fn extract_candidate_trailer(description: &str) -> Option<String> {
+/// Extract all jjq-* trailers from a commit description into a map.
+/// Trailer format: "jjq-key: value" — returns map of "key" -> "value".
+fn extract_trailers(description: &str) -> HashMap<String, String> {
+    let mut trailers = HashMap::new();
     for line in description.lines() {
-        if let Some(id) = line.strip_prefix("jjq-candidate: ") {
-            return Some(id.trim().to_string());
+        if let Some(rest) = line.strip_prefix("jjq-") {
+            if let Some((key, value)) = rest.split_once(": ") {
+                trailers.insert(key.to_string(), value.trim().to_string());
+            }
         }
     }
-    None
+    trailers
 }
 
 /// Look up the filesystem path of a workspace from jjq metadata log history.
@@ -149,8 +154,9 @@ pub fn push(revset: &str) -> Result<()> {
     let failed_bookmarks = jj::bookmark_list_glob("jjq/failed/??????")?;
     for bookmark in &failed_bookmarks {
         let desc = jj::get_description(&format!("bookmarks(exact:{})", bookmark))?;
-        if let Some(candidate_change_id) = extract_candidate_trailer(&desc)
-            && candidate_change_id == change_id
+        let trailers = extract_trailers(&desc);
+        if let Some(candidate_change_id) = trailers.get("candidate")
+            && *candidate_change_id == change_id
         {
             let entry_id = extract_id_from_bookmark(bookmark);
             jj::bookmark_delete(bookmark)?;
@@ -289,7 +295,7 @@ fn run_one() -> Result<RunResult> {
 
     // Capture candidate change ID before creating workspace
     let queue_bookmark = queue::queue_bookmark(id);
-    let candidate_change_id = jj::resolve_revset(&format!("bookmarks(exact:{})", queue_bookmark))?;
+    let (candidate_change_id, candidate_commit_id) = jj::resolve_revset_full(&format!("bookmarks(exact:{})", queue_bookmark))?;
 
     // Create workspace for merge
     let runner_workspace = TempDir::new()?;
@@ -317,7 +323,11 @@ fn run_one() -> Result<RunResult> {
         jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
         jj::describe(
             &workspace_rev,
-            &format!("Failed: merge {} (conflicts)\n\njjq-candidate: {}", id, candidate_change_id),
+            &format!(
+                "Failed: merge {} (conflicts)\n\njjq-candidate: {}\njjq-candidate-commit: {}\njjq-trunk: {}\njjq-workspace: {}\njjq-failure: conflicts",
+                id, candidate_change_id, candidate_commit_id, trunk_commit_id,
+                runner_workspace.path().display()
+            ),
         )?;
 
         env::set_current_dir(&orig_dir)?;
@@ -349,7 +359,11 @@ fn run_one() -> Result<RunResult> {
         jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
         jj::describe(
             &workspace_rev,
-            &format!("Failed: merge {} (check)\n\njjq-candidate: {}", id, candidate_change_id),
+            &format!(
+                "Failed: merge {} (check)\n\njjq-candidate: {}\njjq-candidate-commit: {}\njjq-trunk: {}\njjq-workspace: {}\njjq-failure: check",
+                id, candidate_change_id, candidate_commit_id, trunk_commit_id,
+                runner_workspace.path().display()
+            ),
         )?;
 
         env::set_current_dir(&orig_dir)?;
