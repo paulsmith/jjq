@@ -4,6 +4,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 /// Get a jj config value, returning None if not set.
 pub fn config_get(key: &str) -> Result<Option<String>> {
@@ -82,9 +83,26 @@ pub fn bookmark_delete(name: &str) -> Result<()> {
     run_quiet(&["bookmark", "delete", name])
 }
 
+/// Check if the jj binary supports --allow-protected on bookmark move.
+fn supports_allow_protected() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let Ok(output) = run(&["bookmark", "move", "-h"]) else {
+            return false;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.contains("allow-protected")
+    })
+}
+
 /// Move a bookmark to current working copy.
+/// Uses --allow-protected if the jj binary supports it.
 pub fn bookmark_move(name: &str) -> Result<()> {
-    run_quiet(&["bookmark", "move", name])
+    if supports_allow_protected() {
+        run_quiet(&["bookmark", "move", "--allow-protected", name])
+    } else {
+        run_quiet(&["bookmark", "move", name])
+    }
 }
 
 /// Set a bookmark at a revision (like move but for specific rev).
