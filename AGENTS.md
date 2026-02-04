@@ -21,9 +21,10 @@ jjq stores all state in the jj repository itself:
    - `jjq/queue/NNNNNN` - Queued items (6-digit zero-padded sequence ID)
    - `jjq/failed/NNNNNN` - Failed merge attempts
 
-2. **Filesystem locks** - Uses `mkdir` atomicity in `.jj/jjq-locks/`
+2. **Filesystem locks** - Uses `flock(2)` files in `.jj/jjq-locks/`
    - `run` - Ensures only one queue runner at a time
    - `id` - Protects sequence ID allocation
+   - `config` - Serializes config reads/writes
 
 3. **Isolated branch** - `jjq/_/_` bookmark points to a branch parented to `root()` that holds:
    - `last_id` file - Current sequence ID
@@ -36,23 +37,24 @@ jjq stores all state in the jj repository itself:
 |---------|----------|
 | `init [--trunk <bookmark>] [--check <cmd>]` | Initialize jjq, set trunk and check command |
 | `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID) |
-| `run [--all]` | Process next queue item, or all items in batch |
+| `run [--all] [--stop-on-failure]` | Process next queue item, or all items in batch |
 | `check [--rev <revset>]` | Run check command against a revision (default @) |
 | `status [id] [--json] [--resolve]` | Show queue and recent failures; supports JSON output and single-item detail view |
 | `delete <id>` | Remove item from queue/failed |
 | `config [key] [value]` | Get/set configuration |
 | `clean` | Remove failed workspaces |
 | `doctor` | Validate config, locks, and workspace preconditions |
+| `tail [--all] [--no-follow]` | View the last check output (with optional follow) |
+| `quickstart` | Print a short guide for LLM agents |
 
 ### Exit Codes
 
 | Code | Constant | Meaning |
 |------|----------|---------|
 | 0 | `EXIT_SUCCESS` | Success |
-| 1 | `EXIT_CONFLICT` | Merge conflict (pre-flight or during run) |
-| 2 | `EXIT_CHECK_FAILED` | User's check command returned non-zero |
-| 3 | `EXIT_LOCK_HELD` | Another runner is active |
-| 4 | `EXIT_TRUNK_MOVED` | Trunk bookmark advanced during run |
+| 1 | `EXIT_CONFLICT` | Merge conflict, check failed, trunk moved during run, or run lock unavailable |
+| 2 | `EXIT_PARTIAL` | Batch run processed some items but left failures |
+| 3 | `EXIT_LOCK_HELD` | Sequence ID allocation lock held (push contention) |
 | 10 | `EXIT_USAGE` | Bad arguments, item not found, invalid revset |
 
 ### Key Concepts
@@ -66,18 +68,18 @@ jjq stores all state in the jj repository itself:
 
 ### Concurrency
 
-- `mkdir` atomicity is used as a mutex (mkdir fails if dir exists)
-- Lock dirs stored in `.jj/jjq-locks/` (outside jj's tracked areas)
+- `flock(2)` file locks are used as mutexes
+- Lock files stored in `.jj/jjq-locks/` (outside jj's tracked areas)
 - `run` lock ensures only one queue runner at a time
 - `id` lock protects sequence ID allocation
+- `config` lock guards config read/write
 
 ### Batch Mode (`run --all`)
 
-When running in batch mode, jjq processes all queue items in sequence:
-- Failed items (conflict or check failure) are skipped and processing continues
-- Lock-held (`EXIT_LOCK_HELD`) causes immediate bail (no further progress possible)
-- Summary reports both merged and failed counts
-- Exits 0 if all merged, first failure code if any failed
+When running in batch mode, jjq processes items in sequence:
+- Failed items are recorded and processing continues unless `--stop-on-failure` is set
+- Summary reports merged and failed counts
+- Exits 0 if all items merged or queue was empty; exits 2 (`EXIT_PARTIAL`) if any items failed
 
 ## Testing
 

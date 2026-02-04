@@ -17,12 +17,13 @@ passes checks against the latest trunk.
 
 Prerequisite: make sure `jj` is installed.
 
-Download the tarball for your platform and run the included install script:
+Download the tarball for your platform from the latest release and run the
+included install script (replace the URL and filename with your platform):
 
 ```sh
-curl -LO https://FIXME/jjq-0.1.0-aarch64-darwin.tar.gz
-tar xzf jjq-0.1.0-aarch64-darwin.tar.gz
-cd jjq-0.1.0-aarch64-darwin
+curl -LO https://<releases>/jjq-<version>-<platform>.tar.gz
+tar xzf jjq-<version>-<platform>.tar.gz
+cd jjq-<version>-<platform>
 sudo ./install                    # installs to /usr/local
 ```
 
@@ -65,7 +66,7 @@ Process the next item in the queue:
 jjq run
 ```
 
-Drain the entire queue (continues past failures):
+Drain the entire queue (continues past failures by default):
 
 ```sh
 jjq run --all
@@ -108,13 +109,12 @@ jjq push mychange              # clears old failure, re-queues
 ```
 
 Push is idempotent: re-pushing the same change ID automatically clears any
-previous queue or failed entries for that change.
+previous queue or failed entries for that change. Re-pushing the exact same
+commit ID that is already queued is rejected as a duplicate.
 
 ```sh
 jjq delete 3          # remove item 3 from queue/failed
-jjq clean             # list failed workspaces
-jjq clean 3           # clean workspace for failed item 3
-jjq clean all         # clean all failed workspaces
+jjq clean             # remove all jjq-run-* workspaces (failed merges)
 ```
 
 ### Test your check command
@@ -123,6 +123,14 @@ jjq clean all         # clean all failed workspaces
 jjq check              # run check against current working copy
 jjq check --rev main   # run check against a specific revision
 jjq check -v           # show workspace path, shell, and env vars
+```
+
+View recent check output (tail the log):
+
+```sh
+jjq tail               # last 20 lines; follows by default
+jjq tail --all         # from the beginning
+jjq tail --no-follow   # dump once and exit
 ```
 
 ### Validate your setup
@@ -157,7 +165,7 @@ log = "~ ::jjq/_/_"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `trunk_bookmark` | `main` | Bookmark pointing to your trunk |
-| `check_command` | *(set during init)* | Command to run on merge candidates |
+| `check_command` | *(set during init)* | Command to run on merge candidates (required before running) |
 
 ## Copying
 

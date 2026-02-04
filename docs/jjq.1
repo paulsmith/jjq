@@ -93,9 +93,8 @@ If conflicts are detected, the push is rejected with exit code 1.
 Push is idempotent for the same change ID: if the change is already
 queued or failed, the stale entry is cleared and the revision is
 re\-queued.
-However, if the same change ID is already queued at a different commit
-ID (i.e., the revision has been amended), the push is rejected with
-exit code 10.
+If the exact same commit ID is already queued, the push is rejected as a
+duplicate (usage error).
 .PP
 .RS
 .nf
@@ -104,7 +103,7 @@ jjq push feat\-xyz@      # queue a workspace's working copy
 jjq push abc123         # queue by change ID
 .fi
 .RE
-.SS run \fR[\fB\-\-all\fR]
+.SS run \fR[\fB\-\-all\fR] [\fB\-\-stop-on-failure\fR]
 Process the next queued item.
 Creates a temporary jj workspace with two parents (trunk and candidate),
 then runs the configured check command inside it.
@@ -121,12 +120,14 @@ advanced it), the run aborts and instructs the user to retry.
 .PP
 With
 .BR \-\-all ,
-processes items in a loop until the queue is empty or an item fails.
-Reports the count of successes and failures.
+processes items in a loop until the queue is empty. Failures are recorded and
+processing continues unless
+.B \-\-stop-on-failure
+is set. Reports the count of successes and failures.
 .PP
-Returns 0 if at least one item was processed successfully (or the queue
-was empty).
-Returns 1 if any item failed.
+Returns 0 if all processed items succeeded (or the queue was empty). Returns 2
+if any items failed. Returns 1 if the run lock is unavailable, a conflict is
+detected, or trunk moved during processing.
 .SS check \fR[\fB\-\-rev \fIrevset\fR] [\fB\-v\fR]
 Run the configured check command against a revision in a temporary
 workspace without any queue processing.
@@ -190,17 +191,29 @@ and
 .B \-\-resolve
 are mutually exclusive.
 .SS delete \fIid\fR
-Remove an item from the queue or the failed list by its sequence ID.
-The sequence ID is the number shown in
+Remove an item from the queue or the failed list by its sequence ID. The
+sequence ID is the number shown in
 .B status
 output and
 .B push
 confirmation messages.
 .SS clean
-Remove jjq workspaces left behind by failed merges.
-Lists each workspace removed.
-Safe to run at any time \(em only removes jjq\-owned workspaces, never
-user workspaces.
+Remove jjq workspaces left behind by failed merges. Removes all directories
+named like
+.BR jjq-run-XXXXXX .
+Safe to run at any time \(em only removes jjq-owned workspaces, never user
+workspaces.
+.SS tail \fR[\fB\-\-all\fR] [\fB\-\-no-follow\fR]
+View the check command output stored in
+.IR .jj/jjq-run.log .
+By default shows the last 20 lines and follows until a sentinel line is seen.
+With
+.B \-\-all
+shows from the beginning. With
+.B \-\-no-follow
+dumps once and exits.
+.SS quickstart
+Print a brief quickstart guide for LLM agents.
 .SS doctor
 Validate that the jjq environment is correctly configured.
 Checks the trunk bookmark, check command, lock state, and workspace
@@ -243,19 +256,19 @@ or configured afterward with
 Success.
 .TP
 .B 1
-Merge conflict or check command failure.
+Conflict during push or run, check failure in single-run mode, trunk moved, or
+run lock unavailable.
+.TP
+.B 2
+Partial batch run: at least one item failed while processing
+.BR "jjq run --all" .
 .TP
 .B 3
-Lock held.
-Another
-.B jjq
-process is running.
-Retry later.
+Sequence ID allocation lock held (another push in progress).
 .TP
 .B 10
-Usage error.
-Bad arguments, ambiguous revset, duplicate push of an amended revision,
-etc.
+Usage error. Bad arguments, ambiguous revset, duplicate push of the exact same
+commit ID, etc.
 .SH CONFIGURATION
 .B jjq
 stores configuration on an isolated metadata branch
@@ -269,7 +282,11 @@ Always configure
 .B check_command
 before using
 .BR "jjq run" .
-The default check command rejects everything.
+If
+.B check_command
+is unset,
+.B jjq run
+will refuse to process items.
 .SH LOCKING
 .B jjq
 uses flock\-based file locks in
@@ -298,12 +315,14 @@ Failed items use
 .BI jjq/failed/ NNNNNN .
 The metadata branch at
 .B jjq/_/_
-stores the last allocated ID and all configuration.
+stores the last allocated ID, configuration, and an operation log (commit
+messages include trailers such as sequence IDs and workspace paths).
 .PP
 Successful merges are ordinary jj commits with two parents (trunk and
 candidate) and descriptions like \(lqSuccess: merge N\(rq.
 Failed merges are preserved as conflicted commits with descriptions like
-\(lqFailed: merge N (conflicts)\(rq.
+\(lqFailed: merge N (conflicts)\(rq or \(lqFailed: merge N (check)\(rq. The
+workspace path is recorded in trailers for later cleanup.
 .SH TYPICAL WORKFLOW
 Initialize a project:
 .PP
