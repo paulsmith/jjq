@@ -83,6 +83,14 @@ When running in batch mode, jjq processes items in sequence:
 
 ## Testing
 
+The project employs snapshot tests via Rust insta crate:
+
+```sh
+cargo test
+```
+
+There is an e2e script:
+
 ```sh
 ./jjq-test
 ```
