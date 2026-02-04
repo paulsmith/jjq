@@ -3,3 +3,4 @@ test/
 .jj-*
 .ws/
 /target
+result
