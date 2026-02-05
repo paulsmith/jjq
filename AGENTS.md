@@ -65,6 +65,7 @@ jjq stores all state in the jj repository itself:
 - **Check command** - User-configured shell command that determines success/failure
 - **Pre-flight conflict check** - Headless merge commit to verify clean merge before queuing
 - **Idempotent push** - Re-pushing a change ID clears stale queue/failed entries; same commit ID is rejected as duplicate
+- **Landing strategy** - How the candidate is landed on trunk: `rebase` (default) or `merge`
 
 ### Concurrency
 

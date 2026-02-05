@@ -242,6 +242,7 @@ Users may configure:
 
   - the check command (required — must be set before first run)
   - the name of the trunk bookmark (default "main")
+  - the landing strategy: `rebase` (default) or `merge`
   - (status shows all failed items)
 
 ### Use of jj bookmarks

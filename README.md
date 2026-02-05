@@ -5,10 +5,11 @@ jjq is a lightweight, local merge queue tool for
 
 ## What it does
 
-jjq lets you queue revisions for merging to your trunk branch (eg., `main`
-bookmark). Each queued item is merged with the current trunk and a configurable
-check command is run. If the check passes, the trunk bookmark advances. If it
-fails, the item is marked as failed for you to investigate.
+jjq lets you queue revisions for merging to your trunk branch (eg.,
+`main` bookmark). Each queued item is merged with the current trunk and a
+configurable check command is run. If the check passes, the trunk bookmark
+advances. If it fails, or there were conflicts with the up-to-date trunk,
+the item is marked as failed for you to investigate.
 
 This prevents the "it worked on my branch" problem by ensuring every merge
 passes checks against the latest trunk.
@@ -162,10 +163,11 @@ log = "~ ::jjq/_/_"
 
 ## Configuration
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `trunk_bookmark` | `main` | Bookmark pointing to your trunk |
-| `check_command` | *(set during init)* | Command to run on merge candidates (required before running) |
+| Key                | Default              | Description                                                      |
+|--------------------|----------------------|------------------------------------------------------------------|
+| `trunk_bookmark`   | `main`               | Bookmark pointing to your trunk                                  |
+| `check_command`    | *(set during init)*  | Command to run on merge candidates (required before running)     |
+| `strategy`         | `rebase`             | Strategy for landing the candidate on trunk (`rebase` or `merge`) |
 
 ## Copying
 
