@@ -9,7 +9,7 @@ use tempfile::TempDir;
 
 use serde::Serialize;
 
-use crate::config;
+use crate::config::{self, Strategy};
 use crate::exit_codes::{self, ExitError};
 use crate::jj;
 use crate::lock::{self, Lock};
@@ -157,7 +157,7 @@ fn record_workspace_metadata(id: u32, workspace_path: &str) -> Result<()> {
 }
 
 /// Initialize jjq in this repository.
-pub fn init(trunk: Option<&str>, check: Option<&str>) -> Result<()> {
+pub fn init(trunk: Option<&str>, check: Option<&str>, strategy: &str) -> Result<()> {
     use std::io::{self, IsTerminal};
 
     // Refuse if already initialized
@@ -251,10 +251,23 @@ pub fn init(trunk: Option<&str>, check: Option<&str>) -> Result<()> {
     config::set("trunk_bookmark", &trunk_value)?;
     config::set("check_command", &check_value)?;
 
+    // Validate and set strategy
+    let strategy_val = config::Strategy::try_from(strategy).ok().ok_or_else(|| {
+        ExitError::new(
+            exit_codes::USAGE,
+            format!(
+                "invalid strategy: {}\nvalid values: rebase, merge",
+                strategy
+            ),
+        )
+    })?;
+    config::set("strategy", strategy_val.as_str())?;
+
     println!();
     println!("Initialized jjq:");
     println!("  trunk_bookmark = {}", trunk_value);
     println!("  check_command  = {}", check_value);
+    println!("  strategy       = {}", strategy_val.as_str());
     println!();
 
     // Run doctor
@@ -303,7 +316,8 @@ fn prompt_choice(label: &str, max: u32) -> Result<u32> {
     loop {
         let input = read_prompt(&format!("{} [1-{}]: ", label, max))?;
         if let Ok(n) = input.parse::<u32>()
-            && n >= 1 && n <= max
+            && n >= 1
+            && n <= max
         {
             return Ok(n);
         }
@@ -471,8 +485,6 @@ fn run_one() -> Result<RunResult> {
         }
     };
 
-    prefout(&format!("processing queue item {}", id));
-
     // Acquire config lock to read settings
     let config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
     let trunk_bookmark = config::get_trunk_bookmark()?;
@@ -487,7 +499,14 @@ fn run_one() -> Result<RunResult> {
             ));
         }
     };
+    let strategy = config::get_strategy()?;
     drop(config_lock);
+
+    prefout(&format!(
+        "processing queue item {} ({} strategy)",
+        id,
+        strategy.as_str()
+    ));
 
     // Acquire run lock
     let run_lock = match Lock::acquire("run")? {
@@ -512,24 +531,56 @@ fn run_one() -> Result<RunResult> {
     // Resolve log path before cd-ing into workspace so it stays in the main repo .jj
     let log_path = crate::runlog::log_path()?;
 
-    // Create workspace for merge
+    // Capture original description for rebase success path (before queue bookmark is deleted)
+    let candidate_description =
+        jj::get_description(&format!("bookmarks(exact:{})", queue_bookmark)).unwrap_or_default();
+
+    // Create workspace — strategy determines how
     let runner_workspace = TempDir::new()?;
     let run_name = format!("jjq-run-{}", queue::format_seq_id(id));
 
-    jj::workspace_add(
-        runner_workspace.path().to_str().unwrap(),
-        &run_name,
-        &[
-            &format!("bookmarks(exact:{})", trunk_bookmark),
-            &format!("bookmarks(exact:{})", queue_bookmark),
-        ],
-    )?;
+    // For rebase strategy, track all duplicate IDs so we can abandon them all
+    let mut rebase_duplicate_ids: Vec<String> = Vec::new();
+
+    match strategy {
+        config::Strategy::Merge => {
+            jj::workspace_add(
+                runner_workspace.path().to_str().unwrap(),
+                &run_name,
+                &[
+                    &format!("bookmarks(exact:{})", trunk_bookmark),
+                    &format!("bookmarks(exact:{})", queue_bookmark),
+                ],
+            )?;
+        }
+        config::Strategy::Rebase => {
+            // Duplicate candidate onto trunk (creates rebased copy without touching original)
+            rebase_duplicate_ids = jj::duplicate_onto(
+                &format!("bookmarks(exact:{})", queue_bookmark),
+                &format!("bookmarks(exact:{})", trunk_bookmark),
+            )?;
+            // Create workspace on the tip duplicate (last in the list)
+            let duplicate_tip = rebase_duplicate_ids.last().unwrap();
+            jj::workspace_add(
+                runner_workspace.path().to_str().unwrap(),
+                &run_name,
+                &[duplicate_tip.as_str()],
+            )?;
+        }
+    }
 
     // Record the workspace path in metadata for later recovery by delete/clean
     record_workspace_metadata(id, runner_workspace.path().to_str().unwrap())?;
 
     let orig_dir = env::current_dir()?;
     env::set_current_dir(runner_workspace.path())?;
+
+    // For rebase strategy, edit the duplicate directly so check artifacts
+    // are snapshotted into it (workspace add created an empty commit on top)
+    if strategy == config::Strategy::Rebase {
+        let parent_rev = jj::resolve_revset(&format!("{}@-", run_name))?;
+        jj::edit(&parent_rev)?;
+    }
 
     // Check for conflicts
     let workspace_rev = format!("{}@", run_name);
@@ -538,13 +589,14 @@ fn run_one() -> Result<RunResult> {
         jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
         jj::describe(
             &workspace_rev,
-            &format!(
-                "Failed: merge {} (conflicts)\n\njjq-candidate: {}\njjq-candidate-commit: {}\njjq-trunk: {}\njjq-workspace: {}\njjq-failure: conflicts",
-                id,
-                candidate_change_id,
-                candidate_commit_id,
-                trunk_commit_id,
-                runner_workspace.path().display()
+            &failure_description(
+                id.into(),
+                "conflicts",
+                &candidate_change_id,
+                &candidate_commit_id,
+                &trunk_commit_id,
+                &runner_workspace.path(),
+                &strategy,
             ),
         )?;
 
@@ -586,13 +638,14 @@ fn run_one() -> Result<RunResult> {
         jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
         jj::describe(
             &workspace_rev,
-            &format!(
-                "Failed: merge {} (check)\n\njjq-candidate: {}\njjq-candidate-commit: {}\njjq-trunk: {}\njjq-workspace: {}\njjq-failure: check",
-                id,
-                candidate_change_id,
-                candidate_commit_id,
-                trunk_commit_id,
-                runner_workspace.path().display()
+            &failure_description(
+                id.into(),
+                "check",
+                &candidate_change_id,
+                &candidate_commit_id,
+                &trunk_commit_id,
+                &runner_workspace.path(),
+                &strategy,
             ),
         )?;
 
@@ -616,6 +669,12 @@ fn run_one() -> Result<RunResult> {
     let current_trunk_commit_id =
         jj::get_commit_id(&format!("bookmarks(exact:{})", trunk_bookmark))?;
     if trunk_commit_id != current_trunk_commit_id {
+        // For rebase, abandon all duplicates we created
+        if strategy == config::Strategy::Rebase {
+            for dup_id in &rebase_duplicate_ids {
+                let _ = jj::abandon(dup_id);
+            }
+        }
         env::set_current_dir(&orig_dir)?;
         jj::workspace_forget(&run_name)?;
         drop(run_lock);
@@ -628,24 +687,92 @@ fn run_one() -> Result<RunResult> {
     }
 
     // Success path — order matters for crash safety:
-    // 1. Move trunk first (most critical; if this fails, queue item is preserved for retry)
-    // 2. Delete queue bookmark (if we crash here, next run handles the orphan)
-    // 3. Describe last (commit only claims "Success" after everything actually succeeded)
-    let merge_change_id = jj::resolve_revset("@")?;
+    // 1. Move trunk first (most critical)
+    // 2. Delete queue bookmark
+    // 3. Describe commit
+    // For rebase: we tested against a duplicate, now rebase the original to
+    // preserve change ID, then move trunk to the rebased original.
 
-    jj::bookmark_move(&trunk_bookmark)?;
-    jj::bookmark_delete(&queue_bookmark)?;
-    jj::describe("@", &format!("Success: merge {}", id))?;
+    match strategy {
+        config::Strategy::Merge => {
+            let landed_change_id = jj::resolve_revset("@")?;
+            jj::bookmark_move(&trunk_bookmark, &trunk_commit_id, "@")?;
+            jj::bookmark_delete(&queue_bookmark)?;
+            jj::describe("@", &format!("Success: merge {}", id))?;
 
-    env::set_current_dir(&orig_dir)?;
-    jj::workspace_forget(&run_name)?;
-    drop(run_lock);
+            env::set_current_dir(&orig_dir)?;
+            jj::workspace_forget(&run_name)?;
+            drop(run_lock);
 
-    prefout(&format!(
-        "merged {} to {} (now at {})",
-        id, trunk_bookmark, merge_change_id
-    ));
+            prefout(&format!(
+                "merged {} to {} (now at {})",
+                id, trunk_bookmark, landed_change_id
+            ));
+        }
+        config::Strategy::Rebase => {
+            // The duplicate passed checks. Now rebase the ORIGINAL candidate
+            // onto trunk to preserve its change ID.
+
+            // Return to original directory for rebase operations
+            env::set_current_dir(&orig_dir)?;
+
+            // Rebase original candidate (and its descendants) onto trunk
+            jj::rebase_branch_onto(
+                &candidate_change_id,
+                &format!("bookmarks(exact:{})", trunk_bookmark),
+            )?;
+
+            // Move trunk to the rebased original (not the duplicate)
+            // The candidate_change_id is now rebased onto trunk
+            jj::bookmark_delete(&queue_bookmark)?;
+            jj::bookmark_move(&trunk_bookmark, &trunk_commit_id, &candidate_change_id)?;
+
+            // Describe the landed commit with trailers
+            let desc = format!(
+                "{}\n\njjq-sequence: {}\njjq-strategy: rebase",
+                candidate_description.trim(),
+                id,
+            );
+            jj::describe(&candidate_change_id, &desc)?;
+
+            // Abandon all duplicates (they were only used for testing)
+            for dup_id in &rebase_duplicate_ids {
+                jj::abandon(dup_id)?;
+            }
+
+            jj::workspace_forget(&run_name)?;
+            drop(run_lock);
+
+            prefout(&format!(
+                "rebased {} to {} (now at {})",
+                id, trunk_bookmark, candidate_change_id
+            ));
+        }
+    }
+
     Ok(RunResult::Success)
+}
+
+fn failure_description(
+    id: u64,
+    reason: &str,
+    candidate_change_id: &str,
+    candidate_commit_id: &str,
+    trunk_commit_id: &str,
+    workspace_path: &std::path::Path,
+    strategy: &Strategy,
+) -> String {
+    format!(
+        "Failed: merge {} ({})\n\njjq-candidate: {}\njjq-candidate-commit: {}\njjq-trunk: {}\njjq-workspace: {}\njjq-failure: {}\njjq-strategy: {}",
+        id,
+        reason,
+        candidate_change_id,
+        candidate_commit_id,
+        trunk_commit_id,
+        workspace_path.display(),
+        reason,
+        strategy.as_str()
+    )
 }
 
 /// Run check command against a revision in a temporary workspace.
@@ -991,6 +1118,8 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
                 "check_command = {}",
                 check.unwrap_or_else(|| "(not set)".to_string())
             );
+            let strategy = config::get_strategy()?;
+            println!("strategy = {}", strategy.as_str());
             Ok(())
         }
         (Some(k), None) => {
@@ -1008,6 +1137,7 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
                 let value = match k {
                     "trunk_bookmark" => config::DEFAULT_TRUNK_BOOKMARK.to_string(),
                     "check_command" => String::new(),
+                    "strategy" => config::DEFAULT_STRATEGY.as_str().to_string(),
                     _ => unreachable!(),
                 };
                 println!("{}", value);
@@ -1018,6 +1148,7 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
             let value = match k {
                 "trunk_bookmark" => config::get_trunk_bookmark()?,
                 "check_command" => config::get_check_command()?.unwrap_or_default(),
+                "strategy" => config::get_strategy()?.as_str().to_string(),
                 _ => unreachable!(),
             };
             println!("{}", value);
@@ -1081,7 +1212,18 @@ pub fn doctor() -> Result<()> {
         fails += 1;
     }
 
-    // 5. run lock
+    // 5. strategy valid
+    if initialized {
+        match config::get_strategy() {
+            Ok(s) => print_check("ok", &format!("strategy: {}", s.as_str())),
+            Err(e) => {
+                print_check("FAIL", &format!("invalid strategy: {}", e));
+                fails += 1;
+            }
+        }
+    }
+
+    // 6. run lock
     match lock::lock_state("run")? {
         lock::LockState::Free => print_check("ok", "run lock is free"),
         lock::LockState::Held => {
@@ -1090,7 +1232,7 @@ pub fn doctor() -> Result<()> {
         }
     }
 
-    // 6. id lock
+    // 7. id lock
     match lock::lock_state("id")? {
         lock::LockState::Free => print_check("ok", "id lock is free"),
         lock::LockState::Held => {
@@ -1099,7 +1241,7 @@ pub fn doctor() -> Result<()> {
         }
     }
 
-    // 7. orphaned workspaces
+    // 8. orphaned workspaces
     let ws_output = jj::workspace_list()?;
     let orphaned: usize = ws_output
         .lines()

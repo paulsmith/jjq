@@ -317,6 +317,16 @@ func main() {
     fn init_jjq_with_check(&self, check_cmd: &str) {
         self.jjq_success(&["init", "--trunk", "main", "--check", check_cmd]);
     }
+
+    /// Initialize jjq with merge strategy and default settings (check command = "true").
+    fn init_jjq_merge(&self) {
+        self.jjq_success(&["init", "--trunk", "main", "--check", "true", "--strategy", "merge"]);
+    }
+
+    /// Initialize jjq with merge strategy and a specific check command.
+    fn init_jjq_merge_with_check(&self, check_cmd: &str) {
+        self.jjq_success(&["init", "--trunk", "main", "--check", check_cmd, "--strategy", "merge"]);
+    }
 }
 
 /// Run a jj command in the given directory.
@@ -418,6 +428,7 @@ fn test_config_show_all() {
     insta::assert_snapshot!(output, @r"
     trunk_bookmark = main
     check_command = true
+    strategy = rebase
     ");
 }
 
@@ -441,7 +452,7 @@ fn test_config_invalid_key() {
     let output = repo.jjq_failure(&["config", "invalid_key"]);
     insta::assert_snapshot!(output, @r"
     jjq: unknown config key: invalid_key
-    valid keys: trunk_bookmark, check_command
+    valid keys: trunk_bookmark, check_command, strategy
     ");
 }
 
@@ -530,7 +541,7 @@ fn test_run_without_init() {
 #[test]
 fn test_run_success() {
     let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    repo.init_jjq_merge();
 
     // Create and push a simple branch
     run_jj(repo.path(), &["new", "-m", "add file", "main"]);
@@ -540,7 +551,7 @@ fn test_run_success() {
 
     let output = repo.jjq_success(&["run"]);
     insta::assert_snapshot!(output, @r"
-    jjq: processing queue item 1
+    jjq: processing queue item 1 (merge strategy)
     jjq: merged 1 to main (now at <CHANGE_ID>)
     ");
 }
@@ -548,7 +559,7 @@ fn test_run_success() {
 #[test]
 fn test_run_check_failure() {
     let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("false");
+    repo.init_jjq_merge_with_check("false");
 
     // Create and push a branch
     run_jj(repo.path(), &["new", "-m", "will fail check", "main"]);
@@ -558,7 +569,7 @@ fn test_run_check_failure() {
 
     let run_output = repo.jjq_failure(&["run"]);
     insta::assert_snapshot!(run_output, @r"
-    jjq: processing queue item 1
+    jjq: processing queue item 1 (merge strategy)
     jjq: merge 1 failed check, marked as failed
     jjq: workspace: <TEMP_PATH>
     jjq:
@@ -578,7 +589,7 @@ fn test_run_check_failure() {
 #[test]
 fn test_run_all() {
     let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    repo.init_jjq_merge();
 
     // Create multiple branches
     run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
@@ -608,11 +619,11 @@ fn test_run_all() {
 
     let run_output = repo.jjq_success(&["run", "--all"]);
     insta::assert_snapshot!(run_output, @r"
-    jjq: processing queue item 1
+    jjq: processing queue item 1 (merge strategy)
     jjq: merged 1 to main (now at <CHANGE_ID>)
-    jjq: processing queue item 2
+    jjq: processing queue item 2 (merge strategy)
     jjq: merged 2 to main (now at <CHANGE_ID>)
-    jjq: processing queue item 3
+    jjq: processing queue item 3 (merge strategy)
     jjq: merged 3 to main (now at <CHANGE_ID>)
     jjq: queue is empty
     jjq: processed 3 item(s)
@@ -721,7 +732,7 @@ fn test_sequence_id_validation() {
 #[test]
 fn test_full_workflow_with_prs() {
     let repo = TestRepo::with_prs();
-    repo.init_jjq_with_check("make");
+    repo.init_jjq_merge_with_check("make");
 
     // Push all PRs
     let push1 = repo.jjq_success(&["push", "pr1"]);
@@ -748,14 +759,14 @@ fn test_full_workflow_with_prs() {
     // Run pr1 - should succeed
     let run1 = repo.jjq_success(&["run"]);
     insta::assert_snapshot!(run1, @r"
-    jjq: processing queue item 1
+    jjq: processing queue item 1 (merge strategy)
     jjq: merged 1 to main (now at <CHANGE_ID>)
     ");
 
     // Run pr2 - will have conflicts since pr1 changed main.go
     let run2 = repo.jjq_output(&["run"]);
     insta::assert_snapshot!(run2, @r"
-    jjq: processing queue item 2
+    jjq: processing queue item 2 (merge strategy)
     jjq: merge 2 has conflicts, marked as failed
     jjq: workspace: <TEMP_PATH>
     jjq:
@@ -853,7 +864,7 @@ fn test_log_hint_shown_once_when_forced() {
 #[test]
 fn test_run_all_stop_on_failure_flag() {
     let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    repo.init_jjq_merge();
 
     // f1: modifies main.go (will merge cleanly against trunk)
     run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
@@ -885,8 +896,8 @@ fn test_run_all_stop_on_failure_flag() {
     // run --all should process f1, fail on f2 (conflict), and STOP (not process f3)
     let output = repo.jjq_output(&["run", "--all", "--stop-on-failure"]);
     assert!(
-        output.contains("merged 1 to main"),
-        "f1 should merge: {}",
+        output.contains("rebased 1 to main") || output.contains("merged 1 to main"),
+        "f1 should land: {}",
         output
     );
     assert!(
@@ -895,7 +906,7 @@ fn test_run_all_stop_on_failure_flag() {
         output
     );
     assert!(
-        !output.contains("merged 3 to main"),
+        !output.contains("rebased 3 to main") && !output.contains("merged 3 to main"),
         "f3 should NOT be processed: {}",
         output
     );
@@ -917,7 +928,7 @@ fn test_run_all_stop_on_failure_flag() {
 #[test]
 fn test_run_all_continues_on_failure() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.init_jjq_merge();
 
     // f1: modifies main.go (will merge cleanly against trunk)
     run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
@@ -949,8 +960,8 @@ fn test_run_all_continues_on_failure() {
     // run --all should process f1, fail on f2 (conflict), CONTINUE, and process f3
     let output = repo.jjq_output(&["run", "--all"]);
     assert!(
-        output.contains("merged 1 to main"),
-        "f1 should merge: {}",
+        output.contains("rebased 1 to main") || output.contains("merged 1 to main"),
+        "f1 should land: {}",
         output
     );
     assert!(
@@ -959,7 +970,7 @@ fn test_run_all_continues_on_failure() {
         output
     );
     assert!(
-        output.contains("merged 3 to main"),
+        output.contains("rebased 3 to main") || output.contains("merged 3 to main"),
         "f3 SHOULD be processed: {}",
         output
     );
@@ -973,7 +984,7 @@ fn test_run_all_continues_on_failure() {
 #[test]
 fn test_run_all_partial_failure_exit_code() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.init_jjq_merge();
 
     // f1: clean merge
     run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
@@ -1049,7 +1060,7 @@ fn test_push_exact_duplicate_rejected() {
 #[test]
 fn test_push_idempotent_clears_failed() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "false"]);
+    repo.init_jjq_merge_with_check("false");
 
     // Create and push a branch
     run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
@@ -1091,7 +1102,7 @@ fn test_clean_no_workspaces() {
 #[test]
 fn test_clean_removes_failed_workspaces() {
     let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "false"]);
+    repo.init_jjq_merge_with_check("false");
 
     run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
     fs::write(repo.path().join("fail.txt"), "content").unwrap();
@@ -1418,7 +1429,7 @@ fn test_tail_all_flag() {
 #[test]
 fn test_run_failure_shows_output() {
     let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("echo 'build failed: missing dependency' && exit 1");
+    repo.init_jjq_merge_with_check("echo 'build failed: missing dependency' && exit 1");
 
     run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
     fs::write(repo.path().join("file.txt"), "content").unwrap();
@@ -1436,7 +1447,7 @@ fn test_run_failure_shows_output() {
 #[test]
 fn test_run_creates_log_file() {
     let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    repo.init_jjq_merge();
 
     run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
     fs::write(repo.path().join("newfile.txt"), "content").unwrap();
@@ -1458,7 +1469,7 @@ fn test_run_creates_log_file() {
 #[test]
 fn test_log_file_truncated_between_runs() {
     let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("echo run-output-marker");
+    repo.init_jjq_merge_with_check("echo run-output-marker");
 
     // First run
     run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
@@ -1484,4 +1495,211 @@ fn test_log_file_truncated_between_runs() {
         "log should contain exactly one sentinel after truncation, got {}: {}",
         sentinel_count, contents
     );
+}
+
+#[test]
+fn test_run_rebase_success() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq(); // defaults to rebase strategy
+
+    // Create a simple non-conflicting change
+    run_jj(repo.path(), &["new", "-m", "add feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feature"]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    // Push and run
+    repo.jjq_success(&["push", "feature"]);
+    let output = repo.jjq_success(&["run"]);
+
+    // Verify rebase strategy was used
+    assert!(output.contains("rebase strategy"), "expected rebase strategy in output: {}", output);
+    assert!(output.contains("rebased"), "expected 'rebased' in output: {}", output);
+
+    // Verify trunk advanced: feature.txt should exist on main
+    assert!(repo.jj_file_exists("feature.txt", "main"));
+}
+
+#[test]
+fn test_run_rebase_preserves_change_id() {
+    // Option E: verify the original change ID is preserved when landing
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Create a change and capture its change ID
+    run_jj(repo.path(), &["new", "-m", "my feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat"]);
+
+    let original_change_id = run_jj(repo.path(), &[
+        "log", "-r", "feat", "--no-graph", "-T", "change_id.short()",
+    ]).trim().to_string();
+
+    run_jj(repo.path(), &["new", "main"]);
+
+    // Push and run
+    repo.jjq_success(&["push", "feat"]);
+    repo.jjq_success(&["run"]);
+
+    // The change ID on main should be the SAME as the original
+    let landed_change_id = run_jj(repo.path(), &[
+        "log", "-r", "main", "--no-graph", "-T", "change_id.short()",
+    ]).trim().to_string();
+
+    assert_eq!(
+        original_change_id, landed_change_id,
+        "change ID should be preserved: original={}, landed={}",
+        original_change_id, landed_change_id
+    );
+}
+
+#[test]
+fn test_run_rebase_linear_history() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Push two non-conflicting changes
+    run_jj(repo.path(), &["new", "-m", "feature A", "main"]);
+    fs::write(repo.path().join("a.txt"), "aaa\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat-a"]);
+
+    run_jj(repo.path(), &["new", "-m", "feature B", "main"]);
+    fs::write(repo.path().join("b.txt"), "bbb\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat-b"]);
+
+    run_jj(repo.path(), &["new", "main"]);
+
+    repo.jjq_success(&["push", "feat-a"]);
+    repo.jjq_success(&["push", "feat-b"]);
+    repo.jjq_success(&["run", "--all"]);
+
+    // Verify both files landed
+    assert!(repo.jj_file_exists("a.txt", "main"));
+    assert!(repo.jj_file_exists("b.txt", "main"));
+
+    // Verify linear history: main's commit should have only 1 parent
+    let parent_count = run_jj(repo.path(), &[
+        "log", "-r", "main", "--no-graph", "-T", "parents.len()",
+    ]);
+    assert_eq!(parent_count.trim(), "1", "expected linear history (1 parent), got: {}", parent_count.trim());
+}
+
+#[test]
+fn test_run_rebase_preserves_description() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    run_jj(repo.path(), &["new", "-m", "my cool feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat"]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    repo.jjq_success(&["push", "feat"]);
+    repo.jjq_success(&["run"]);
+
+    // Check that trunk's description contains the original message + trailers
+    // Note: Option E preserves the original change ID, so no jjq-source trailer needed
+    let desc = run_jj(repo.path(), &[
+        "log", "-r", "main", "--no-graph", "-T", "description",
+    ]);
+    assert!(desc.contains("my cool feature"), "desc should contain original: {}", desc);
+    assert!(desc.contains("jjq-sequence:"), "desc should have sequence trailer: {}", desc);
+    assert!(desc.contains("jjq-strategy: rebase"), "desc should have strategy trailer: {}", desc);
+}
+
+#[test]
+fn test_run_rebase_conflict() {
+    let repo = TestRepo::with_prs();
+    repo.init_jjq(); // rebase strategy
+
+    // PR1 and PR2 both modify main.go, should conflict after PR1 merges
+    repo.jjq_success(&["push", "pr1"]);
+    repo.jjq_success(&["push", "pr2"]);
+
+    // Run first item (should succeed)
+    repo.jjq_success(&["run"]);
+
+    // Run second item (should fail with conflict)
+    let output = repo.jjq_failure(&["run"]);
+    assert!(output.contains("conflicts"), "expected conflict: {}", output);
+}
+
+#[test]
+fn test_run_rebase_check_failure() {
+    let repo = TestRepo::with_go_project();
+    // Use rebase strategy with "false" check command
+    repo.jjq_success(&["init", "--trunk", "main", "--check", "false"]);
+
+    run_jj(repo.path(), &["new", "-m", "will fail check", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat"]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    repo.jjq_success(&["push", "feat"]);
+    let output = repo.jjq_failure(&["run"]);
+    assert!(output.contains("failed check"), "expected check failure: {}", output);
+
+    // Trunk should NOT have moved
+    assert!(!repo.jj_file_exists("feature.txt", "main"));
+}
+
+#[test]
+fn test_run_rebase_commit_chain() {
+    // Regression test: pushing an empty @ whose parent has the actual changes.
+    // duplicate_onto must duplicate the full range (trunk..candidate), not just
+    // the candidate's diff, to include intermediate commits.
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Create a change, then do "jj new" so @ is empty and the parent has content.
+    // This mimics: workspace with work in @-, empty @ on top.
+    run_jj(repo.path(), &["new", "-m", "add feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    // Create a new empty commit on top (simulates jj's empty working copy)
+    run_jj(repo.path(), &["new"]);
+    // Now @ is empty, @- has the content. Push @ (the empty tip).
+    repo.jjq_success(&["push", "@"]);
+    let output = repo.jjq_success(&["run"]);
+
+    assert!(output.contains("rebased"), "expected rebased: {}", output);
+    // The critical check: feature.txt must be on main even though the pushed
+    // commit itself was empty — the intermediate commit's changes must be included.
+    assert!(repo.jj_file_exists("feature.txt", "main"),
+        "feature.txt should be on main after rebase of commit chain");
+}
+
+#[test]
+fn test_run_rebase_abandons_all_duplicates() {
+    // Regression test: when duplicating a commit chain for rebase testing,
+    // ALL duplicates must be abandoned on success, not just the tip.
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Create a chain of 3 commits off main
+    run_jj(repo.path(), &["new", "-m", "first", "main"]);
+    fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+    run_jj(repo.path(), &["new", "-m", "second"]);
+    fs::write(repo.path().join("b.txt"), "b\n").unwrap();
+    run_jj(repo.path(), &["new", "-m", "third"]);
+    fs::write(repo.path().join("c.txt"), "c\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat"]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    repo.jjq_success(&["push", "feat"]);
+    repo.jjq_success(&["run"]);
+
+    // Count commits with each description — should be exactly 1 of each
+    let log = run_jj(repo.path(), &["log", "--no-graph", "-T", "description.first_line() ++ \"\\n\""]);
+    let first_count = log.lines().filter(|l| *l == "first").count();
+    let second_count = log.lines().filter(|l| *l == "second").count();
+    let third_count = log.lines().filter(|l| *l == "third").count();
+
+    assert_eq!(first_count, 1, "should have exactly 1 'first' commit, found {}", first_count);
+    assert_eq!(second_count, 1, "should have exactly 1 'second' commit, found {}", second_count);
+    assert_eq!(third_count, 1, "should have exactly 1 'third' commit, found {}", third_count);
+
+    // Verify all files are on main
+    assert!(repo.jj_file_exists("a.txt", "main"), "a.txt should be on main");
+    assert!(repo.jj_file_exists("b.txt", "main"), "b.txt should be on main");
+    assert!(repo.jj_file_exists("c.txt", "main"), "c.txt should be on main");
 }

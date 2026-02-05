@@ -18,8 +18,10 @@ pub fn config_get(key: &str) -> Result<Option<String>> {
 
 /// Execute a jj command and return the output.
 pub fn run(args: &[&str]) -> Result<Output> {
+    let mut full_args = vec!["--color=never"];
+    full_args.extend_from_slice(args);
     let output = Command::new("jj")
-        .args(args)
+        .args(&full_args)
         .output()
         .context("failed to execute jj")?;
     Ok(output)
@@ -95,20 +97,15 @@ fn supports_allow_protected() -> bool {
     })
 }
 
-/// Move a bookmark to current working copy.
+/// Move a bookmark from one revision to another (compare-and-swap).
 /// Uses --allow-protected if the jj binary supports it.
-pub fn bookmark_move(name: &str) -> Result<()> {
+pub fn bookmark_move(name: &str, from: &str, to: &str) -> Result<()> {
+    let mut args = vec!["bookmark", "move"];
     if supports_allow_protected() {
-        run_quiet(&["bookmark", "move", "--allow-protected", name])
-    } else {
-        run_quiet(&["bookmark", "move", name])
+        args.push("--allow-protected");
     }
-}
-
-/// Set a bookmark at a revision (like move but for specific rev).
-#[allow(dead_code)]
-pub fn bookmark_set(name: &str, rev: &str) -> Result<()> {
-    run_quiet(&["bookmark", "set", "-r", rev, name])
+    args.extend_from_slice(&["--from", from, "--to", to, name]);
+    run_quiet(&args)
 }
 
 /// List bookmarks matching a glob pattern.
@@ -238,6 +235,50 @@ pub fn abandon(rev: &str) -> Result<()> {
     run_quiet(&["abandon", rev])
 }
 
+/// Duplicate the commit range destination..revset onto the destination,
+/// returning all new change IDs (the last one is the tip/candidate).
+/// This handles commit chains: if revset has ancestors between it and
+/// destination, those intermediate commits are also duplicated.
+/// Parses stderr for: "Duplicated <hash> as <new_change_id> <new_hash> ..."
+pub fn duplicate_onto(revset: &str, destination: &str) -> Result<Vec<String>> {
+    let range = format!("{}..{}", destination, revset);
+    let output = run(&["duplicate", &range, "--onto", destination])?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("jj duplicate failed: {}", stderr.trim());
+    }
+    // jj duplicate outputs to stderr; one line per duplicated commit.
+    // Collect all duplicated change IDs (last one is the tip).
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut change_ids = Vec::new();
+    for line in stderr.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // "Duplicated <old_hash> as <new_change_id> <new_hash> ..."
+        if parts.len() >= 4 && parts[0] == "Duplicated" && parts[2] == "as" {
+            change_ids.push(parts[3].to_string());
+        }
+    }
+    if change_ids.is_empty() {
+        bail!(
+            "failed to parse change ID from jj duplicate output: {}",
+            stderr.trim()
+        );
+    }
+    Ok(change_ids)
+}
+
+/// Edit a revision (set it as working copy in current workspace).
+pub fn edit(rev: &str) -> Result<()> {
+    run_quiet(&["edit", rev])
+}
+
+/// Rebase a revision and its ancestors (up to destination) onto the destination.
+/// Uses `jj rebase -b` which rebases the "branch" — all revisions in the
+/// range (destination..source) plus their descendants.
+pub fn rebase_branch_onto(source: &str, destination: &str) -> Result<()> {
+    run_quiet(&["rebase", "-b", source, "-d", destination])
+}
+
 /// Show file contents from a revision.
 pub fn file_show(path: &str, rev: &str) -> Result<String> {
     run_ok(&["file", "show", path, "-r", rev])
@@ -256,9 +297,18 @@ pub fn workspace_add(path: &str, name: &str, parents: &[&str]) -> Result<()> {
     run_quiet(&args)
 }
 
-/// Forget a workspace.
+/// Forget a workspace, updating stale state first if needed.
 pub fn workspace_forget(name: &str) -> Result<()> {
-    run_quiet(&["workspace", "forget", name])
+    let output = run(&["workspace", "forget", name])?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("stale") {
+        let _ = run(&["workspace", "update-stale"]);
+        return run_quiet(&["workspace", "forget", name]);
+    }
+    bail!("jj workspace forget {} failed: {}", name, stderr.trim())
 }
 
 /// List all workspaces (raw output from jj workspace list).

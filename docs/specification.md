@@ -20,8 +20,9 @@ solutions require frequent rebasing or risk broken trunk states.
 jjq provides a local merge queue that:
 - Accepts candidate revisions for merging
 - Processes them in FIFO order
-- Creates merge commits combining trunk with each candidate
-- Runs configurable checks on each merge
+- Lands each candidate onto trunk using a configurable strategy (merge
+  commit or rebased duplicate)
+- Runs configurable checks on each landed candidate
 - Only advances trunk when checks pass
 
 This is analogous to CI-based merge queues (like GitHub's), but operates
@@ -33,6 +34,16 @@ lines of work.
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be
 interpreted as described in RFC 2119.
+
+- **Strategy**: The method jjq uses to land a queued candidate onto trunk.
+  Two strategies are defined: merge and rebase.
+- **Merge strategy**: Creates a merge commit with two parents (trunk and
+  candidate). The merge commit becomes the new trunk head.
+- **Rebase strategy**: Duplicates the candidate onto trunk, producing a
+  linear commit. The duplicate becomes the new trunk head; the original
+  candidate is abandoned when safe.
+- **Landing**: The process of integrating a queued candidate revision
+  onto trunk, using the configured strategy.
 
 ## Notational Conventions
 
@@ -65,6 +76,7 @@ implementations rely on the following jj features:
 - The `root()` revset function
 - First-class conflict objects (conflicts stored in tree, queryable
   via the `conflict` template keyword)
+- The `duplicate --onto` subcommand (required for rebase strategy)
 
 Implementations SHOULD verify that the available `jj` command supports
 these features and report an error if it does not.
@@ -176,10 +188,10 @@ Configuration values are stored as individual files under `config/`.
 Each file contains the configuration value as plain text (single line,
 no trailing newline required but permitted).
 
-Initialization MUST NOT create config files. A missing config file means
-the default value applies. Implementations MUST NOT pre-populate config
-files with default values; files are only created when the user explicitly
-sets a value via the `config` command.
+Lazy initialization (§Initialization) MUST NOT create config files. A
+missing config file means the default value applies. Config files are
+created when the user explicitly sets values via the `init` or `config`
+commands.
 
 When reading configuration, implementations MUST:
 1. Attempt to read `config/<key>` from the metadata branch
@@ -188,13 +200,20 @@ When reading configuration, implementations MUST:
 
 Defined configuration keys:
 
-| Key              | Default   | Description                        |
-|------------------|-----------|-------------------------------------|
-| `trunk_bookmark` | `main`    | Bookmark designating trunk          |
-| `check_command`  | (none)    | Command to validate merge-to-be     |
+| Key              | Default   | Description                          |
+|------------------|-----------|--------------------------------------|
+| `trunk_bookmark` | `main`    | Bookmark designating trunk           |
+| `check_command`  | (none)    | Command to validate merge-to-be      |
+| `strategy`       | `merge`   | Landing strategy (`merge` or `rebase`) |
 
 The `check_command` key has no default. If unconfigured, the `run` command
 MUST fail with an error indicating that configuration is required.
+
+The `strategy` key accepts only the values `merge` or `rebase`.
+Implementations MUST reject any other value when setting this key. If
+the key is absent (e.g., repositories initialized before strategy support
+was added), the default value `merge` applies, preserving backward
+compatibility.
 
 ##### Log Hint Marker (`log_hint_shown`)
 
@@ -357,7 +376,49 @@ This hint-based approach ensures:
 - Error messages MUST be written to stderr
 - Commands MUST NOT modify user revisions, bookmarks, or working copy
   outside of jjq-namespaced state, except as explicitly specified
-  (e.g., moving the trunk bookmark on successful merge)
+  (e.g., moving the trunk bookmark on successful landing)
+
+---
+
+### init
+
+```
+jjq init [--trunk <name>] [--check <command>] [--strategy <strategy>]
+```
+
+Initialize jjq in this repository.
+
+#### Options
+
+- `--trunk <name>`: Trunk bookmark name. If omitted, detected from
+  existing bookmarks or prompted interactively.
+- `--check <command>`: Check command. If omitted, prompted interactively.
+- `--strategy <strategy>`: Landing strategy. Default: `rebase`. Valid
+  values: `merge`, `rebase`.
+
+#### Behavior
+
+1. If jjq is already initialized, MUST fail with exit code 10.
+2. Determine trunk bookmark, check command, and strategy from flags
+   or interactive prompts. In non-interactive mode (no TTY), `--trunk`
+   and `--check` are REQUIRED.
+3. Perform lazy initialization (create metadata branch, see
+   §Initialization).
+4. Set `trunk_bookmark`, `check_command`, and `strategy` configuration
+   values on the metadata branch.
+5. Output confirmation showing effective configuration.
+6. Exit with code 0.
+
+#### Notes
+
+- The `init` command always writes the `strategy` config value. This
+  is distinct from lazy initialization, which MUST NOT create config
+  files. The `init` command is an explicit user action that establishes
+  the repository's configuration.
+- The default strategy for `init` is `rebase`. Existing repositories
+  that were initialized before strategy support (and thus have no
+  `strategy` config key) default to `merge` for backward compatibility
+  (see §Configuration Store).
 
 ---
 
@@ -421,10 +482,12 @@ Queue a revision for merging to trunk.
   (with a different commit ID) replaces any existing queue or failed
   entries for that change. This is the intended workflow for handling
   failures — fix the revision, rebase onto trunk, push again.
-- The conflict check verifies merge-ability at push time. However, trunk
-  may advance between push and run, so a clean push does not guarantee
-  a clean merge at run time. The check catches conflicts that exist at
-  the moment of pushing.
+- The conflict check verifies compatibility with trunk at push time.
+  The check uses a temporary merge commit regardless of the active
+  strategy (merge conflicts and rebase conflicts are equivalent in jj).
+  However, trunk may advance between push and run, so a clean push
+  does not guarantee a clean landing at run time. The check catches
+  conflicts that exist at the moment of pushing.
 
 ---
 
@@ -458,36 +521,55 @@ Process the next item in the queue, or all items if `--all` is specified.
    then release the config lock.
 5. Create a temporary workspace directory outside the repository working copy.
 6. Record the current trunk revision (commit ID) for later verification.
-7. Create a jj workspace named `jjq-run-<padded-id>` at that directory,
+7. Read the `strategy` configuration value. Create the landed revision
+   and workspace according to the active strategy:
+
+   Before creating the workspace, the candidate's change ID and commit
+   description MUST be captured from the queue bookmark (for use in
+   failure and success descriptions).
+
+   **Merge strategy:**
+   Create a jj workspace named `jjq-run-<padded-id>` at that directory,
    with a new merge revision having two parents in this order:
    - Parent 1 (first): The revision at the trunk bookmark
    - Parent 2 (second): The queued revision (`jjq/queue/<id>`)
 
-   The merge revision is the working copy of this workspace and can be
-   referenced as `jjq-run-<padded-id>@` in revsets.
+   The merge revision is the working copy of this workspace.
 
-   Before creating the workspace, the candidate's change ID MUST be
-   captured from the queue bookmark (for use in failure descriptions).
-8. Check for conflicts in the merge revision. A revision has conflicts
-   if its tree contains conflict objects (in jj terms, the `conflict`
-   template keyword evaluates to true). If conflicts exist:
+   **Rebase strategy:**
+   Duplicate the queued revision onto the trunk bookmark revision using
+   `jj duplicate <candidate> --onto <trunk>`, creating a rebased copy.
+   Parse the new change ID from the command output. Create a jj workspace
+   named `jjq-run-<padded-id>` at that directory with `-r <duplicate>`.
+   Then `jj edit <duplicate>` in the workspace context so the duplicate
+   itself (not a child commit) is the workspace's working copy. This
+   ensures that check command artifacts are snapshotted into the
+   duplicate, matching merge strategy behavior.
+
+   In both strategies, the workspace working copy can be referenced as
+   `jjq-run-<padded-id>@` in revsets.
+8. Check for conflicts in the workspace working copy revision (merge
+   revision under merge strategy, duplicate revision under rebase
+   strategy). A revision has conflicts if its tree contains conflict
+   objects (in jj terms, the `conflict` template keyword evaluates to
+   true). If conflicts exist:
    - Delete `jjq/queue/<id>`
-   - Create `jjq/failed/<id>` pointing to the merge revision
-   - Set the merge revision's description to include a
-     `jjq-candidate: <change-id>` trailer identifying the original
-     candidate (this survives jj rewrites of the merge commit)
+   - Create `jjq/failed/<id>` pointing to the conflicted revision
+   - Set the revision's description to include failure trailers (see
+     §Failure Description Trailers)
    - Output error message including workspace path
-   - Output actionable guidance SHOULD be displayed telling the user
-     how to resolve (e.g., rebase onto trunk, resolve conflicts, and
-     use `jjq push`)
+   - Actionable guidance SHOULD be displayed telling the user how to
+     resolve (e.g., rebase onto trunk, resolve conflicts, and use
+     `jjq push`)
    - Release run lock
    - Exit with code 1 (workspace is NOT deleted)
 9. Execute the configured check command in the workspace.
 10. If check exits non-zero:
     - Delete `jjq/queue/<id>`
-    - Create `jjq/failed/<id>` pointing to the merge revision
-    - Set the merge revision's description to include a
-      `jjq-candidate: <change-id>` trailer (same as step 8)
+    - Create `jjq/failed/<id>` pointing to the workspace working copy
+      revision
+    - Set the revision's description to include failure trailers (see
+      §Failure Description Trailers), with `jjq-failure: check`
     - Output check failure message and workspace path
     - Actionable guidance SHOULD be displayed telling the user how
       to resolve (e.g., fix the issue and use `jjq push`)
@@ -496,11 +578,17 @@ Process the next item in the queue, or all items if `--all` is specified.
 11. Verify trunk bookmark still points to the same revision recorded in
     step 6. If trunk has moved:
     - Leave `jjq/queue/<id>` in place (do NOT delete it)
+    - Under the rebase strategy, abandon the duplicate revision created
+      in step 7 (it is no longer needed; a new duplicate will be created
+      on retry). Under the merge strategy, the merge revision is
+      cleaned up when the workspace is forgotten.
     - Forget the workspace and delete the workspace directory
     - Release run lock
     - Output error message indicating trunk moved during run
     - Exit with code 1
-12. On success:
+12. On success, behavior depends on the active strategy:
+
+    **Merge strategy:**
     - Capture the merge revision's change ID (before any modifications)
     - Delete `jjq/queue/<id>`
     - Move trunk bookmark to the merge revision (`jjq-run-<padded-id>@`)
@@ -508,6 +596,31 @@ Process the next item in the queue, or all items if `--all` is specified.
     - Delete the temporary workspace directory
     - Output success message including sequence ID, trunk bookmark name,
       and the merge revision's change ID
+    - Release run lock
+    - Exit with code 0
+
+    **Rebase strategy:**
+    The duplicate was used only for testing. Now rebase the ORIGINAL
+    candidate to preserve its change ID:
+    - Rebase the original candidate (and its ancestors up to trunk, plus
+      any descendants) onto trunk using `jj rebase -b <candidate> -d <trunk>`
+    - Move trunk bookmark to the rebased original candidate (this is the
+      first and most critical operation for crash safety; the change ID
+      is preserved)
+    - Delete `jjq/queue/<id>`
+    - Describe the rebased candidate with the original commit description
+      plus trailers:
+      ```
+      <original description>
+
+      jjq-sequence: <sequence_id>
+      jjq-strategy: rebase
+      ```
+    - Abandon the duplicate (it was only used for testing)
+    - Forget the workspace (`jj workspace forget jjq-run-<padded-id>`)
+    - Delete the temporary workspace directory
+    - Output success message including sequence ID, trunk bookmark name,
+      and the candidate's change ID (which is preserved)
     - Release run lock
     - Exit with code 0
 
@@ -538,7 +651,7 @@ states between items if needed.
 | check_command not configured       | 1         |
 | Run lock unavailable               | 1         |
 | Config lock unavailable            | 1         |
-| Merge has conflicts                | 1         |
+| Landed revision has conflicts      | 1         |
 | Check command exits non-zero       | 1         |
 | Trunk moved during run             | 1         |
 | Partial success (--all, no --stop-on-failure) | 2 |
@@ -567,21 +680,80 @@ On success, the workspace MUST be removed.
 - If trunk moves during a run (e.g., user manually advances it), the
   queue item is left in place and the user can simply re-run. This
   avoids discarding commits that were added to trunk during the run.
+- The strategy may be changed between runs (e.g., via
+  `jjq config strategy rebase`). Queued items are strategy-agnostic
+  bookmarks; the strategy is read at the start of each run. Existing
+  failed items retain their original strategy's artifacts.
 
-#### Merge Revision Lifecycle
+#### Landed Revision Lifecycle
 
-The merge revision created in step 7 is a proper merge commit with two
-parents (trunk and candidate). This parentage applies regardless of
-whether the run succeeds or fails:
+The revision created in step 7 differs by strategy but follows the same
+lifecycle pattern regardless of whether the run succeeds or fails:
+
+**Merge strategy:**
+The merge revision is a proper merge commit with two parents (trunk and
+candidate).
 
 - **On success**: The merge revision becomes the new trunk head.
 - **On failure**: The merge revision remains in the DAG as a side branch.
-  The `jjq/failed/<id>` bookmark pointing to it prevents garbage collection,
-  allowing users to inspect it for debugging.
+  The `jjq/failed/<id>` bookmark prevents garbage collection, allowing
+  users to inspect it for debugging.
 
-The merge revision is NOT parented to `root()` - it is part of the
-repository's normal commit history, just not reachable from trunk
-until/unless it succeeds.
+**Rebase strategy:**
+A duplicate revision is created for testing (linear commit with trunk as
+parent). The original candidate is not modified during testing.
+
+- **On success**: The original candidate is rebased onto trunk (preserving
+  its change ID) and becomes the new trunk head, producing linear history.
+  The duplicate is abandoned. Any descendants of the candidate are rebased
+  along with it.
+- **On failure**: The duplicate remains in the DAG. The
+  `jjq/failed/<id>` bookmark prevents garbage collection, allowing
+  users to inspect it for debugging. The original candidate is
+  untouched; the user fixes and re-pushes.
+
+In both strategies, the landed revision is NOT parented to `root()` -
+it is part of the repository's normal commit history, just not reachable
+from trunk until/unless it succeeds.
+
+#### Failure Description Trailers
+
+When a queue item fails (conflicts or check failure), the landed
+revision's description MUST be set to a structured format containing
+trailers that identify the failure context. The description MUST use
+the following format:
+
+```
+Failed: merge <id> (<reason>)
+
+jjq-candidate: <change_id>
+jjq-candidate-commit: <commit_id>
+jjq-trunk: <trunk_commit_id>
+jjq-workspace: <workspace_path>
+jjq-failure: conflicts|check
+jjq-strategy: rebase|merge
+```
+
+Note: The summary line uses the word "merge" regardless of the active
+strategy. This refers to the queue item number (historically called a
+"merge"), not the landing strategy. The `jjq-strategy` trailer carries
+the actual strategy used.
+
+Where:
+- `<id>` is the sequence ID
+- `<reason>` is `conflicts` or the check failure description
+- `jjq-candidate` is the change ID of the original candidate revision
+- `jjq-candidate-commit` is the commit ID of the original candidate
+- `jjq-trunk` is the commit ID of the trunk revision at the time of
+  the run
+- `jjq-workspace` is the filesystem path to the preserved workspace
+- `jjq-failure` is either `conflicts` or `check`
+- `jjq-strategy` is either `rebase` or `merge`
+
+The `jjq-candidate` trailer is the primary key used to associate failed
+items back to their original candidate revisions (e.g., for idempotent
+re-push). The `jjq-strategy` trailer MAY be absent for backward
+compatibility; if absent, `merge` is assumed.
 
 ---
 
@@ -720,10 +892,11 @@ Get or set configuration values.
 
 #### Valid Keys
 
-| Key              | Value Type | Description                        |
-|------------------|------------|------------------------------------|
-| `trunk_bookmark` | string     | Bookmark designating trunk         |
-| `check_command`  | string     | Shell command to validate merges   |
+| Key              | Value Type | Description                          |
+|------------------|------------|--------------------------------------|
+| `trunk_bookmark` | string     | Bookmark designating trunk           |
+| `check_command`  | string     | Shell command to validate merges     |
+| `strategy`       | string     | Landing strategy (`merge` or `rebase`) |
 
 #### Behavior
 
@@ -782,7 +955,7 @@ TK TK
 ## Workspaces
 
 jjq uses jj workspaces for operations that require a working copy:
-modifying the metadata branch and executing merge checks.
+modifying the metadata branch and executing landing checks.
 
 Note that the workspace name in a jj sense is a bookmark-like identification of
 a working copy and its revisions. This is different than the directory name in

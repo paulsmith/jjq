@@ -31,6 +31,9 @@ enum Commands {
         /// Check command
         #[arg(long)]
         check: Option<String>,
+        /// Merge strategy (rebase or merge)
+        #[arg(long, default_value = "rebase")]
+        strategy: String,
     },
     /// Queue a revision for merging to trunk
     Push {
@@ -119,7 +122,9 @@ fn run() -> Result<()> {
     jj::verify_repo()?;
 
     match cli.command {
-        Commands::Init { trunk, check } => commands::init(trunk.as_deref(), check.as_deref()),
+        Commands::Init { trunk, check, strategy } => {
+            commands::init(trunk.as_deref(), check.as_deref(), &strategy)
+        }
         Commands::Push { revset } => commands::push(&revset),
         Commands::Run {
             all,
