@@ -5,7 +5,17 @@ use assert_cmd::Command;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::LazyLock;
 use tempfile::TempDir;
+
+static JJQ_BIN: LazyLock<PathBuf> = LazyLock::new(|| {
+    std::env::var_os("CARGO_BIN_EXE_jjq")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            #[allow(deprecated)]
+            assert_cmd::cargo::cargo_bin("jjq")
+        })
+});
 
 /// Test fixture for a jj repository with jjq.
 struct TestRepo {
@@ -27,198 +37,61 @@ impl TestRepo {
         TestRepo { dir, path }
     }
 
-    /// Create a test repository with main branch and optional PRs.
+    /// Create a test repository with main branch, copied from a cached template.
     fn with_go_project() -> Self {
-        let repo = Self::new();
-
-        // Create go.mod
-        fs::write(
-            repo.path.join("go.mod"),
-            "module example/jjdemo\n\ngo 1.24\n",
-        )
-        .unwrap();
-
-        // Create main.go
-        fs::write(
-            repo.path.join("main.go"),
-            r#"package main
-
-import "fmt"
-
-func main() {
-	fmt.Println("Hello, world!")
-}
-"#,
-        )
-        .unwrap();
-
-        // Create main_test.go
-        fs::write(
-            repo.path.join("main_test.go"),
-            r#"package main_test
-
-import (
-	"os/exec"
-	"testing"
-)
-
-func TestMain(t *testing.T) {
-	cmd := exec.Command("go", "run", ".")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "Hello, world!\n"
-	if string(out) != want {
-		t.Errorf("want %q, got %q", want, string(out))
-	}
-}
-"#,
-        )
-        .unwrap();
-
-        // Create Makefile
-        fs::write(
-            repo.path.join("Makefile"),
-            "all: test\ntest:\n\tgo test -v ./...\n",
-        )
-        .unwrap();
-
-        // Format and commit
-        run_in_dir(&repo.path, "go", &["fmt", "./..."]);
-        run_jj(&repo.path, &["desc", "-m", "initial"]);
-        run_jj(&repo.path, &["bookmark", "create", "main"]);
-
-        repo
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let path = dir.path().to_path_buf();
+        copy_dir_all(&GO_PROJECT_TEMPLATE.path, &path)
+            .expect("failed to copy go project template");
+        TestRepo { dir, path }
     }
 
-    /// Create a full test repo with all 4 PRs.
+    /// Create a full test repo with all 4 PRs, copied from a cached template.
     fn with_prs() -> Self {
-        let repo = Self::with_go_project();
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let path = dir.path().to_path_buf();
+        copy_dir_all(&PRS_TEMPLATE.path, &path)
+            .expect("failed to copy prs template");
+        TestRepo { dir, path }
+    }
 
-        // PR1: Add greeting package
-        run_jj(&repo.path, &["new", "-m", "add greeting pkg", "main"]);
-        fs::create_dir_all(repo.path.join("say")).unwrap();
-        fs::write(
-            repo.path.join("say/greet.go"),
-            r#"package say
+    /// Create a repo with 3 non-conflicting branches (f1/f2/f3) for run --all success tests.
+    fn with_run_all_happy_scenario() -> Self {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let path = dir.path().to_path_buf();
+        copy_dir_all(&RUN_ALL_HAPPY_TEMPLATE.path, &path)
+            .expect("failed to copy run-all happy template");
+        TestRepo { dir, path }
+    }
 
-func Greet(name string) string {
-	return "Hello, " + name + "!"
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            repo.path.join("main.go"),
-            r#"package main
+    /// Create a repo with f1/f2/f3 where f2 conflicts after f1, and f3 is clean.
+    fn with_run_all_conflict_scenario() -> Self {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let path = dir.path().to_path_buf();
+        copy_dir_all(&RUN_ALL_CONFLICT_TEMPLATE.path, &path)
+            .expect("failed to copy run-all conflict template");
+        TestRepo { dir, path }
+    }
 
-import (
-	"fmt"
-
-	"example/jjdemo/say"
-)
-
-func main() {
-	fmt.Println(say.Greet("world"))
-}
-"#,
-        )
-        .unwrap();
-        run_in_dir(&repo.path, "go", &["fmt", "./..."]);
-        run_jj(&repo.path, &["bookmark", "create", "pr1"]);
-
-        // PR2: Add goodbye
-        run_jj(&repo.path, &["new", "-m", "add goodbye", "main"]);
-        fs::create_dir_all(repo.path.join("say")).unwrap();
-        fs::write(
-            repo.path.join("say/bye.go"),
-            r#"package say
-
-func Bye() string {
-	return "Goodbye."
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            repo.path.join("main.go"),
-            r#"package main
-
-import (
-	"fmt"
-
-	"example/jjdemo/say"
-)
-
-func main() {
-	fmt.Println("Hello, world!")
-	fmt.Println(say.Bye())
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            repo.path.join("main_test.go"),
-            r#"package main_test
-
-import (
-	"os/exec"
-	"testing"
-)
-
-func TestMain(t *testing.T) {
-	cmd := exec.Command("go", "run", ".")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "Hello, world!\nGoodbye.\n"
-	if string(out) != want {
-		t.Errorf("want %q, got %q", want, string(out))
-	}
-}
-"#,
-        )
-        .unwrap();
-        run_in_dir(&repo.path, "go", &["fmt", "./..."]);
-        run_jj(&repo.path, &["bookmark", "create", "pr2"]);
-
-        // PR3: Add comment
-        run_jj(&repo.path, &["new", "-m", "add comment", "main"]);
-        fs::write(
-            repo.path.join("main.go"),
-            r#"package main
-
-import "fmt"
-
-func main() {
-	// say hi
-	fmt.Println("Hello, world!")
-}
-"#,
-        )
-        .unwrap();
-        run_in_dir(&repo.path, "go", &["fmt", "./..."]);
-        run_jj(&repo.path, &["bookmark", "create", "pr3"]);
-
-        // PR4: Add readme
-        run_jj(&repo.path, &["new", "-m", "add readme", "main"]);
-        fs::write(repo.path.join("README.md"), "# jjq demo\n").unwrap();
-        run_jj(&repo.path, &["bookmark", "create", "pr4"]);
-
-        // Return to main
-        run_jj(&repo.path, &["new", "main"]);
-
-        repo
+    /// Create a repo with f1 clean, f2/f3 conflicting, for partial failure exit-code tests.
+    fn with_run_all_partial_scenario() -> Self {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let path = dir.path().to_path_buf();
+        copy_dir_all(&RUN_ALL_PARTIAL_TEMPLATE.path, &path)
+            .expect("failed to copy run-all partial template");
+        TestRepo { dir, path }
     }
 
     /// Get a jjq Command configured for this repo.
     fn jjq(&self) -> Command {
-        #[allow(deprecated)]
-        let mut cmd = Command::cargo_bin("jjq").unwrap();
+        let mut cmd = Command::new(&*JJQ_BIN);
         cmd.current_dir(&self.path);
         cmd.env("NON_INTERACTIVE", "1");
+        // Speed up jj subprocess calls within jjq
+        cmd.env("JJ_OP_HOSTNAME", "test");
+        cmd.env("JJ_OP_USERNAME", "test");
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd.env("HOME", &self.path);
         cmd
     }
 
@@ -277,6 +150,10 @@ func main() {
         let output = process::Command::new("jj")
             .current_dir(&self.path)
             .args(["file", "show", path, "-r", rev])
+            .env("JJ_OP_HOSTNAME", "test")
+            .env("JJ_OP_USERNAME", "test")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &self.path)
             .output()
             .expect("failed to run jj");
         output.status.success()
@@ -292,10 +169,13 @@ func main() {
 
     /// Run jjq with additional environment variables.
     fn jjq_with_env(&self, args: &[&str], env_vars: &[(&str, &str)]) -> String {
-        #[allow(deprecated)]
-        let mut cmd = Command::cargo_bin("jjq").unwrap();
+        let mut cmd = Command::new(&*JJQ_BIN);
         cmd.current_dir(&self.path);
         cmd.env("NON_INTERACTIVE", "1");
+        cmd.env("JJ_OP_HOSTNAME", "test");
+        cmd.env("JJ_OP_USERNAME", "test");
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd.env("HOME", &self.path);
         for (key, value) in env_vars {
             cmd.env(key, value);
         }
@@ -334,6 +214,10 @@ fn run_jj(dir: &Path, args: &[&str]) -> String {
     let output = process::Command::new("jj")
         .current_dir(dir)
         .args(args)
+        .env("JJ_OP_HOSTNAME", "test")
+        .env("JJ_OP_USERNAME", "test")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", dir)
         .output()
         .expect("failed to run jj");
 
@@ -345,20 +229,312 @@ fn run_jj(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-/// Run a command in the given directory.
-fn run_in_dir(dir: &Path, cmd: &str, args: &[&str]) -> String {
-    let output = process::Command::new(cmd)
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .unwrap_or_else(|_| panic!("failed to run {}", cmd));
-
-    String::from_utf8_lossy(&output.stdout).to_string()
+/// Recursively copy a directory tree.
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            fs::create_dir_all(&dst_path)?;
+            copy_dir_all(&entry.path(), &dst_path)?;
+        } else {
+            fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
 }
+
+/// Pre-built repository template, created once and copied for each test.
+struct RepoTemplate {
+    _dir: TempDir,
+    path: PathBuf,
+}
+
+/// Cached template: jj repo with a Go project (main branch with initial commit).
+/// All Go code is pre-formatted so no `go fmt` call is needed.
+static GO_PROJECT_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    let dir = TempDir::new().expect("failed to create template dir");
+    let path = dir.path().to_path_buf();
+
+    run_jj(&path, &["git", "init", "."]);
+
+    fs::write(
+        path.join("go.mod"),
+        "module example/jjdemo\n\ngo 1.24\n",
+    )
+    .unwrap();
+
+    fs::write(
+        path.join("main.go"),
+        r#"package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("Hello, world!")
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        path.join("main_test.go"),
+        r#"package main_test
+
+import (
+	"os/exec"
+	"testing"
+)
+
+func TestMain(t *testing.T) {
+	cmd := exec.Command("go", "run", ".")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Hello, world!\n"
+	if string(out) != want {
+		t.Errorf("want %q, got %q", want, string(out))
+	}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        path.join("Makefile"),
+        "all: test\ntest:\n\tgo test -v ./...\n",
+    )
+    .unwrap();
+
+    run_jj(&path, &["desc", "-m", "initial"]);
+    run_jj(&path, &["bookmark", "create", "main"]);
+
+    RepoTemplate { _dir: dir, path }
+});
+
+/// Cached template: Go project with 4 PRs branching off main.
+static PRS_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    let dir = TempDir::new().expect("failed to create prs template dir");
+    let path = dir.path().to_path_buf();
+    copy_dir_all(&GO_PROJECT_TEMPLATE.path, &path)
+        .expect("failed to copy go project template for prs");
+
+    // PR1: Add greeting package
+    run_jj(&path, &["new", "-m", "add greeting pkg", "main"]);
+    fs::create_dir_all(path.join("say")).unwrap();
+    fs::write(
+        path.join("say/greet.go"),
+        r#"package say
+
+func Greet(name string) string {
+	return "Hello, " + name + "!"
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        path.join("main.go"),
+        r#"package main
+
+import (
+	"fmt"
+
+	"example/jjdemo/say"
+)
+
+func main() {
+	fmt.Println(say.Greet("world"))
+}
+"#,
+    )
+    .unwrap();
+    run_jj(&path, &["bookmark", "create", "pr1"]);
+
+    // PR2: Add goodbye
+    run_jj(&path, &["new", "-m", "add goodbye", "main"]);
+    fs::create_dir_all(path.join("say")).unwrap();
+    fs::write(
+        path.join("say/bye.go"),
+        r#"package say
+
+func Bye() string {
+	return "Goodbye."
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        path.join("main.go"),
+        r#"package main
+
+import (
+	"fmt"
+
+	"example/jjdemo/say"
+)
+
+func main() {
+	fmt.Println("Hello, world!")
+	fmt.Println(say.Bye())
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        path.join("main_test.go"),
+        r#"package main_test
+
+import (
+	"os/exec"
+	"testing"
+)
+
+func TestMain(t *testing.T) {
+	cmd := exec.Command("go", "run", ".")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Hello, world!\nGoodbye.\n"
+	if string(out) != want {
+		t.Errorf("want %q, got %q", want, string(out))
+	}
+}
+"#,
+    )
+    .unwrap();
+    run_jj(&path, &["bookmark", "create", "pr2"]);
+
+    // PR3: Add comment
+    run_jj(&path, &["new", "-m", "add comment", "main"]);
+    fs::write(
+        path.join("main.go"),
+        r#"package main
+
+import "fmt"
+
+func main() {
+	// say hi
+	fmt.Println("Hello, world!")
+}
+"#,
+    )
+    .unwrap();
+    run_jj(&path, &["bookmark", "create", "pr3"]);
+
+    // PR4: Add readme
+    run_jj(&path, &["new", "-m", "add readme", "main"]);
+    fs::write(path.join("README.md"), "# jjq demo\n").unwrap();
+    run_jj(&path, &["bookmark", "create", "pr4"]);
+
+    // Return to main
+    run_jj(&path, &["new", "main"]);
+
+    RepoTemplate { _dir: dir, path }
+});
+
+/// Cached template: 3 non-conflicting branches off main for run --all happy path.
+static RUN_ALL_HAPPY_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    let dir = TempDir::new().expect("failed to create run-all happy template dir");
+    let path = dir.path().to_path_buf();
+    copy_dir_all(&GO_PROJECT_TEMPLATE.path, &path)
+        .expect("failed to copy go project template for run-all happy template");
+
+    run_jj(&path, &["new", "-m", "feature 1", "main"]);
+    fs::write(path.join("f1.txt"), "feature 1").unwrap();
+    run_jj(&path, &["bookmark", "create", "f1"]);
+
+    run_jj(&path, &["new", "-m", "feature 2", "main"]);
+    fs::write(path.join("f2.txt"), "feature 2").unwrap();
+    run_jj(&path, &["bookmark", "create", "f2"]);
+
+    run_jj(&path, &["new", "-m", "feature 3", "main"]);
+    fs::write(path.join("f3.txt"), "feature 3").unwrap();
+    run_jj(&path, &["bookmark", "create", "f3"]);
+
+    run_jj(&path, &["new", "main"]);
+
+    RepoTemplate { _dir: dir, path }
+});
+
+/// Cached template: f2 conflicts after f1 lands; f3 merges cleanly.
+static RUN_ALL_CONFLICT_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    let dir = TempDir::new().expect("failed to create run-all conflict template dir");
+    let path = dir.path().to_path_buf();
+    copy_dir_all(&GO_PROJECT_TEMPLATE.path, &path)
+        .expect("failed to copy go project template for run-all conflict template");
+
+    run_jj(&path, &["new", "-m", "feature 1", "main"]);
+    fs::write(
+        path.join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 1\")\n}\n",
+    )
+    .unwrap();
+    run_jj(&path, &["bookmark", "create", "f1"]);
+
+    run_jj(&path, &["new", "-m", "feature 2", "main"]);
+    fs::write(
+        path.join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 2\")\n}\n",
+    )
+    .unwrap();
+    run_jj(&path, &["bookmark", "create", "f2"]);
+
+    run_jj(&path, &["new", "-m", "feature 3", "main"]);
+    fs::write(path.join("f3.txt"), "feature 3").unwrap();
+    run_jj(&path, &["bookmark", "create", "f3"]);
+
+    run_jj(&path, &["new", "main"]);
+
+    RepoTemplate { _dir: dir, path }
+});
+
+/// Cached template: f1 is clean; f2/f3 conflict with each other after f1 lands.
+static RUN_ALL_PARTIAL_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    let dir = TempDir::new().expect("failed to create run-all partial template dir");
+    let path = dir.path().to_path_buf();
+    copy_dir_all(&GO_PROJECT_TEMPLATE.path, &path)
+        .expect("failed to copy go project template for run-all partial template");
+
+    run_jj(&path, &["new", "-m", "feature 1", "main"]);
+    fs::write(path.join("f1.txt"), "feature 1").unwrap();
+    run_jj(&path, &["bookmark", "create", "f1"]);
+
+    run_jj(&path, &["new", "-m", "feature 2", "main"]);
+    fs::write(
+        path.join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 2\")\n}\n",
+    )
+    .unwrap();
+    run_jj(&path, &["bookmark", "create", "f2"]);
+
+    run_jj(&path, &["new", "-m", "feature 3", "main"]);
+    fs::write(
+        path.join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 3\")\n}\n",
+    )
+    .unwrap();
+    run_jj(&path, &["bookmark", "create", "f3"]);
+
+    run_jj(&path, &["new", "main"]);
+
+    RepoTemplate { _dir: dir, path }
+});
 
 /// Normalize output for snapshot comparison.
 /// Replaces change IDs, commit IDs, paths, and other variable content.
 fn normalize_output(output: &str, repo_path: &Path) -> String {
+    static RE_TEMP: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"/var/folders/[^\s]+|/tmp/[^\s]+|/private/var/folders/[^\s]+").unwrap()
+    });
+    static RE_CHANGE_ID: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\b[a-z]{12}\b").unwrap()
+    });
+    static RE_NOW_AT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\(now at [a-z]+\)").unwrap()
+    });
+
     let mut result = output.to_string();
 
     // Replace the repo path with a placeholder
@@ -366,17 +542,13 @@ fn normalize_output(output: &str, repo_path: &Path) -> String {
     result = result.replace(&*repo_str, "<REPO>");
 
     // Replace temp directory paths (various formats)
-    let re_temp =
-        regex::Regex::new(r"/var/folders/[^\s]+|/tmp/[^\s]+|/private/var/folders/[^\s]+").unwrap();
-    result = re_temp.replace_all(&result, "<TEMP_PATH>").to_string();
+    result = RE_TEMP.replace_all(&result, "<TEMP_PATH>").to_string();
 
     // Replace change IDs (12 lowercase letters)
-    let re_change_id = regex::Regex::new(r"\b[a-z]{12}\b").unwrap();
-    result = re_change_id.replace_all(&result, "<CHANGE_ID>").to_string();
+    result = RE_CHANGE_ID.replace_all(&result, "<CHANGE_ID>").to_string();
 
     // Replace short change IDs in "now at <id>" pattern
-    let re_now_at = regex::Regex::new(r"\(now at [a-z]+\)").unwrap();
-    result = re_now_at
+    result = RE_NOW_AT
         .replace_all(&result, "(now at <CHANGE_ID>)")
         .to_string();
 
@@ -588,21 +760,8 @@ fn test_run_check_failure() {
 
 #[test]
 fn test_run_all() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::with_run_all_happy_scenario();
     repo.init_jjq_merge();
-
-    // Create multiple branches
-    run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
-    fs::write(repo.path().join("f1.txt"), "feature 1").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f1"]);
-
-    run_jj(repo.path(), &["new", "-m", "feature 2", "main"]);
-    fs::write(repo.path().join("f2.txt"), "feature 2").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f2"]);
-
-    run_jj(repo.path(), &["new", "-m", "feature 3", "main"]);
-    fs::write(repo.path().join("f3.txt"), "feature 3").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f3"]);
 
     // Push all
     repo.jjq_success(&["push", "f1"]);
@@ -732,7 +891,9 @@ fn test_sequence_id_validation() {
 #[test]
 fn test_full_workflow_with_prs() {
     let repo = TestRepo::with_prs();
-    repo.init_jjq_merge_with_check("make");
+    // This test validates queue/conflict behavior; an expensive project build
+    // check is unnecessary here.
+    repo.init_jjq_merge_with_check("true");
 
     // Push all PRs
     let push1 = repo.jjq_success(&["push", "pr1"]);
@@ -863,31 +1024,8 @@ fn test_log_hint_shown_once_when_forced() {
 
 #[test]
 fn test_run_all_stop_on_failure_flag() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::with_run_all_conflict_scenario();
     repo.init_jjq_merge();
-
-    // f1: modifies main.go (will merge cleanly against trunk)
-    run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
-    fs::write(
-        repo.path().join("main.go"),
-        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 1\")\n}\n",
-    )
-    .unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f1"]);
-
-    // f2: also modifies main.go differently — will conflict after f1 merges
-    run_jj(repo.path(), &["new", "-m", "feature 2", "main"]);
-    fs::write(
-        repo.path().join("main.go"),
-        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 2\")\n}\n",
-    )
-    .unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f2"]);
-
-    // f3: clean merge (just adds a file)
-    run_jj(repo.path(), &["new", "-m", "feature 3", "main"]);
-    fs::write(repo.path().join("f3.txt"), "feature 3").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f3"]);
 
     repo.jjq_success(&["push", "f1"]);
     repo.jjq_success(&["push", "f2"]);
@@ -927,31 +1065,8 @@ fn test_run_all_stop_on_failure_flag() {
 
 #[test]
 fn test_run_all_continues_on_failure() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::with_run_all_conflict_scenario();
     repo.init_jjq_merge();
-
-    // f1: modifies main.go (will merge cleanly against trunk)
-    run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
-    fs::write(
-        repo.path().join("main.go"),
-        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 1\")\n}\n",
-    )
-    .unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f1"]);
-
-    // f2: also modifies main.go differently — will conflict after f1 merges
-    run_jj(repo.path(), &["new", "-m", "feature 2", "main"]);
-    fs::write(
-        repo.path().join("main.go"),
-        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 2\")\n}\n",
-    )
-    .unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f2"]);
-
-    // f3: clean merge (just adds a file)
-    run_jj(repo.path(), &["new", "-m", "feature 3", "main"]);
-    fs::write(repo.path().join("f3.txt"), "feature 3").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f3"]);
 
     repo.jjq_success(&["push", "f1"]);
     repo.jjq_success(&["push", "f2"]);
@@ -983,31 +1098,8 @@ fn test_run_all_continues_on_failure() {
 
 #[test]
 fn test_run_all_partial_failure_exit_code() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::with_run_all_partial_scenario();
     repo.init_jjq_merge();
-
-    // f1: clean merge
-    run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
-    fs::write(repo.path().join("f1.txt"), "feature 1").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f1"]);
-
-    // f2: will conflict (modifies main.go)
-    run_jj(repo.path(), &["new", "-m", "feature 2", "main"]);
-    fs::write(
-        repo.path().join("main.go"),
-        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 2\")\n}\n",
-    )
-    .unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f2"]);
-
-    // f3: also modifies main.go differently — will conflict after f1 merges
-    run_jj(repo.path(), &["new", "-m", "feature 3", "main"]);
-    fs::write(
-        repo.path().join("main.go"),
-        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"feature 3\")\n}\n",
-    )
-    .unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f3"]);
 
     repo.jjq_success(&["push", "f1"]);
     repo.jjq_success(&["push", "f2"]);
@@ -1471,22 +1563,27 @@ fn test_log_file_truncated_between_runs() {
     let repo = TestRepo::with_go_project();
     repo.init_jjq_merge_with_check("echo run-output-marker");
 
-    // First run
+    let log_path = repo.path().join(".jj").join("jjq-run.log");
+    // Seed a stale log to verify run truncates rather than appends.
+    fs::write(
+        &log_path,
+        "stale-marker\n--- jjq: run complete\nstale-tail\n--- jjq: run complete\n",
+    )
+    .unwrap();
+
     run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
     fs::write(repo.path().join("f1.txt"), "content").unwrap();
     run_jj(repo.path(), &["bookmark", "create", "f1"]);
     repo.jjq_success(&["push", "f1"]);
     repo.jjq_success(&["run"]);
 
-    // Second run
-    run_jj(repo.path(), &["new", "-m", "feature 2", "main"]);
-    fs::write(repo.path().join("f2.txt"), "content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f2"]);
-    repo.jjq_success(&["push", "f2"]);
-    repo.jjq_success(&["run"]);
-
-    let log_path = repo.path().join(".jj").join("jjq-run.log");
     let contents = fs::read_to_string(&log_path).unwrap();
+
+    assert!(
+        !contents.contains("stale-marker"),
+        "stale contents should be truncated away: {}",
+        contents
+    );
 
     // Log should contain exactly one sentinel (file was truncated)
     let sentinel_count = contents.matches("--- jjq: run complete").count();
