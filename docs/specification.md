@@ -360,6 +360,9 @@ When shown, the hint SHOULD suggest running:
 jj config set --repo revsets.log '~ ::jjq/_/_'
 ```
 
+Implementations SHOULD also configure this filter automatically during
+initialization (`init` command).
+
 After displaying the hint, implementations MUST create the `log_hint_shown`
 file in the metadata branch to prevent the hint from appearing again.
 The file contents are not significant; its presence is the marker.

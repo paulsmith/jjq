@@ -629,6 +629,40 @@ fn test_config_invalid_key() {
 }
 
 #[test]
+fn test_init_sets_log_filter() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // init should automatically configure jj to hide jjq metadata
+    let config_output = run_jj(repo.path(), &["config", "get", "revsets.log"]);
+    assert!(
+        config_output.contains("jjq/_/_"),
+        "init should set revsets.log to hide jjq metadata: {}",
+        config_output
+    );
+}
+
+#[test]
+fn test_init_log_filter_preserves_existing() {
+    let repo = TestRepo::with_go_project();
+
+    // Set a custom revsets.log before init
+    run_jj(
+        repo.path(),
+        &["config", "set", "--repo", "revsets.log", "all()"],
+    );
+
+    repo.init_jjq();
+
+    let config_output = run_jj(repo.path(), &["config", "get", "revsets.log"]);
+    assert!(
+        config_output.contains("(all()) ~ ::jjq/_/_"),
+        "init should wrap existing filter and append exclusion: {}",
+        config_output
+    );
+}
+
+#[test]
 fn test_push_and_status() {
     let repo = TestRepo::with_go_project();
     repo.init_jjq();
@@ -996,6 +1030,9 @@ fn test_log_hint_not_shown_in_non_tty() {
 fn test_log_hint_shown_once_when_forced() {
     let repo = TestRepo::with_go_project();
     repo.init_jjq();
+
+    // Remove log filter to simulate a repo initialized before auto-setup
+    run_jj(repo.path(), &["config", "unset", "--repo", "revsets.log"]);
 
     // First push with forced hint - should show hint
     let output1 = repo.jjq_with_env(&["push", "main"], &[("JJQTEST_FORCE_HINT", "1")]);

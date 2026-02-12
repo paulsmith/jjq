@@ -263,6 +263,9 @@ pub fn init(trunk: Option<&str>, check: Option<&str>, strategy: &str) -> Result<
     })?;
     config::set("strategy", strategy_val.as_str())?;
 
+    // Configure jj to hide jjq metadata from jj log
+    setup_log_filter()?;
+
     println!();
     println!("Initialized jjq:");
     println!("  trunk_bookmark = {}", trunk_value);
@@ -277,6 +280,25 @@ pub fn init(trunk: Option<&str>, check: Option<&str>, strategy: &str) -> Result<
     println!();
     println!("Ready to go! Queue revisions with 'jjq push <revset>'.");
 
+    Ok(())
+}
+
+/// Configure jj's revsets.log to exclude jjq metadata from `jj log`.
+/// Composes with any existing filter value.
+fn setup_log_filter() -> Result<()> {
+    let exclude = format!("~ ::{}", config::JJQ_BOOKMARK);
+
+    let value = if let Ok(Some(current)) = jj::config_get("revsets.log") {
+        if current.contains(config::JJQ_BOOKMARK) {
+            return Ok(());
+        }
+        format!("({}) {}", current, exclude)
+    } else {
+        exclude
+    };
+
+    jj::config_set_repo("revsets.log", &value)?;
+    prefout("configured jj to hide jjq metadata from 'jj log'");
     Ok(())
 }
 
@@ -1223,7 +1245,21 @@ pub fn doctor() -> Result<()> {
         }
     }
 
-    // 6. run lock
+    // 6. jj log filter hides jjq metadata
+    if let Ok(Some(current_log)) = jj::config_get("revsets.log")
+        && current_log.contains(config::JJQ_BOOKMARK)
+    {
+        print_check("ok", "jj log hides jjq metadata");
+    } else {
+        print_check("WARN", "jj log does not hide jjq metadata");
+        print_hint(&format!(
+            "to fix: jj config set --repo revsets.log '~ ::{}'",
+            config::JJQ_BOOKMARK
+        ));
+        warns += 1;
+    }
+
+    // 7. run lock
     match lock::lock_state("run")? {
         lock::LockState::Free => print_check("ok", "run lock is free"),
         lock::LockState::Held => {

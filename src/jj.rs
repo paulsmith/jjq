@@ -16,6 +16,11 @@ pub fn config_get(key: &str) -> Result<Option<String>> {
     }
 }
 
+/// Set a jj config value at repo scope.
+pub fn config_set_repo(key: &str, value: &str) -> Result<()> {
+    run_quiet(&["config", "set", "--repo", key, value])
+}
+
 /// Execute a jj command and return the output.
 pub fn run(args: &[&str]) -> Result<Output> {
     let mut full_args = vec!["--color=never"];

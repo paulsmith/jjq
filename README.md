@@ -152,14 +152,12 @@ branch:
 - Failed items: `jjq/failed/000001`, ...
 - Metadata branch: `jjq/_/_` (parented to `root()`)
 
-To hide jjq metadata from `jj log`, add this to `.jj/repo/config.toml`:
+`jjq init` automatically configures `jj log` to hide jjq metadata.
+For repositories initialized before this feature, run:
 
-```toml
-[revsets]
-log = "~ ::jjq/_/_"
+```sh
+jj config set --repo revsets.log '~ ::jjq/_/_'
 ```
-
-(jjq shows this hint on first interactive use)
 
 ## Configuration
 
