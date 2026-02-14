@@ -24,10 +24,12 @@ pub fn parse_seq_id(input: &str) -> Result<u32> {
         bail!("invalid sequence ID: '{}' (must be numeric)", input);
     }
 
-    let id: u32 = input.parse().unwrap_or(0);
+    let id: u32 = input
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid sequence ID: {} (must be 1-999999)", input))?;
 
     if !(1..=999999).contains(&id) {
-        bail!("invalid sequence ID: {} (must be 1-999999)", id);
+        bail!("invalid sequence ID: {} (must be 1-999999)", input);
     }
 
     Ok(id)
