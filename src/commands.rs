@@ -746,8 +746,8 @@ fn run_one() -> Result<RunResult> {
 
             // Move trunk to the rebased original (not the duplicate)
             // The candidate_change_id is now rebased onto trunk
-            jj::bookmark_delete(&queue_bookmark)?;
             jj::bookmark_move(&trunk_bookmark, &trunk_commit_id, &candidate_change_id)?;
+            jj::bookmark_delete(&queue_bookmark)?;
 
             // Describe the landed commit with trailers
             let desc = format!(
