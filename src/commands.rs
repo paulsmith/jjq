@@ -1259,7 +1259,7 @@ pub fn doctor() -> Result<()> {
         warns += 1;
     }
 
-    // 7. run lock
+    // 7. locks
     match lock::lock_state("run")? {
         lock::LockState::Free => print_check("ok", "run lock is free"),
         lock::LockState::Held => {
@@ -1268,7 +1268,7 @@ pub fn doctor() -> Result<()> {
         }
     }
 
-    // 7. id lock
+    // (id lock)
     match lock::lock_state("id")? {
         lock::LockState::Free => print_check("ok", "id lock is free"),
         lock::LockState::Held => {
