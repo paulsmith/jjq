@@ -1346,23 +1346,26 @@ pub fn clean() -> Result<()> {
     for line in ws_output.lines() {
         let ws_name = line.split_whitespace().next().unwrap_or("");
         let ws_name = ws_name.trim_end_matches(':');
-        if !ws_name.starts_with("jjq-run-") {
+        let is_jjq = ws_name.starts_with("jjq-run-")
+            || ws_name.starts_with("jjq-config-")
+            || ws_name.starts_with("jjq-meta-");
+        if !is_jjq {
             continue;
         }
 
-        // Extract ID from workspace name
-        let ws_id_str = ws_name.strip_prefix("jjq-run-").unwrap_or("000000");
-        let plain_id: u32 = ws_id_str.parse().unwrap_or(0);
-
-        // Check if corresponding failed bookmark exists
-        let label = if queue::failed_item_exists(plain_id)? {
-            format!("failed item {}", plain_id)
+        // For run workspaces, extract the queue item ID and look up details.
+        // Config/meta workspaces don't correspond to queue items.
+        let (label, workspace_path) = if let Some(ws_id_str) = ws_name.strip_prefix("jjq-run-") {
+            let plain_id: u32 = ws_id_str.parse().unwrap_or(0);
+            let label = if queue::failed_item_exists(plain_id)? {
+                format!("failed item {}", plain_id)
+            } else {
+                "orphaned".to_string()
+            };
+            (label, lookup_workspace_path(plain_id))
         } else {
-            "orphaned".to_string()
+            ("orphaned".to_string(), None)
         };
-
-        // Look up workspace path
-        let workspace_path = lookup_workspace_path(plain_id);
 
         // Forget the workspace
         let _ = jj::workspace_forget(ws_name);
