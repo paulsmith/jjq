@@ -44,17 +44,24 @@ pub fn tail(all: bool, follow: bool) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    let start = if all || lines.len() <= 20 {
+    let visible: Vec<&str> = lines
+        .iter()
+        .filter(|l| !l.starts_with(crate::runlog::SENTINEL_PREFIX))
+        .copied()
+        .collect();
+    let already_finished = lines
+        .iter()
+        .any(|l| l.starts_with(crate::runlog::SENTINEL_PREFIX));
+    let start = if all || visible.len() <= 20 {
         0
     } else {
-        lines.len() - 20
+        visible.len() - 20
     };
-    for line in &lines[start..] {
+    for line in &visible[start..] {
         writeln!(out, "{}", line)?;
-        if line.starts_with(crate::runlog::SENTINEL_PREFIX) {
-            // Run already finished during initial print.
-            return Ok(());
-        }
+    }
+    if already_finished {
+        return Ok(());
     }
     out.flush()?;
 
