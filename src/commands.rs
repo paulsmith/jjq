@@ -43,7 +43,7 @@ struct FailedItem {
 
 /// Check if a workspace name belongs to jjq (and should be cleaned up by doctor/clean).
 /// Covers all workspace naming patterns: jjq-run-*, jjq-config-*, jjq-meta-*,
-/// jjq-check-*, jjq-hint-*, and bare jjq<PID> from init/next_id.
+/// jjq-check-*, jjq-hint-*, and bare "jjq{PID}" from init/next_id.
 fn is_jjq_workspace(name: &str) -> bool {
     name.starts_with("jjq-") || (name.starts_with("jjq") && name.len() > 3)
 }
@@ -374,16 +374,16 @@ pub fn push(revset: &str) -> Result<()> {
 
     // Idempotent push: clean up existing queue/failed entries for this change
 
-    // Scan queue bookmarks
+    // Scan queue bookmarks (one subprocess per bookmark for both IDs)
     let queue_bookmarks = jj::bookmark_list_glob("jjq/queue/??????")?;
     for bookmark in &queue_bookmarks {
-        let entry_commit_id = jj::get_commit_id(&format!("bookmarks(exact:{})", bookmark))?;
+        let revset = format!("bookmarks(exact:{})", bookmark);
+        let (entry_change_id, entry_commit_id) = jj::resolve_revset_full(&revset)?;
         if entry_commit_id == commit_id {
             let entry_id = extract_id_from_bookmark(bookmark);
             preferr(&format!("revision already queued at {}", entry_id));
             return Err(ExitError::new(exit_codes::USAGE, "revision already queued").into());
         }
-        let entry_change_id = jj::resolve_revset(&format!("bookmarks(exact:{})", bookmark))?;
         if entry_change_id == change_id {
             let entry_id = extract_id_from_bookmark(bookmark);
             jj::bookmark_delete(bookmark)?;
@@ -405,10 +405,19 @@ pub fn push(revset: &str) -> Result<()> {
         }
     }
 
-    // Pre-flight conflict check using headless merge commit
+    // Pre-flight conflict check using headless merge commit.
+    // Ensure the temporary commit is always abandoned, even if has_conflicts errors.
     let conflict_check_id = jj::new_rev(&[&trunk_bookmark, revset])?;
-    let has_conflicts = jj::has_conflicts(&conflict_check_id)?;
-    jj::abandon(&conflict_check_id)?;
+    let has_conflicts = match jj::has_conflicts(&conflict_check_id) {
+        Ok(v) => {
+            jj::abandon(&conflict_check_id)?;
+            v
+        }
+        Err(e) => {
+            let _ = jj::abandon(&conflict_check_id);
+            return Err(e);
+        }
+    };
 
     if has_conflicts {
         preferr(&format!(

@@ -35,10 +35,10 @@ jjq stores all state in the jj repository itself:
 
 | Command | Function |
 |---------|----------|
-| `init [--trunk <bookmark>] [--check <cmd>]` | Initialize jjq, set trunk and check command |
+| `init [--trunk <bookmark>] [--check <cmd>] [--strategy <strategy>]` | Initialize jjq, set trunk, check command, and strategy |
 | `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID) |
 | `run [--all] [--stop-on-failure]` | Process next queue item, or all items in batch |
-| `check [--rev <revset>]` | Run check command against a revision (default @) |
+| `check [--rev <revset>] [-v]` | Run check command against a revision (default @); -v shows workspace/env details |
 | `status [id] [--json] [--resolve]` | Show queue and recent failures; supports JSON output and single-item detail view |
 | `delete <id>` | Remove item from queue/failed |
 | `config [key] [value]` | Get/set configuration |

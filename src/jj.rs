@@ -61,10 +61,16 @@ pub fn verify_repo() -> Result<()> {
     Ok(())
 }
 
-/// Get the repository root path.
+/// Get the repository root path (cached after first call).
 pub fn repo_root() -> Result<PathBuf> {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(root) = ROOT.get() {
+        return Ok(root.clone());
+    }
     let output = run_ok(&["root"])?;
-    Ok(PathBuf::from(output.trim()))
+    let root = PathBuf::from(output.trim());
+    let _ = ROOT.set(root.clone());
+    Ok(root)
 }
 
 /// Check if a bookmark exists.

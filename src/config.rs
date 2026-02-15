@@ -2,7 +2,6 @@
 // ABOUTME: Handles reading/writing config values from config/ directory.
 
 use anyhow::{Result, bail};
-use std::convert::TryFrom;
 use std::env;
 use std::fs;
 use std::io::IsTerminal;

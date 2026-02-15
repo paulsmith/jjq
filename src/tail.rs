@@ -2,7 +2,8 @@
 // ABOUTME: Supports dump mode and follow mode with poll-based file tailing.
 
 use anyhow::Result;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// View check command output, optionally following new output in real time.
 ///
@@ -65,23 +66,40 @@ pub fn tail(all: bool, follow: bool) -> Result<()> {
     }
     out.flush()?;
 
-    // Track our read position by byte offset.
-    let mut offset = content.len();
+    // Track our read position by byte offset; use seek-based reads
+    // to avoid re-reading the entire file each iteration.
+    let mut offset = content.len() as u64;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let current = std::fs::read_to_string(&path)?;
-        if current.len() > offset {
-            let new_data = &current[offset..];
-            for line in new_data.lines() {
+        let mut file = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                eprintln!("jjq: log file disappeared");
+                return Ok(());
+            }
+        };
+
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+        if file_len < offset {
+            // File was truncated (new run started); reset to beginning
+            offset = 0;
+        }
+
+        if file_len > offset {
+            file.seek(SeekFrom::Start(offset))?;
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)?;
+            for line in buf.lines() {
                 if line.starts_with(crate::runlog::SENTINEL_PREFIX) {
                     return Ok(());
                 }
                 writeln!(out, "{}", line)?;
             }
             out.flush()?;
-            offset = current.len();
+            offset = file_len;
         } else if !crate::lock::is_held("run")? {
             eprintln!("jjq: run process is no longer active");
             return Ok(());

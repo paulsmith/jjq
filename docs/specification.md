@@ -947,8 +947,6 @@ Get or set configuration values.
 
 ---
 
----
-
 ## Workspaces
 
 jjq uses jj workspaces for operations that require a working copy:

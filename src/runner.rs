@@ -153,9 +153,9 @@ pub fn run_check_command(command: &str, log_path: &Path) -> Result<ExitStatus> {
             libc::tcgetattr(libc::STDIN_FILENO, &mut t);
             t
         };
-        // Ignore the error: set_handler can only be called once per process.
-        #[allow(clippy::let_unit_value)]
-        let _ = ctrlc::set_handler(move || {
+        // ctrlc::set_handler can only be called once per process; subsequent
+        // calls are silently ignored (ctrlc v2 returns () regardless).
+        ctrlc::set_handler(move || {
             unsafe {
                 libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original_termios);
             }
