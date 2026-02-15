@@ -105,8 +105,8 @@ The test script creates a temporary jj repository with 4 PR branches (some with 
 - All jj interaction is via the `jj` CLI (no API)
 - Uses `jj log -T'...'` templates for structured output parsing
 - `run_quiet` helper suppresses output on success, shows on failure
-- `log_op` records operations as commits with trailer metadata
-- `preflight_conflict_check` creates a headless merge commit to test for conflicts without a workspace
+- Operations are recorded as commits with trailer metadata on the `jjq/_/_` branch
+- Pre-flight conflict check in `push` creates a headless merge commit to test for conflicts without a workspace
 
 ## Common Patterns
 

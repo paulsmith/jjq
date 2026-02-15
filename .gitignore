@@ -4,3 +4,5 @@ test/
 /target
 result
 *.pending-snap
+.workgraph
+demo-project/

@@ -14,7 +14,7 @@ CORE COMMANDS
   jjq run             Process the next queue item
   jjq run --all       Process all queue items
   jjq status          Show queue and recent failures
-  jjq check REVSET    Pre-flight: test a revision without queuing it
+  jjq check [--rev R] Pre-flight: test a revision without queuing it
 
 AS AN AGENT
   Your job is to push finished work to the queue. You don't run it.

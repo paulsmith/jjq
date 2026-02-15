@@ -36,11 +36,6 @@ impl Lock {
         }
     }
 
-    /// Release the lock explicitly.
-    #[allow(dead_code)]
-    pub fn release(self) {
-        drop(self);
-    }
 }
 
 /// State of a named lock.

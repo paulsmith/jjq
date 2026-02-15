@@ -617,7 +617,7 @@ fn run_one() -> Result<RunResult> {
                 &candidate_change_id,
                 &candidate_commit_id,
                 &trunk_commit_id,
-                &runner_workspace.path(),
+                runner_workspace.path(),
                 &strategy,
             ),
         )?;
@@ -666,7 +666,7 @@ fn run_one() -> Result<RunResult> {
                 &candidate_change_id,
                 &candidate_commit_id,
                 &trunk_commit_id,
-                &runner_workspace.path(),
+                runner_workspace.path(),
                 &strategy,
             ),
         )?;

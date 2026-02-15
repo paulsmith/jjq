@@ -204,7 +204,6 @@ pub fn has_conflicts(revset: &str) -> Result<bool> {
     Ok(!output.trim().is_empty())
 }
 
-
 /// Create a new revision with given parent(s).
 pub fn new_rev(parents: &[&str]) -> Result<String> {
     let mut args = vec!["new", "--no-edit"];
