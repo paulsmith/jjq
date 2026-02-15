@@ -5,6 +5,7 @@ use anyhow::{bail, Result};
 use regex::Regex;
 use std::env;
 use std::fs;
+use std::sync::OnceLock;
 use tempfile::TempDir;
 
 use crate::config::{self, JJQ_BOOKMARK};
@@ -87,9 +88,21 @@ pub fn next_id() -> Result<u32> {
     Ok(new_id)
 }
 
+/// Compiled regex for matching queue bookmark names.
+fn queue_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^jjq/queue/(\d{6})$").unwrap())
+}
+
+/// Compiled regex for matching failed bookmark names.
+fn failed_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^jjq/failed/(\d{6})$").unwrap())
+}
+
 /// Get all queued items sorted by sequence ID (ascending).
 pub fn get_queue() -> Result<Vec<u32>> {
-    let re = Regex::new(r"^jjq/queue/(\d{6})$").unwrap();
+    let re = queue_re();
     let bookmarks = jj::bookmark_list_glob("jjq/queue/??????")?;
 
     let mut ids: Vec<u32> = bookmarks
@@ -107,7 +120,7 @@ pub fn get_queue() -> Result<Vec<u32>> {
 
 /// Get all failed items sorted by sequence ID (descending, for display).
 pub fn get_failed() -> Result<Vec<u32>> {
-    let re = Regex::new(r"^jjq/failed/(\d{6})$").unwrap();
+    let re = failed_re();
     let bookmarks = jj::bookmark_list_glob("jjq/failed/??????")?;
 
     let mut ids: Vec<u32> = bookmarks

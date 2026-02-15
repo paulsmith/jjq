@@ -6,10 +6,10 @@ jjq is a merge queue CLI tool for jj (Jujutsu VCS).
 
 ## Key Files / Paths
 
-- `src` - root of the Rust implementation
+- `src/` - root of the Rust implementation
+- `tests/e2e.rs` - end-to-end integration tests (insta snapshots)
 - `docs/README.md` - high-level overview
 - `docs/specification.md` - RFC-style specification
-- `jjq-test` - End-to-end test script
 
 ## Architecture
 
@@ -51,16 +51,15 @@ jjq stores all state in the jj repository itself:
 
 | Code | Constant | Meaning |
 |------|----------|---------|
-| 0 | `EXIT_SUCCESS` | Success |
-| 1 | `EXIT_CONFLICT` | Merge conflict, check failed, trunk moved during run, or run lock unavailable |
-| 2 | `EXIT_PARTIAL` | Batch run processed some items but left failures |
-| 3 | `EXIT_LOCK_HELD` | Sequence ID allocation lock held (push contention) |
-| 10 | `EXIT_USAGE` | Bad arguments, item not found, invalid revset |
+| 0 | *(success)* | Success |
+| 1 | `CONFLICT` | Merge conflict, check failed, trunk moved during run, or run lock unavailable |
+| 2 | `PARTIAL` | Batch run processed some items but left failures |
+| 3 | `LOCK_HELD` | Sequence ID allocation lock held (push contention) |
+| 10 | `USAGE` | Bad arguments, item not found, invalid revset |
 
 ### Key Concepts
 
 - **Sequence ID** - Monotonically increasing integer for FIFO ordering
-- **Merge-to-be** - A commit with two parents: trunk and candidate revision
 - **Runner workspace** - Temporary jj workspace in `/tmp` for running checks
 - **Check command** - User-configured shell command that determines success/failure
 - **Pre-flight conflict check** - Headless merge commit to verify clean merge before queuing
@@ -80,23 +79,19 @@ jjq stores all state in the jj repository itself:
 When running in batch mode, jjq processes items in sequence:
 - Failed items are recorded and processing continues unless `--stop-on-failure` is set
 - Summary reports merged and failed counts
-- Exits 0 if all items merged or queue was empty; exits 2 (`EXIT_PARTIAL`) if any items failed
+- Exits 0 if all items merged or queue was empty; exits 2 (`PARTIAL`) if any items failed
 
 ## Testing
 
-The project employs snapshot tests via Rust insta crate:
+The project uses Rust integration tests with insta snapshot testing (`tests/e2e.rs`):
 
 ```sh
 cargo test
 ```
 
-There is an e2e script:
+Tests create temporary jj repositories with pre-built templates (Go projects, multi-PR scenarios, conflict setups) and exercise the full merge queue workflow including conflict handling, batch mode, rebase/merge strategies, exit codes, and idempotent push behavior.
 
-```sh
-./jjq-test
-```
-
-The test script creates a temporary jj repository with 4 PR branches (some with known conflicts), processes the merge queue, resolves conflicts deterministically, and verifies the final state. Tests also cover exit codes, conflict rejection, and batch mode resilience.
+There is also a legacy shell-based e2e script (`jjq-test`) from before the Rust port.
 
 ## Development Notes
 

@@ -9,6 +9,8 @@ jjq \- local merge queue for jj
 .IR bookmark ]
 .RB [ \-\-check
 .IR command ]
+.RB [ \-\-strategy
+.IR strategy ]
 .br
 .B jjq push
 .I revset
@@ -59,7 +61,7 @@ stores all state inside the jj repository using bookmarks and an
 isolated metadata branch.
 No external database or service is required.
 .SH COMMANDS
-.SS init \fR[\fB\-\-trunk \fIbookmark\fR] [\fB\-\-check \fIcommand\fR]
+.SS init \fR[\fB\-\-trunk \fIbookmark\fR] [\fB\-\-check \fIcommand\fR] [\fB\-\-strategy \fIstrategy\fR]
 Initialize jjq in the current repository.
 Sets up the metadata branch and configures the trunk bookmark and check
 command.
@@ -112,10 +114,10 @@ jjq push abc123         # queue by change ID
 .RE
 .SS run \fR[\fB\-\-all\fR] [\fB\-\-stop-on-failure\fR]
 Process the next queued item.
-Creates a temporary jj workspace with two parents (trunk and candidate),
+Creates a temporary jj workspace to test the candidate against trunk,
 then runs the configured check command inside it.
 .PP
-On success, the trunk bookmark advances to the merge commit and the
+On success, the trunk bookmark advances and the
 temporary workspace is cleaned up.
 .PP
 On failure (conflicts or check command failure), the item moves to the
@@ -257,6 +259,16 @@ Set during
 .B jjq init
 or configured afterward with
 .BR "jjq config" .
+.TP
+.BR strategy " (default: \(lqrebase\(rq for new repos)"
+How candidates are landed on trunk.
+.B rebase
+duplicates the candidate onto trunk for linear history, preserving
+the original change ID.
+.B merge
+creates a merge commit with two parents.
+Existing repositories initialized before strategy support default to
+.BR merge .
 .SH EXIT CODES
 .TP
 .B 0
@@ -325,8 +337,10 @@ The metadata branch at
 stores the last allocated ID, configuration, and an operation log (commit
 messages include trailers such as sequence IDs and workspace paths).
 .PP
-Successful merges are ordinary jj commits with two parents (trunk and
-candidate) and descriptions like \(lqSuccess: merge N\(rq.
+With the merge strategy, successful merges are ordinary jj commits with
+two parents (trunk and candidate).
+With the rebase strategy, the candidate is duplicated onto trunk to
+produce linear history, preserving the original change ID.
 Failed merges are preserved as conflicted commits with descriptions like
 \(lqFailed: merge N (conflicts)\(rq or \(lqFailed: merge N (check)\(rq. The
 workspace path is recorded in trailers for later cleanup.
@@ -383,14 +397,15 @@ It invokes
 as a subprocess and expects it to be on
 .BR PATH .
 .SH TIPS
-Configure
+.B jjq init
+automatically configures
 .B jj log
-to hide jjq metadata bookmarks:
+to hide jjq metadata bookmarks.
+For repositories initialized before this feature, run:
 .PP
 .RS
 .nf
-jj config set \-\-repo \(aqrevset\-aliases."trunk()"\(aq \e
-    \(aqmain | ancestors(main, 2)\(aq
+jj config set \-\-repo revsets.log '~ ::jjq/_/_'
 .fi
 .RE
 .PP

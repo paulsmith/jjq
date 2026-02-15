@@ -251,6 +251,7 @@ Each lock is a file named `<lock-name>.lock`.
 
 ```
 <repo>/.jj/jjq-locks/
+├── config.lock  # Configuration lock
 ├── id.lock      # Sequence ID lock
 └── run.lock     # Queue runner lock
 ```
@@ -279,6 +280,7 @@ automatically.
 |-----------|---------------------------------------|
 | `id`      | Sequence ID store read-modify-write   |
 | `run`     | Queue runner exclusivity              |
+| `config`  | Configuration read-modify-write       |
 
 #### Sequence ID Lock (`id`)
 
@@ -291,6 +293,13 @@ serializes their access to the sequence counter.
 MUST be held for the duration of a queue run. Only one process MAY
 process the queue at a time. This lock MUST be acquired before
 processing begins and released after completion (success or failure).
+
+#### Config Lock (`config`)
+
+MUST be held when reading or writing configuration values on the
+metadata branch. This serializes concurrent access to configuration
+state. The lock is held briefly — only for the duration of the
+read or write operation.
 
 ### Lock Probing
 
@@ -856,14 +865,15 @@ Remove all jjq workspaces and their directories.
 
 #### Behavior
 
-1. Enumerate all jj workspaces matching the pattern `jjq-run-*`.
+1. Enumerate all jj workspaces belonging to jjq (names starting
+   with `jjq-` or `jjq` followed by additional characters).
 2. If no matching workspaces exist, output "no workspaces to clean"
    and exit with code 0.
 3. For each matching workspace:
-   - Extract the sequence ID from the workspace name.
-   - Determine if a corresponding `jjq/failed/<padded-id>` bookmark
+   - For `jjq-run-*` workspaces, extract the sequence ID and
+     determine if a corresponding `jjq/failed/<padded-id>` bookmark
      exists (label the workspace as "failed item N") or not (label
-     as "orphaned").
+     as "orphaned"). All other jjq workspaces are labeled "orphaned".
    - Forget the workspace via `jj workspace forget`.
    - If the workspace directory exists on the filesystem, remove it.
 4. Output summary: count of removed workspaces with per-workspace
@@ -936,22 +946,6 @@ Get or set configuration values.
 | Cannot acquire config lock         | 1         |
 
 ---
-
-### log
-
-```
-jjq log [limit]
-```
-
-Display jjq operation history.
-
-#### Arguments
-
-- `[limit]`: Maximum number of entries to display. Default: 20.
-
-#### Behavior
-
-TK TK
 
 ---
 

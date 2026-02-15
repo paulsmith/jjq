@@ -41,6 +41,13 @@ struct FailedItem {
     failure_reason: String,
 }
 
+/// Check if a workspace name belongs to jjq (and should be cleaned up by doctor/clean).
+/// Covers all workspace naming patterns: jjq-run-*, jjq-config-*, jjq-meta-*,
+/// jjq-check-*, jjq-hint-*, and bare jjq<PID> from init/next_id.
+fn is_jjq_workspace(name: &str) -> bool {
+    name.starts_with("jjq-") || (name.starts_with("jjq") && name.len() > 3)
+}
+
 /// Output with jjq: prefix to stdout.
 fn prefout(msg: &str) {
     println!("jjq: {}", msg);
@@ -612,7 +619,7 @@ fn run_one() -> Result<RunResult> {
         jj::describe(
             &workspace_rev,
             &failure_description(
-                id.into(),
+                id,
                 "conflicts",
                 &candidate_change_id,
                 &candidate_commit_id,
@@ -661,7 +668,7 @@ fn run_one() -> Result<RunResult> {
         jj::describe(
             &workspace_rev,
             &failure_description(
-                id.into(),
+                id,
                 "check",
                 &candidate_change_id,
                 &candidate_commit_id,
@@ -776,7 +783,7 @@ fn run_one() -> Result<RunResult> {
 }
 
 fn failure_description(
-    id: u64,
+    id: u32,
     reason: &str,
     candidate_change_id: &str,
     candidate_commit_id: &str,
@@ -1283,14 +1290,7 @@ pub fn doctor() -> Result<()> {
         .lines()
         .filter_map(|line| {
             let name = line.split_whitespace().next()?.trim_end_matches(':');
-            if name.starts_with("jjq-run-")
-                || name.starts_with("jjq-config-")
-                || name.starts_with("jjq-meta-")
-            {
-                Some(())
-            } else {
-                None
-            }
+            is_jjq_workspace(name).then_some(())
         })
         .count();
     if orphaned == 0 {
@@ -1346,10 +1346,7 @@ pub fn clean() -> Result<()> {
     for line in ws_output.lines() {
         let ws_name = line.split_whitespace().next().unwrap_or("");
         let ws_name = ws_name.trim_end_matches(':');
-        let is_jjq = ws_name.starts_with("jjq-run-")
-            || ws_name.starts_with("jjq-config-")
-            || ws_name.starts_with("jjq-meta-");
-        if !is_jjq {
+        if !is_jjq_workspace(ws_name) {
             continue;
         }
 

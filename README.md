@@ -115,7 +115,7 @@ commit ID that is already queued is rejected as a duplicate.
 
 ```sh
 jjq delete 3          # remove item 3 from queue/failed
-jjq clean             # remove all jjq-run-* workspaces (failed merges)
+jjq clean             # remove all orphaned jjq workspaces
 ```
 
 ### Test your check command

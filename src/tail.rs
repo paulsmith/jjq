@@ -75,10 +75,10 @@ pub fn tail(all: bool, follow: bool) -> Result<()> {
         if current.len() > offset {
             let new_data = &current[offset..];
             for line in new_data.lines() {
-                writeln!(out, "{}", line)?;
                 if line.starts_with(crate::runlog::SENTINEL_PREFIX) {
                     return Ok(());
                 }
+                writeln!(out, "{}", line)?;
             }
             out.flush()?;
             offset = current.len();
