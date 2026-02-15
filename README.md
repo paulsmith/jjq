@@ -104,7 +104,7 @@ jjq config trunk_bookmark main       # set trunk bookmark name
 When a merge fails, fix the issue and re-push:
 
 ```sh
-jj rebase -b mychange -o main  # rebase onto current trunk
+jj rebase -b mychange -d main  # rebase onto current trunk
 # resolve any conflicts
 jjq push mychange              # clears old failure, re-queues
 ```
@@ -165,7 +165,7 @@ jj config set --repo revsets.log '~ ::jjq/_/_'
 |--------------------|----------------------|------------------------------------------------------------------|
 | `trunk_bookmark`   | `main`               | Bookmark pointing to your trunk                                  |
 | `check_command`    | *(set during init)*  | Command to run on merge candidates (required before running)     |
-| `strategy`         | `rebase`             | Strategy for landing the candidate on trunk (`rebase` or `merge`) |
+| `strategy`         | `rebase`             | Strategy for landing the candidate on trunk (`rebase` or `merge`). Existing repos without this key default to `merge` for backward compatibility. |
 
 ## Copying
 

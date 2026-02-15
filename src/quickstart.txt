@@ -10,11 +10,13 @@ CORE COMMANDS
   jjq init            Set up jjq one time (interactive without flags)
     --trunk NAME      Trunk bookmark (skip prompt)
     --check CMD       Check command (skip prompt)
+    --strategy STR    Landing strategy: rebase (default) or merge
   jjq push REVSET     Queue a revision for merging
   jjq run             Process the next queue item
   jjq run --all       Process all queue items
   jjq status          Show queue and recent failures
   jjq check [--rev R] Pre-flight: test a revision without queuing it
+  jjq tail            View check command output (follows by default)
 
 AS AN AGENT
   Your job is to push finished work to the queue. You don't run it.
@@ -23,7 +25,7 @@ AS AN AGENT
 
 RESOLVING FAILURES
   If your push was marked failed (conflict or check failure):
-    1. jj rebase -b <your-rev> -o <trunk-bookmark>
+    1. jj rebase -b <your-rev> -d <trunk-bookmark>
     2. Resolve any conflict markers in the affected files
     3. Verify: run the project's check command
     4. jjq push @        Re-push (automatically clears the failed entry)
@@ -33,7 +35,7 @@ THINGS TO KNOW
   - Queue is processed FIFO; each item gets a temporary workspace
   - Re-pushing the same change ID replaces its queue/failed entry
   - Use 'jjq check @' to test before pushing — catches conflicts early
-  - Exit codes: 0=success, 1=conflict/failure, 2=partial, 3=lock held
+  - Exit codes: 0=success, 1=conflict/failure, 2=partial, 3=lock held, 10=usage error
 
 TROUBLESHOOTING
   jjq doctor           Validate config, bookmarks, locks

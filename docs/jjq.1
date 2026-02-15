@@ -375,7 +375,7 @@ Handle a failure:
 .RS
 .nf
 jjq status                    # see what failed
-jj rebase \-b <rev> \-o main    # rebase onto current trunk
+jj rebase \-b <rev> \-d main    # rebase onto current trunk
 \&... resolve conflicts ...
 jjq push <rev>                # re\-queue
 jjq run                       # retry

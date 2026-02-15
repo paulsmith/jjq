@@ -27,7 +27,7 @@ interchangeably throughout this document, although "revision" is often
 preferred, as it is a clearer jj-specific concept than "commit", which can mean
 either a Git commit (eg., if the storage backend of the jj repo is Git) or the
 immutable version related to a change ID, which is the stable ID in jj as
-revisions are muted.
+revisions are mutated.
 
 ## Design
 
@@ -37,12 +37,14 @@ candidate revisions directly in the same jj repo.
 
 ### The queue
 
-The jjq merge queue is a set of candidate revisions to be merged to the
-repository's trunk (more on that later). A merge is a new commit with two
-parents: the current trunk revision (pointed to by a bookmark that defaults to
-"main" but is user-configurable), and the candidate revision. The trunk is a
-revision in the repo that has passed a check (more on checks later). The queue
-is processed in FIFO order.
+The jjq merge queue is a set of candidate revisions to be landed on the
+repository's trunk (more on that later). The landing strategy is configurable:
+with the `merge` strategy, a new commit with two parents (the current trunk
+revision and the candidate revision) is created; with the `rebase` strategy
+(default for new repos), the candidate is duplicated onto trunk to produce
+linear history, preserving the original change ID. The trunk is a revision in
+the repo that has passed a check (more on checks later). The queue is processed
+in FIFO order.
 
 ### Pushing to the queue
 
@@ -107,27 +109,27 @@ time. The `run` lock uses `.jj/jjq-locks/run.lock`.
 
 Configuration reads/writes are serialized via `.jj/jjq-locks/config.lock`.
 
-### Merge-to-be
+### Landed revision
 
-The "merge-to-be" in jjq is the name for the revision that is parented by both
-the current trunk and the candidate revision the user queued for merge. It
+The "landed revision" is the revision that combines trunk and the candidate.
+Under the merge strategy it is a merge commit with two parents; under the
+rebase strategy it is a duplicate of the candidate rebased onto trunk. It
 doesn't exist until a jjq run is executed.
 
 ### Conflicts
 
-Producing the merge-to-be from two parents, the trunk and the candidate
-revision for merging, can lead to conflicts.
+Combining the trunk and the candidate revision can lead to conflicts, regardless
+of which strategy is in use.
 
 Conflicts are a first-class concept in jj, in that they are stored as objects
 in the repo, and don't prevent subsequent operations.
 
-A conflict in a merge-to-be will mark that queue item as having failed.
+A conflict in the landed revision will mark that queue item as having failed.
 
 ### Checks
 
-A check in jjq is the command to be run on the commit that is the combination
-of the trunk and the candidate revision (i.e., the commit where those are the
-two parents).
+A check in jjq is the command to be run on the landed revision — the commit
+that combines the trunk and the candidate revision.
 
 The check can be any command that can be executed by a POSIX shell. Its exit
 code, zero (success) or non-zero (failure), is determinative of the success of
@@ -136,7 +138,7 @@ the check.
 ### Workspaces
 
 jjq uses a jj workspace during a run for the working copy to produce the
-merge-to-be and to execute the check on same.
+landed revision and to execute the check on same.
 
 This "runner" workspace shall be located outside the working copy of the jj
 repo, so as not to accidentally be snapshotted by jj (an alternative might be to

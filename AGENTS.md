@@ -42,7 +42,7 @@ jjq stores all state in the jj repository itself:
 | `status [id] [--json] [--resolve]` | Show queue and recent failures; supports JSON output and single-item detail view |
 | `delete <id>` | Remove item from queue/failed |
 | `config [key] [value]` | Get/set configuration |
-| `clean` | Remove failed workspaces |
+| `clean` | Remove all jjq workspaces |
 | `doctor` | Validate config, locks, and workspace preconditions |
 | `tail [--all] [--no-follow]` | View the last check output (with optional follow) |
 | `quickstart` | Print a short guide for LLM agents |

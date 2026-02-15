@@ -772,12 +772,21 @@ compatibility; if absent, `merge` is assumed.
 ### status
 
 ```
-jjq status
+jjq status [<id>] [--json] [--resolve <change_id>]
 ```
 
 Display the current state of the queue.
 
+#### Options
+
+- `<id>`: Show detail view for a single item by sequence ID.
+- `--json`: Output in machine-readable JSON format.
+- `--resolve <change_id>`: Look up an item by candidate change ID.
+  Mutually exclusive with `<id>`.
+
 #### Behavior
+
+**Overview mode (no arguments):**
 
 1. If jjq is not initialized, output "not initialized" message and
    exit with code 0.
@@ -789,18 +798,35 @@ Display the current state of the queue.
 5. If no queued or failed items exist, output "queue is empty".
 6. Exit with code 0.
 
+**Single-item mode (`<id>` or `--resolve`):**
+
+1. Look up the item in queue bookmarks, then failed bookmarks.
+2. If not found, fail with exit code 1.
+3. Display detail fields for the item:
+   - For queued items: sequence ID, change ID, commit ID, description.
+   - For failed items: sequence ID, candidate change/commit IDs,
+     description, failure reason, trunk commit ID, workspace path.
+4. Exit with code 0.
+
 #### Output
 
-For each queued or failed item, implementations SHOULD display:
+For each queued or failed item in overview mode, implementations
+SHOULD display:
 - The sequence ID (without zero-padding)
 - The short change ID of the revision
 - The first line of the revision's description
+
+With `--json`, the output MUST be a JSON object. In overview mode,
+the object contains `running` (boolean), `queue` (array of queue
+items), and `failed` (array of failed items). In single-item mode,
+the output is a single item object.
 
 #### Errors
 
 | Condition                          | Exit Code |
 |------------------------------------|-----------|
 | Config lock unavailable            | 1         |
+| Item not found (single-item mode)  | 1         |
 
 An uninitialized repository is not an error.
 
