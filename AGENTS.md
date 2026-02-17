@@ -4,6 +4,13 @@
 
 jjq is a merge queue CLI tool for jj (Jujutsu VCS).
 
+## Important things to remember
+
+### jj
+
+`jj squash` is interactive - it'll block your tool use waiting for input if
+you are not careful
+
 ## Key Files / Paths
 
 - `src/` - root of the Rust implementation
