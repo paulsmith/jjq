@@ -16,6 +16,8 @@ jobs:
         include:
           - platform: aarch64-darwin
             runner: macos-latest
+          - platform: x86_64-darwin
+            runner: macos-13
           - platform: x86_64-linux
             runner: ubuntu-latest
           - platform: aarch64-linux
@@ -67,3 +69,91 @@ jobs:
             tag="manual-$(date +%Y%m%d-%H%M%S)"
             gh release create "$tag" artifacts/*.tar.gz --title "$tag" --draft --generate-notes
           fi
+
+  update-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          gh release download "${{ github.ref_name }}" \
+            --repo paulsmith/jjq \
+            --pattern '*.tar.gz' \
+            --dir assets
+
+      - name: Compute SHA256 hashes
+        id: hashes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          cd assets
+          for f in *.tar.gz; do
+            platform=$(echo "$f" | sed "s/^jjq-${VERSION}-//" | sed 's/\.tar\.gz$//')
+            key=$(echo "$platform" | tr '-' '_')
+            echo "${key}=$(sha256sum "$f" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ github.ref_name }}"
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/paulsmith/homebrew-tap.git"
+          cd homebrew-tap
+          mkdir -p Formula
+
+          cat > Formula/jjq.rb << FORMULA
+          class Jjq < Formula
+            desc "Lightweight local merge queue for Jujutsu (jj)"
+            homepage "https://github.com/paulsmith/jjq"
+            version "${VERSION}"
+            license "BSD-2-Clause"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/paulsmith/jjq/releases/download/${TAG}/jjq-${VERSION}-aarch64-darwin.tar.gz"
+                sha256 "${{ steps.hashes.outputs.aarch64_darwin }}"
+              end
+              on_intel do
+                url "https://github.com/paulsmith/jjq/releases/download/${TAG}/jjq-${VERSION}-x86_64-darwin.tar.gz"
+                sha256 "${{ steps.hashes.outputs.x86_64_darwin }}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/paulsmith/jjq/releases/download/${TAG}/jjq-${VERSION}-aarch64-linux.tar.gz"
+                sha256 "${{ steps.hashes.outputs.aarch64_linux }}"
+              end
+              on_intel do
+                url "https://github.com/paulsmith/jjq/releases/download/${TAG}/jjq-${VERSION}-x86_64-linux.tar.gz"
+                sha256 "${{ steps.hashes.outputs.x86_64_linux }}"
+              end
+            end
+
+            depends_on "jj"
+
+            def install
+              bin.install "bin/jjq"
+              man1.install "share/man/man1/jjq.1.gz"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/jjq --version")
+            end
+          end
+          FORMULA
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/jjq.rb
+          git commit -m "jjq ${VERSION}"
+          git push
