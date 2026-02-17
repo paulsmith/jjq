@@ -1842,3 +1842,93 @@ fn test_run_rebase_abandons_all_duplicates() {
     assert!(repo.jj_file_exists("b.txt", "main"), "b.txt should be on main");
     assert!(repo.jj_file_exists("c.txt", "main"), "c.txt should be on main");
 }
+
+#[test]
+fn test_run_skips_empty_commit_rebase() {
+    // When a queued commit's changes are already on trunk, run should skip it.
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Create a feature branch
+    run_jj(repo.path(), &["new", "-m", "add feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat"]);
+
+    // Manually apply the same change to trunk (simulates someone else landing it)
+    run_jj(repo.path(), &["new", "-m", "same change on trunk", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "set", "main"]);
+
+    // Go back to a clean working copy
+    run_jj(repo.path(), &["new", "main"]);
+
+    // Push the feature — its changes are already on trunk
+    repo.jjq_success(&["push", "feat"]);
+    let output = repo.jjq_success(&["run"]);
+
+    assert!(output.contains("empty"), "expected 'empty' in output: {}", output);
+    assert!(output.contains("skipping"), "expected 'skipping' in output: {}", output);
+
+    // Queue should now be empty
+    let status = repo.jjq_success(&["status"]);
+    assert!(status.contains("queue is empty"), "queue should be empty: {}", status);
+}
+
+#[test]
+fn test_run_skips_empty_commit_merge() {
+    // Same scenario with merge strategy.
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_merge();
+
+    // Create a feature branch
+    run_jj(repo.path(), &["new", "-m", "add feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat"]);
+
+    // Manually apply the same change to trunk
+    run_jj(repo.path(), &["new", "-m", "same change on trunk", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "set", "main"]);
+
+    // Go back to a clean working copy
+    run_jj(repo.path(), &["new", "main"]);
+
+    // Push the feature — its changes are already on trunk
+    repo.jjq_success(&["push", "feat"]);
+    let output = repo.jjq_success(&["run"]);
+
+    assert!(output.contains("empty"), "expected 'empty' in output: {}", output);
+    assert!(output.contains("skipping"), "expected 'skipping' in output: {}", output);
+}
+
+#[test]
+fn test_run_all_counts_skipped_empty() {
+    // Batch mode should report skipped items separately.
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Create first feature (will be empty — changes already on trunk)
+    run_jj(repo.path(), &["new", "-m", "feature one", "main"]);
+    fs::write(repo.path().join("f1.txt"), "one\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat1"]);
+
+    // Apply same change to trunk
+    run_jj(repo.path(), &["new", "-m", "same as f1", "main"]);
+    fs::write(repo.path().join("f1.txt"), "one\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "set", "main"]);
+
+    // Create second feature (has real changes)
+    run_jj(repo.path(), &["new", "-m", "feature two", "main"]);
+    fs::write(repo.path().join("f2.txt"), "two\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat2"]);
+
+    // Go back to clean working copy
+    run_jj(repo.path(), &["new", "main"]);
+
+    repo.jjq_success(&["push", "feat1"]);
+    repo.jjq_success(&["push", "feat2"]);
+    let output = repo.jjq_success(&["run", "--all"]);
+
+    assert!(output.contains("skipped (empty)"), "expected skipped count in output: {}", output);
+    assert!(repo.jj_file_exists("f2.txt", "main"), "f2.txt should be on main");
+}

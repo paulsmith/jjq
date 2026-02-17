@@ -460,6 +460,7 @@ pub fn run(all: bool, stop_on_failure: bool) -> Result<()> {
         match run_one()? {
             RunResult::Success => Ok(()),
             RunResult::Empty => Ok(()),
+            RunResult::Skipped => Ok(()),
             RunResult::Failure(code, msg) => Err(ExitError::new(code, msg).into()),
         }
     }
@@ -468,12 +469,14 @@ pub fn run(all: bool, stop_on_failure: bool) -> Result<()> {
 enum RunResult {
     Success,
     Empty,
+    Skipped,
     Failure(i32, String),
 }
 
 fn run_all(stop_on_failure: bool) -> Result<()> {
     let mut merged_count = 0u32;
     let mut failed_count = 0u32;
+    let mut skipped_count = 0u32;
 
     loop {
         match run_one()? {
@@ -482,6 +485,9 @@ fn run_all(stop_on_failure: bool) -> Result<()> {
             }
             RunResult::Empty => {
                 break;
+            }
+            RunResult::Skipped => {
+                skipped_count += 1;
             }
             RunResult::Failure(_code, msg) => {
                 if stop_on_failure {
@@ -498,7 +504,7 @@ fn run_all(stop_on_failure: bool) -> Result<()> {
         }
     }
 
-    if merged_count > 0 || failed_count > 0 {
+    if merged_count > 0 || failed_count > 0 || skipped_count > 0 {
         if failed_count > 0 {
             prefout(&format!(
                 "processed {} item(s), {} failed",
@@ -513,7 +519,14 @@ fn run_all(stop_on_failure: bool) -> Result<()> {
             )
             .into());
         }
-        prefout(&format!("processed {} item(s)", merged_count));
+        if skipped_count > 0 {
+            prefout(&format!(
+                "processed {} item(s), {} skipped (empty)",
+                merged_count, skipped_count
+            ));
+        } else {
+            prefout(&format!("processed {} item(s)", merged_count));
+        }
     }
     Ok(())
 }
@@ -659,6 +672,34 @@ fn run_one() -> Result<RunResult> {
             exit_codes::CONFLICT,
             format!("merge {} has conflicts", id),
         ));
+    }
+
+    // Check for empty commit (no changes vs trunk).
+    // Compare the workspace tree against trunk: if they match, the candidate
+    // adds nothing new and can be skipped.
+    let is_empty = jj::trees_match(
+        &format!("bookmarks(exact:{})", trunk_bookmark),
+        &workspace_rev,
+    )?;
+    if is_empty {
+        jj::bookmark_delete(&queue_bookmark)?;
+
+        // For rebase, abandon all duplicates we created
+        if strategy == config::Strategy::Rebase {
+            for dup_id in &rebase_duplicate_ids {
+                let _ = jj::abandon(dup_id);
+            }
+        }
+
+        env::set_current_dir(&orig_dir)?;
+        jj::workspace_forget(&run_name)?;
+        drop(run_lock);
+
+        preferr(&format!(
+            "queue item {} is empty (no changes vs {}), skipping",
+            id, trunk_bookmark
+        ));
+        return Ok(RunResult::Skipped);
     }
 
     jj::describe(&workspace_rev, &format!("WIP: attempting merge {}", id))?;

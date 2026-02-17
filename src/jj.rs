@@ -210,6 +210,12 @@ pub fn has_conflicts(revset: &str) -> Result<bool> {
     Ok(!output.trim().is_empty())
 }
 
+/// Check if two revisions have the same tree (no diff between them).
+pub fn trees_match(from: &str, to: &str) -> Result<bool> {
+    let output = run_ok(&["diff", "--from", from, "--to", to, "--summary"])?;
+    Ok(output.trim().is_empty())
+}
+
 /// Create a new revision with given parent(s).
 pub fn new_rev(parents: &[&str]) -> Result<String> {
     let mut args = vec!["new", "--no-edit"];
