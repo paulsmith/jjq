@@ -537,7 +537,12 @@ fn normalize_output(output: &str, repo_path: &Path) -> String {
 
     let mut result = output.to_string();
 
-    // Replace the repo path with a placeholder
+    // Replace the repo path with a placeholder (canonical path first to handle
+    // macOS /private prefix, then the original path)
+    if let Ok(canonical) = repo_path.canonicalize() {
+        let canonical_str = canonical.to_string_lossy();
+        result = result.replace(&*canonical_str, "<REPO>");
+    }
     let repo_str = repo_path.to_string_lossy();
     result = result.replace(&*repo_str, "<REPO>");
 
@@ -673,7 +678,7 @@ fn test_push_and_status() {
     run_jj(repo.path(), &["bookmark", "create", "feature"]);
 
     let push_output = repo.jjq_success(&["push", "feature"]);
-    insta::assert_snapshot!(push_output, @"jjq: revision 'feature' queued at 1");
+    insta::assert_snapshot!(push_output, @"jjq: revision 'feature' queued at 1 (trunk: main in <REPO>)");
 
     let status_output = repo.jjq_success(&["status"]);
     insta::assert_snapshot!(status_output, @r"
@@ -931,16 +936,16 @@ fn test_full_workflow_with_prs() {
 
     // Push all PRs
     let push1 = repo.jjq_success(&["push", "pr1"]);
-    insta::assert_snapshot!(push1, @"jjq: revision 'pr1' queued at 1");
+    insta::assert_snapshot!(push1, @"jjq: revision 'pr1' queued at 1 (trunk: main in <REPO>)");
 
     let push2 = repo.jjq_success(&["push", "pr2"]);
-    insta::assert_snapshot!(push2, @"jjq: revision 'pr2' queued at 2");
+    insta::assert_snapshot!(push2, @"jjq: revision 'pr2' queued at 2 (trunk: main in <REPO>)");
 
     let push3 = repo.jjq_success(&["push", "pr3"]);
-    insta::assert_snapshot!(push3, @"jjq: revision 'pr3' queued at 3");
+    insta::assert_snapshot!(push3, @"jjq: revision 'pr3' queued at 3 (trunk: main in <REPO>)");
 
     let push4 = repo.jjq_success(&["push", "pr4"]);
-    insta::assert_snapshot!(push4, @"jjq: revision 'pr4' queued at 4");
+    insta::assert_snapshot!(push4, @"jjq: revision 'pr4' queued at 4 (trunk: main in <REPO>)");
 
     let status = repo.jjq_success(&["status"]);
     insta::assert_snapshot!(status, @r"
@@ -990,7 +995,7 @@ fn test_multiple_push_same_revision() {
 
     // Push main once - should succeed
     let push1 = repo.jjq_success(&["push", "main"]);
-    insta::assert_snapshot!(push1, @"jjq: revision 'main' queued at 1");
+    insta::assert_snapshot!(push1, @"jjq: revision 'main' queued at 1 (trunk: main in <REPO>)");
 
     // Push same commit ID again - should be rejected as duplicate
     let push2 = repo.jjq_output(&["push", "main"]);

@@ -438,7 +438,11 @@ pub fn push(revset: &str) -> Result<()> {
 
     jj::bookmark_create(&bookmark, revset)?;
 
-    prefout(&format!("revision '{}' queued at {}", revset, id));
+    let repo_path = jj::repo_root()?;
+    prefout(&format!(
+        "revision '{}' queued at {} (trunk: {} in {})",
+        revset, id, trunk_bookmark, repo_path.display()
+    ));
 
     // Show one-time hint about configuring jj log
     config::maybe_show_log_hint()?;
