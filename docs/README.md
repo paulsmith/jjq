@@ -186,16 +186,26 @@ marked as "failed" with a bookmark `jjq/failed/NNNNNN` pointing at the
 conflicted or failed merge commit. The runner workspace directory is preserved
 for debugging.
 
+When a run fails, jjq prints concrete resolution instructions with the actual
+change IDs involved (e.g. `jj rebase -r <change-id> -d <trunk>` and
+`jjq push <change-id>`), so users can copy-paste commands directly.
+
 To resolve, fix the revision (rebase onto trunk, resolve conflicts) and push it
 again. Push is idempotent — re-pushing the same change ID clears any stale
 queue or failed entries for that change and queues the updated revision. If you
 re-push the exact same commit ID that is already queued, the push is rejected
-as a duplicate.
+as a duplicate. Alternatively, use `jjq requeue <id>` to re-push a failed item
+back onto the queue; this runs a pre-flight conflict check before re-queuing.
 
 ### Status
 
 jjq users can get a list of the current queue via the CLI's status command,
-including recent failures (all are shown, newest first).
+including recent failures (all are shown, newest first) and recently landed
+items (discovered by scanning trunk ancestors for jjq metadata).
+
+Failed items display conflicting file paths when available, e.g.
+`(conflicts: main.go, util.go)`, giving immediate visibility into what went
+wrong.
 
 The status command supports a `--json` flag for machine-readable output.
 It also supports single-item lookup by sequence ID or candidate change ID via

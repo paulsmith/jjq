@@ -44,9 +44,10 @@ jjq stores all state in the jj repository itself:
 |---------|----------|
 | `init [--trunk <bookmark>] [--check <cmd>] [--strategy <strategy>]` | Initialize jjq, set trunk, check command, and strategy |
 | `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID) |
-| `run [--all] [--stop-on-failure]` | Process next queue item, or all items in batch |
+| `run [--all] [--stop-on-failure]` | Process next queue item, or all items in batch; failure output shows concrete jj commands with actual change IDs |
 | `check [--rev <revset>] [-v]` | Run check command against a revision (default @); -v shows workspace/env details |
-| `status [id] [--json] [--resolve]` | Show queue and recent failures; supports JSON output and single-item detail view |
+| `status [id] [--json] [--resolve]` | Show queue, recent failures (with conflicting file paths), and recently landed items; supports JSON output and single-item detail view |
+| `requeue <id>` | Re-push a failed item back onto the queue (with pre-flight conflict check) |
 | `delete <id>` | Remove item from queue/failed |
 | `config [key] [value]` | Get/set configuration |
 | `clean` | Remove all jjq workspaces |
@@ -71,6 +72,7 @@ jjq stores all state in the jj repository itself:
 - **Check command** - User-configured shell command that determines success/failure
 - **Pre-flight conflict check** - Headless merge commit to verify clean merge before queuing
 - **Idempotent push** - Re-pushing a change ID clears stale queue/failed entries; same commit ID is rejected as duplicate
+- **Requeue** - Re-pushes a failed item back onto the queue, running a pre-flight conflict check first; a shortcut for fixing and re-pushing manually
 - **Landing strategy** - How the candidate is landed on trunk: `rebase` (default) or `merge`
 
 ### Concurrency

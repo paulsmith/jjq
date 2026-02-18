@@ -14,8 +14,9 @@ CORE COMMANDS
   jjq push REVSET     Queue a revision for merging
   jjq run             Process the next queue item
   jjq run --all       Process all queue items
-  jjq status          Show queue and recent failures
+  jjq status          Show queue, recent failures, and recently landed items
   jjq check [--rev R] Pre-flight: test a revision without queuing it
+  jjq requeue ID      Re-push a failed item back onto the queue
   jjq tail            View check command output (follows by default)
 
 AS AN AGENT
@@ -25,19 +26,23 @@ AS AN AGENT
 
 RESOLVING FAILURES
   If your push was marked failed (conflict or check failure):
-    1. jj rebase -b <your-rev> -d <trunk-bookmark>
+    1. jj rebase -r <your-rev> -d <trunk-bookmark>
     2. Resolve any conflict markers in the affected files
     3. Verify: run the project's check command
-    4. jjq push @        Re-push (automatically clears the failed entry)
+    4. jjq push <your-rev>   Re-push (automatically clears the failed entry)
+  Or, to retry without changes: jjq requeue <id>
 
 THINGS TO KNOW
   - Push resolves a jj revset to one revision and queues it by change ID
   - Queue is processed FIFO; each item gets a temporary workspace
   - Re-pushing the same change ID replaces its queue/failed entry
   - Use 'jjq check @' to test before pushing — catches conflicts early
+  - Status shows recently landed items and conflicting file paths for failures
+  - Failure output shows concrete jj commands with your actual change IDs
   - Exit codes: 0=success, 1=conflict/failure, 2=partial, 3=lock held, 10=usage error
 
 TROUBLESHOOTING
   jjq doctor           Validate config, bookmarks, locks
+  jjq requeue ID       Re-push a failed item (runs pre-flight conflict check)
   jjq delete ID        Remove item from queue or failed list
   jjq clean            Remove orphaned jjq workspaces

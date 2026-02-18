@@ -69,6 +69,11 @@ enum Commands {
         #[arg(long, conflicts_with = "id")]
         resolve: Option<String>,
     },
+    /// Re-push a failed item back onto the queue
+    Requeue {
+        /// Sequence ID of the failed item
+        id: String,
+    },
     /// Remove an item from queue or failed list
     Delete {
         /// Sequence ID of the item
@@ -134,6 +139,7 @@ fn run() -> Result<()> {
         Commands::Status { id, json, resolve } => {
             commands::status(id.as_deref(), json, resolve.as_deref())
         }
+        Commands::Requeue { id } => commands::requeue(&id),
         Commands::Delete { id } => commands::delete(&id),
         Commands::Clean => commands::clean(),
         Commands::Doctor => commands::doctor(),

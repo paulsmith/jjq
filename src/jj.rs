@@ -210,6 +210,23 @@ pub fn has_conflicts(revset: &str) -> Result<bool> {
     Ok(!output.trim().is_empty())
 }
 
+/// List conflicting file paths in a revision.
+pub fn conflict_paths(revset: &str) -> Result<Vec<String>> {
+    let output = run_ok(&[
+        "log",
+        "-r",
+        revset,
+        "--no-graph",
+        "-T",
+        r#"conflicted_files.map(|e| e.path() ++ "\n").join("")"#,
+    ])?;
+    Ok(output
+        .lines()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect())
+}
+
 /// Check if two revisions have the same tree (no diff between them).
 pub fn trees_match(from: &str, to: &str) -> Result<bool> {
     let output = run_ok(&["diff", "--from", from, "--to", to, "--summary"])?;

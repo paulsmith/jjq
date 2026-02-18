@@ -20,6 +20,8 @@ struct StatusOutput {
     running: bool,
     queue: Vec<QueueItem>,
     failed: Vec<FailedItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    landed: Vec<LandedItem>,
 }
 
 #[derive(Serialize)]
@@ -39,6 +41,15 @@ struct FailedItem {
     trunk_commit_id: String,
     workspace_path: String,
     failure_reason: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conflict_paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct LandedItem {
+    id: u32,
+    change_id: String,
+    description: String,
 }
 
 /// Check if a workspace name belongs to jjq (and should be cleaned up by doctor/clean).
@@ -640,6 +651,7 @@ fn run_one() -> Result<RunResult> {
     // Check for conflicts
     let workspace_rev = format!("{}@", run_name);
     if jj::has_conflicts(&workspace_rev)? {
+        let conflicts = jj::conflict_paths(&workspace_rev)?;
         jj::bookmark_delete(&queue_bookmark)?;
         jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
         jj::describe(
@@ -652,22 +664,30 @@ fn run_one() -> Result<RunResult> {
                 &trunk_commit_id,
                 runner_workspace.path(),
                 &strategy,
+                &conflicts,
             ),
         )?;
 
         env::set_current_dir(&orig_dir)?;
-        let ws_path = runner_workspace.keep();
+        let _ = runner_workspace.keep();
         drop(run_lock);
 
         preferr(&format!("merge {} has conflicts, marked as failed", id));
-        preferr(&format!("workspace: {}", ws_path.display()));
+        preferr(&format!("  candidate: {}", candidate_change_id));
+        if !conflicts.is_empty() {
+            preferr(&format!("  conflicting files: {}", conflicts.join(", ")));
+        }
         preferr("");
         preferr("To resolve:");
         preferr(&format!(
-            "  1. Rebase your revision onto {} and resolve conflicts",
-            trunk_bookmark
+            "  jj rebase -r {} -d {}",
+            candidate_change_id, trunk_bookmark
         ));
-        preferr("  2. Run: jjq push <fixed-revset>");
+        preferr(&format!(
+            "  # resolve conflicts in {}",
+            candidate_change_id
+        ));
+        preferr(&format!("  jjq push {}", candidate_change_id));
         return Ok(RunResult::Failure(
             exit_codes::CONFLICT,
             format!("merge {} has conflicts", id),
@@ -729,19 +749,20 @@ fn run_one() -> Result<RunResult> {
                 &trunk_commit_id,
                 runner_workspace.path(),
                 &strategy,
+                &[],
             ),
         )?;
 
         env::set_current_dir(&orig_dir)?;
-        let ws_path = runner_workspace.keep();
+        let _ = runner_workspace.keep();
         drop(run_lock);
 
         preferr(&format!("merge {} failed check, marked as failed", id));
-        preferr(&format!("workspace: {}", ws_path.display()));
+        preferr(&format!("  candidate: {}", candidate_change_id));
         preferr("");
         preferr("To resolve:");
-        preferr("  1. Fix the issue and create a new revision");
-        preferr("  2. Run: jjq push <fixed-revset>");
+        preferr(&format!("  # fix the issue in {}", candidate_change_id));
+        preferr(&format!("  jjq push {}", candidate_change_id));
         return Ok(RunResult::Failure(
             exit_codes::CONFLICT,
             format!("merge {} check failed", id),
@@ -844,8 +865,9 @@ fn failure_description(
     trunk_commit_id: &str,
     workspace_path: &std::path::Path,
     strategy: &Strategy,
+    conflict_paths: &[String],
 ) -> String {
-    format!(
+    let mut desc = format!(
         "Failed: merge {} ({})\n\njjq-candidate: {}\njjq-candidate-commit: {}\njjq-trunk: {}\njjq-workspace: {}\njjq-failure: {}\njjq-strategy: {}",
         id,
         reason,
@@ -855,7 +877,11 @@ fn failure_description(
         workspace_path.display(),
         reason,
         strategy.as_str()
-    )
+    );
+    if !conflict_paths.is_empty() {
+        desc.push_str(&format!("\njjq-conflicts: {}", conflict_paths.join(",")));
+    }
+    desc
 }
 
 /// Run check command against a revision in a temporary workspace.
@@ -964,6 +990,10 @@ fn build_failed_item(id: u32) -> Result<FailedItem> {
     let trunk_commit_id = trailers.get("trunk").cloned().unwrap_or_default();
     let workspace_path = trailers.get("workspace").cloned().unwrap_or_default();
     let failure_reason = trailers.get("failure").cloned().unwrap_or_default();
+    let conflict_paths = trailers
+        .get("conflicts")
+        .map(|s| s.split(',').map(|p| p.to_string()).collect())
+        .unwrap_or_default();
 
     // Resolve original candidate description from the candidate change ID
     let description = if !candidate_change_id.is_empty() {
@@ -982,7 +1012,68 @@ fn build_failed_item(id: u32) -> Result<FailedItem> {
         trunk_commit_id,
         workspace_path,
         failure_reason,
+        conflict_paths,
     })
+}
+
+/// Find recently landed items by scanning trunk ancestors for jjq trailers.
+/// Returns up to `limit` items, most recent first.
+fn get_recently_landed(trunk_bookmark: &str, limit: usize) -> Result<Vec<LandedItem>> {
+    // Scan recent trunk ancestors for commits landed by jjq. We look for
+    // jjq-sequence trailers (rebase strategy) or "Success: merge" descriptions
+    // (merge strategy). Scan more than limit since not every ancestor is jjq-landed.
+    let scan_count = (limit * 10).max(50);
+    let revset = format!(
+        "ancestors(bookmarks(exact:\"{}\"), {})",
+        trunk_bookmark, scan_count
+    );
+    let template = "change_id.short() ++ \"\\t\" ++ description ++ \"\\x00\"";
+    let output = jj::run_ok(&["log", "-r", &revset, "--no-graph", "-T", template])?;
+
+    let mut items = Vec::new();
+    for block in output.split('\x00') {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        let (change_id, description) = match block.split_once('\t') {
+            Some(pair) => pair,
+            None => continue,
+        };
+
+        let trailers = extract_trailers(description);
+
+        if let Some(seq_str) = trailers.get("sequence") {
+            // Rebase strategy: description has the original text + trailers
+            if let Ok(id) = seq_str.parse::<u32>() {
+                let desc_line = description
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                items.push(LandedItem {
+                    id,
+                    change_id: change_id.to_string(),
+                    description: desc_line,
+                });
+            }
+        } else if let Some(rest) = description.trim().strip_prefix("Success: merge ") {
+            // Merge strategy: description is "Success: merge {id}"
+            if let Ok(id) = rest.trim().parse::<u32>() {
+                items.push(LandedItem {
+                    id,
+                    change_id: change_id.to_string(),
+                    description: description.lines().next().unwrap_or("").to_string(),
+                });
+            }
+        }
+
+        if items.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(items)
 }
 
 /// Display queue status.
@@ -998,6 +1089,7 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
                 running: false,
                 queue: vec![],
                 failed: vec![],
+                landed: vec![],
             };
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
@@ -1021,11 +1113,15 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
         .map(|&id| build_failed_item(id))
         .collect::<Result<_>>()?;
 
+    let trunk_bookmark = config::get_trunk_bookmark()?;
+    let landed_items = get_recently_landed(&trunk_bookmark, 5).unwrap_or_default();
+
     if json {
         let output = StatusOutput {
             running,
             queue: queue_items,
             failed: failed_items,
+            landed: landed_items,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -1034,7 +1130,7 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
             println!();
         }
 
-        if queue_items.is_empty() && failed_items.is_empty() {
+        if queue_items.is_empty() && failed_items.is_empty() && landed_items.is_empty() {
             prefout("queue is empty");
             return Ok(());
         }
@@ -1052,10 +1148,30 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
             }
             prefout("Failed (recent):");
             for item in &failed_items {
-                println!(
-                    "  {}: {} {}",
-                    item.id, item.candidate_change_id, item.description
-                );
+                if item.conflict_paths.is_empty() {
+                    println!(
+                        "  {}: {} {}",
+                        item.id, item.candidate_change_id, item.description
+                    );
+                } else {
+                    println!(
+                        "  {}: {} {} (conflicts: {})",
+                        item.id,
+                        item.candidate_change_id,
+                        item.description,
+                        item.conflict_paths.join(", ")
+                    );
+                }
+            }
+        }
+
+        if !landed_items.is_empty() {
+            if !queue_items.is_empty() || !failed_items.is_empty() {
+                println!();
+            }
+            prefout("Landed (recent):");
+            for item in &landed_items {
+                println!("  {}: {} {}", item.id, item.change_id, item.description);
             }
         }
     }
@@ -1101,12 +1217,25 @@ fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<
             );
             println!("  Description: {}", item.description);
             println!("  Failure:     {}", item.failure_reason);
+            if !item.conflict_paths.is_empty() {
+                println!("  Conflicts:   {}", item.conflict_paths.join(", "));
+            }
             println!("  Trunk:       {}", item.trunk_commit_id);
-            println!("  Workspace:   {}", item.workspace_path);
             println!();
-            println!("To resolve:");
-            println!("  1. Fix the issue and create a new revision");
-            println!("  2. Run: jjq push <fixed-revset>");
+            let trunk_bookmark = config::get_trunk_bookmark().unwrap_or_else(|_| "main".into());
+            if item.failure_reason == "conflicts" {
+                println!("To resolve:");
+                println!(
+                    "  jj rebase -r {} -d {}",
+                    item.candidate_change_id, trunk_bookmark
+                );
+                println!("  # resolve conflicts in {}", item.candidate_change_id);
+                println!("  jjq push {}", item.candidate_change_id);
+            } else {
+                println!("To resolve:");
+                println!("  # fix the issue in {}", item.candidate_change_id);
+                println!("  jjq push {}", item.candidate_change_id);
+            }
         }
     }
 
@@ -1142,6 +1271,106 @@ fn find_by_change_id(change_id: &str) -> Result<(u32, bool)> {
     }
 
     bail!("no item found with candidate change ID '{}'", change_id)
+}
+
+/// Re-push a failed item back onto the queue.
+pub fn requeue(id_str: &str) -> Result<()> {
+    let id = queue::parse_seq_id(id_str)?;
+
+    require_initialized()?;
+
+    if !queue::failed_item_exists(id)? {
+        if queue::queue_item_exists(id)? {
+            return Err(
+                ExitError::new(exit_codes::USAGE, format!("item {} is already queued", id)).into(),
+            );
+        }
+        return Err(
+            ExitError::new(exit_codes::USAGE, format!("failed item {} not found", id)).into(),
+        );
+    }
+
+    // Build the failed item to get candidate info
+    let item = build_failed_item(id)?;
+    let candidate_change_id = &item.candidate_change_id;
+
+    if candidate_change_id.is_empty() {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            format!("failed item {} has no candidate change ID", id),
+        )
+        .into());
+    }
+
+    // Resolve the candidate — it may have been rebased since the failure
+    let revset = candidate_change_id.as_str();
+    let (_change_id, _commit_id) = jj::resolve_revset_full(revset)
+        .map_err(|e| ExitError::new(exit_codes::USAGE, format!("candidate not found: {}", e)))?;
+
+    // Get trunk bookmark for conflict check
+    let trunk_bookmark = config::get_trunk_bookmark()?;
+    if !jj::bookmark_exists(&trunk_bookmark)? {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            format!("trunk bookmark '{}' not found", trunk_bookmark),
+        )
+        .into());
+    }
+
+    // Pre-flight conflict check against current trunk
+    let conflict_check_id = jj::new_rev(&[&trunk_bookmark, revset])?;
+    let has_conflicts = match jj::has_conflicts(&conflict_check_id) {
+        Ok(v) => {
+            jj::abandon(&conflict_check_id)?;
+            v
+        }
+        Err(e) => {
+            let _ = jj::abandon(&conflict_check_id);
+            return Err(e);
+        }
+    };
+
+    if has_conflicts {
+        preferr(&format!(
+            "revision '{}' still conflicts with {}",
+            revset, trunk_bookmark
+        ));
+        preferr(&format!(
+            "rebase onto {} and resolve conflicts before requeuing",
+            trunk_bookmark
+        ));
+        return Err(
+            ExitError::new(exit_codes::CONFLICT, "revision conflicts with trunk").into(),
+        );
+    }
+
+    // Allocate new queue ID and create queue bookmark
+    let new_id = queue::next_id()?;
+    let new_bookmark = queue::queue_bookmark(new_id);
+    jj::bookmark_create(&new_bookmark, revset)?;
+
+    // Clean up the failed entry and its workspace
+    let padded = queue::format_seq_id(id);
+    let run_name = format!("jjq-run-{}", padded);
+    let workspace_path = lookup_workspace_path(id);
+
+    jj::bookmark_delete(&queue::failed_bookmark(id))?;
+    let _ = jj::workspace_forget(&run_name);
+
+    if let Some(ref path) = workspace_path {
+        let p = std::path::Path::new(path);
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+
+    let repo_path = jj::repo_root()?;
+    prefout(&format!(
+        "requeued failed item {} as {} (trunk: {} in {})",
+        id, new_id, trunk_bookmark, repo_path.display()
+    ));
+
+    Ok(())
 }
 
 /// Delete an item from queue or failed list.

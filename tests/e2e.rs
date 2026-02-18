@@ -782,11 +782,11 @@ fn test_run_check_failure() {
     insta::assert_snapshot!(run_output, @r"
     jjq: processing queue item 1 (merge strategy)
     jjq: merge 1 failed check, marked as failed
-    jjq: workspace: <TEMP_PATH>
+    jjq:   candidate: <CHANGE_ID>
     jjq:
     jjq: To resolve:
-    jjq:   1. Fix the issue and create a new revision
-    jjq:   2. Run: jjq push <fixed-revset>
+    jjq:   # fix the issue in <CHANGE_ID>
+    jjq:   jjq push <CHANGE_ID>
     jjq: merge 1 check failed
     ");
 
@@ -828,7 +828,12 @@ fn test_run_all() {
     ");
 
     let status_after = repo.jjq_success(&["status"]);
-    insta::assert_snapshot!(status_after, @"jjq: queue is empty");
+    insta::assert_snapshot!(status_after, @r"
+    jjq: Landed (recent):
+      3: <CHANGE_ID> Success: merge 3
+      2: <CHANGE_ID> Success: merge 2
+      1: <CHANGE_ID> Success: merge 1
+    ");
 }
 
 #[test]
@@ -968,15 +973,17 @@ fn test_full_workflow_with_prs() {
     insta::assert_snapshot!(run2, @r"
     jjq: processing queue item 2 (merge strategy)
     jjq: merge 2 has conflicts, marked as failed
-    jjq: workspace: <TEMP_PATH>
+    jjq:   candidate: <CHANGE_ID>
+    jjq:   conflicting files: main.go
     jjq:
     jjq: To resolve:
-    jjq:   1. Rebase your revision onto main and resolve conflicts
-    jjq:   2. Run: jjq push <fixed-revset>
+    jjq:   jj rebase -r <CHANGE_ID> -d main
+    jjq:   # resolve conflicts in <CHANGE_ID>
+    jjq:   jjq push <CHANGE_ID>
     jjq: merge 2 has conflicts
     ");
 
-    // Check status shows failed item
+    // Check status shows failed item and landed item
     let status_after_conflict = repo.jjq_success(&["status"]);
     insta::assert_snapshot!(status_after_conflict, @r"
     jjq: Queued:
@@ -984,7 +991,10 @@ fn test_full_workflow_with_prs() {
       4: <CHANGE_ID> add readme
 
     jjq: Failed (recent):
-      2: <CHANGE_ID> add goodbye
+      2: <CHANGE_ID> add goodbye (conflicts: main.go)
+
+    jjq: Landed (recent):
+      1: <CHANGE_ID> Success: merge 1
     ");
 }
 
@@ -1401,8 +1411,8 @@ fn test_status_single_failed() {
     );
     assert!(output.contains("Trunk:"), "should show Trunk: {}", output);
     assert!(
-        output.contains("Workspace:"),
-        "should show Workspace: {}",
+        output.contains("jjq push"),
+        "should show concrete push command: {}",
         output
     );
     assert!(
@@ -1931,4 +1941,136 @@ fn test_run_all_counts_skipped_empty() {
 
     assert!(output.contains("skipped (empty)"), "expected skipped count in output: {}", output);
     assert!(repo.jj_file_exists("f2.txt", "main"), "f2.txt should be on main");
+}
+
+// ============================================================================
+// Requeue tests
+
+#[test]
+fn test_requeue_basic() {
+    // Set up: push a feature with a failing check, then requeue after
+    // switching to a passing check command.
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_with_check("false");
+
+    // Create a non-conflicting feature
+    run_jj(repo.path(), &["new", "-m", "add feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat"]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    repo.jjq_success(&["push", "feat"]);
+
+    // Run — fails because check command is "false"
+    repo.jjq_output(&["run"]);
+
+    // Verify item 1 is in failed state
+    let status = repo.jjq_success(&["status"]);
+    assert!(status.contains("Failed"), "expected failed item: {}", status);
+
+    // Switch check command to "true" (simulating the user fixing the issue)
+    repo.jjq_success(&["config", "check_command", "true"]);
+
+    // Requeue the failed item
+    let output = repo.jjq_success(&["requeue", "1"]);
+    insta::assert_snapshot!(output, @"jjq: requeued failed item 1 as 2 (trunk: main in <REPO>)");
+
+    // Status should show the item back in queue, no failed items
+    let status = repo.jjq_success(&["status"]);
+    assert!(status.contains("Queued"), "expected queued item: {}", status);
+    assert!(!status.contains("Failed"), "failed list should be empty: {}", status);
+
+    // Run the requeued item — should succeed now
+    let run_output = repo.jjq_success(&["run"]);
+    assert!(run_output.contains("merged") || run_output.contains("rebased"),
+        "expected successful merge: {}", run_output);
+}
+
+#[test]
+fn test_requeue_not_found() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    let output = repo.jjq_failure(&["requeue", "999"]);
+    insta::assert_snapshot!(output, @"jjq: failed item 999 not found");
+}
+
+#[test]
+fn test_requeue_already_queued() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Create and push a feature
+    run_jj(repo.path(), &["new", "-m", "feature", "main"]);
+    fs::write(repo.path().join("new.txt"), "hello\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat"]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    repo.jjq_success(&["push", "feat"]);
+
+    // Try requeuing ID 1 which is queued, not failed
+    let output = repo.jjq_failure(&["requeue", "1"]);
+    insta::assert_snapshot!(output, @"jjq: item 1 is already queued");
+}
+
+#[test]
+fn test_requeue_still_conflicts() {
+    // Set up a failed item but don't fix the conflict before requeuing
+    let repo = TestRepo::with_prs();
+    repo.init_jjq_merge_with_check("true");
+
+    repo.jjq_success(&["push", "pr1"]);
+    repo.jjq_success(&["push", "pr2"]);
+
+    // Run pr1 (succeeds), then pr2 (fails with conflict)
+    repo.jjq_success(&["run"]);
+    repo.jjq_output(&["run"]);
+
+    // Try requeuing without resolving conflicts — should fail
+    let output = repo.jjq_failure(&["requeue", "2"]);
+    assert!(output.contains("conflicts"), "expected conflict error: {}", output);
+}
+
+#[test]
+fn test_status_shows_recently_landed_merge() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    repo.init_jjq_merge();
+
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+    repo.jjq_success(&["push", "f3"]);
+
+    // Run all items
+    repo.jjq_success(&["run", "--all"]);
+
+    // Status should show recently landed items (most recent first)
+    let status = repo.jjq_success(&["status"]);
+    insta::assert_snapshot!(status, @r"
+    jjq: Landed (recent):
+      3: <CHANGE_ID> Success: merge 3
+      2: <CHANGE_ID> Success: merge 2
+      1: <CHANGE_ID> Success: merge 1
+    ");
+}
+
+#[test]
+fn test_status_shows_recently_landed_rebase() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    repo.init_jjq();
+
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+    repo.jjq_success(&["push", "f3"]);
+
+    // Run all items
+    repo.jjq_success(&["run", "--all"]);
+
+    // Status should show recently landed items (most recent first, rebase shows original descriptions)
+    let status = repo.jjq_success(&["status"]);
+    insta::assert_snapshot!(status, @r"
+    jjq: Landed (recent):
+      3: <CHANGE_ID> feature 3
+      2: <CHANGE_ID> feature 2
+      1: <CHANGE_ID> feature 1
+    ");
 }
