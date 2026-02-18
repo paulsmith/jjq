@@ -17,7 +17,7 @@ jobs:
           - platform: aarch64-darwin
             runner: macos-latest
           - platform: x86_64-darwin
-            runner: macos-13
+            runner: macos-15-intel
           - platform: x86_64-linux
             runner: ubuntu-latest
           - platform: aarch64-linux

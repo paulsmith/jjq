@@ -11,6 +11,16 @@ jjq is a merge queue CLI tool for jj (Jujutsu VCS).
 `jj squash` is interactive - it'll block your tool use waiting for input if
 you are not careful
 
+### Landing commits on main
+
+The `main` bookmark is protected and immutable. Do NOT try to move it
+directly with `jj bookmark set/move` or `jj tug`. Instead, use jjq itself:
+
+```sh
+jjq push @    # queue the commit
+jjq run       # land it on main
+```
+
 ## Key Files / Paths
 
 - `src/` - root of the Rust implementation
@@ -111,6 +121,21 @@ There is also a legacy shell-based e2e script (`jjq-test`) from before the Rust 
 - `run_quiet` helper suppresses output on success, shows on failure
 - Operations are recorded as commits with trailer metadata on the `jjq/_/_` branch
 - Pre-flight conflict check in `push` creates a headless merge commit to test for conflicts without a workspace
+
+## Cutting a Release
+
+1. **Bump version** in `Cargo.toml` (`version = "X.Y.Z"`)
+   - The flake.nix reads this dynamically, so no other version files need updating
+2. **Run tests** — `cargo test` (all must pass)
+3. **Update `CHANGELOG.md`** — Add a section for the new version with categorized notes
+4. **Tag and push** — `scripts/tag-release vX.Y.Z`
+   - Validates semver format and that tag version matches Cargo.toml
+   - Exports jj state to git, creates the git tag, and pushes to origin
+
+GitHub Actions handles the rest automatically:
+- Builds tarballs for 4 platforms (aarch64-darwin, x86_64-darwin, x86_64-linux, aarch64-linux) via Nix
+- Creates a GitHub release with auto-generated notes
+- Updates the Homebrew tap (`paulsmith/homebrew-tap`) with new SHA256 hashes
 
 ## Common Patterns
 

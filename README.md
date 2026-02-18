@@ -18,20 +18,52 @@ passes checks against the latest trunk.
 
 Prerequisite: make sure `jj` is installed.
 
-Download the tarball for your platform from the latest release and run the
-included install script (replace the URL and filename with your platform):
+### Homebrew
 
 ```sh
-curl -LO https://<releases>/jjq-<version>-<platform>.tar.gz
-tar xzf jjq-<version>-<platform>.tar.gz
-cd jjq-<version>-<platform>
+brew install paulsmith/tap/jjq
+```
+
+### Download a release
+
+Download the tarball for your platform from the
+[latest release](https://github.com/paulsmith/jjq/releases/latest) and run
+the included install script:
+
+```sh
+curl -LO https://github.com/paulsmith/jjq/releases/latest/download/jjq-VERSION-PLATFORM.tar.gz
+tar xzf jjq-VERSION-PLATFORM.tar.gz
+cd jjq-VERSION-PLATFORM
 sudo ./install                    # installs to /usr/local
 ```
+
+Available platforms: `aarch64-darwin`, `x86_64-darwin`, `aarch64-linux`,
+`x86_64-linux`.
 
 To install to a different prefix (no sudo needed):
 
 ```sh
 PREFIX=$HOME/.local ./install
+```
+
+### Build from source
+
+Requires Rust (edition 2024) and Cargo, or Nix.
+
+With Cargo:
+
+```sh
+git clone https://github.com/paulsmith/jjq.git
+cd jjq
+cargo build --release
+install -m 755 target/release/jjq /usr/local/bin/
+```
+
+With Nix:
+
+```sh
+nix build github:paulsmith/jjq
+./result/bin/jjq --help
 ```
 
 ## Usage
@@ -101,11 +133,17 @@ jjq config trunk_bookmark main       # set trunk bookmark name
 
 ### Handle failures
 
-When a merge fails, fix the issue and re-push:
+When a merge fails, the simplest option is `requeue`:
 
 ```sh
 jj rebase -b mychange -d main  # rebase onto current trunk
 # resolve any conflicts
+jjq requeue 3                  # re-push failed item 3 (runs conflict check first)
+```
+
+Or push the fixed revision directly:
+
+```sh
 jjq push mychange              # clears old failure, re-queues
 ```
 
