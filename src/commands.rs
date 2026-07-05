@@ -1,7 +1,7 @@
 // ABOUTME: Command implementations for jjq CLI.
 // ABOUTME: Each function implements one jjq subcommand per the specification.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -13,6 +13,7 @@ use crate::config::{self, Strategy};
 use crate::exit_codes::{self, ExitError};
 use crate::jj;
 use crate::lock::{self, Lock};
+use crate::meta;
 use crate::queue;
 
 #[derive(Serialize)]
@@ -53,8 +54,8 @@ struct LandedItem {
 }
 
 /// Check if a workspace name belongs to jjq (and should be cleaned up by doctor/clean).
-/// Covers all workspace naming patterns: jjq-run-*, jjq-config-*, jjq-meta-*,
-/// jjq-check-*, jjq-hint-*, and bare "jjq{PID}" from init/next_id.
+/// Covers the workspace naming patterns jjq-run-*, jjq-meta-*, and jjq-check-*,
+/// plus names left behind by earlier layouts (jjq{PID}, jjq-config-*, jjq-hint-*).
 fn is_jjq_workspace(name: &str) -> bool {
     name.starts_with("jjq-") || (name.starts_with("jjq") && name.len() > 3)
 }
@@ -109,7 +110,9 @@ fn lookup_workspace_path(id: u32) -> Option<String> {
     // Try reading workspace path from metadata file first
     let padded = queue::format_seq_id(id);
     let file_path = format!("workspace/{}", padded);
-    if let Ok(path) = jj::file_show(&file_path, config::JJQ_BOOKMARK) {
+    if let Ok(Some(snap)) = config::snapshot()
+        && let Ok(Some(path)) = snap.file(&file_path)
+    {
         let path = path.trim().to_string();
         if !path.is_empty() {
             return Some(path);
@@ -144,34 +147,15 @@ fn lookup_workspace_path(id: u32) -> Option<String> {
 }
 
 /// Record workspace path in metadata for later recovery by delete/clean.
+/// Called while holding the run lock; takes the meta lock inside (run → meta,
+/// never the reverse — see src/meta.rs).
 fn record_workspace_metadata(id: u32, workspace_path: &str) -> Result<()> {
-    let temp_dir = tempfile::TempDir::new()?;
-    let workspace_name = format!("jjq-meta-{}", std::process::id());
-
-    jj::workspace_add(
-        temp_dir.path().to_str().unwrap(),
-        &workspace_name,
-        &[config::JJQ_BOOKMARK],
-    )?;
-
-    let orig_dir = env::current_dir()?;
-    env::set_current_dir(temp_dir.path())?;
-
-    fs::create_dir_all("workspace")?;
-    fs::write(
-        format!("workspace/{}", queue::format_seq_id(id)),
-        workspace_path,
-    )?;
-    jj::describe(
-        "@",
-        &format!("Sequence-Id: {}\nWorkspace: {}", id, workspace_path),
-    )?;
-    jj::run_quiet(&["bookmark", "set", config::JJQ_BOOKMARK])?;
-
-    env::set_current_dir(&orig_dir)?;
-    jj::workspace_forget(&workspace_name)?;
-
-    Ok(())
+    meta::with_meta_workspace(|workspace| {
+        let dir = workspace.join("workspace");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join(queue::format_seq_id(id)), workspace_path)?;
+        Ok(format!("Sequence-Id: {}\nWorkspace: {}", id, workspace_path))
+    })
 }
 
 /// Initialize jjq in this repository.
@@ -304,10 +288,10 @@ pub fn init(trunk: Option<&str>, check: Option<&str>, strategy: &str) -> Result<
 /// Configure jj's revsets.log to exclude jjq metadata from `jj log`.
 /// Composes with any existing filter value.
 fn setup_log_filter() -> Result<()> {
-    let exclude = format!("~ ::{}", config::JJQ_BOOKMARK);
+    let exclude = format!("~ ::{}", meta::JJQ_BOOKMARK);
 
     let value = if let Ok(Some(current)) = jj::config_get("revsets.log") {
-        if current.contains(config::JJQ_BOOKMARK) {
+        if current.contains(meta::JJQ_BOOKMARK) {
             return Ok(());
         }
         format!("({}) {}", current, exclude)
@@ -461,6 +445,13 @@ pub fn push(revset: &str) -> Result<()> {
     Ok(())
 }
 
+/// Configuration for one run invocation, read once per batch.
+struct RunConfig {
+    trunk_bookmark: String,
+    check_command: String,
+    strategy: Strategy,
+}
+
 /// Process queue items.
 pub fn run(all: bool, stop_on_failure: bool) -> Result<()> {
     require_initialized()?;
@@ -476,10 +467,32 @@ pub fn run(all: bool, stop_on_failure: bool) -> Result<()> {
         }
     };
 
+    // Read configuration once, right after taking the run lock: the whole
+    // batch lands against a single trunk/check/strategy generation
+    // (per-batch consistency is intended — a concurrent `jjq config` set
+    // applies to the next run, not mid-batch). A missing check command is a
+    // configuration error reported once, before touching any queue item.
+    let snapshot =
+        config::snapshot()?.ok_or_else(|| anyhow!("jjq metadata missing; run 'jjq doctor'"))?;
+    let run_config = RunConfig {
+        trunk_bookmark: snapshot.trunk_bookmark()?,
+        check_command: match snapshot.check_command()? {
+            Some(cmd) => cmd,
+            None => {
+                return Err(ExitError::new(
+                    exit_codes::CONFLICT,
+                    "check_command not configured (use 'jjq config check_command <cmd>')",
+                )
+                .into());
+            }
+        },
+        strategy: snapshot.strategy()?,
+    };
+
     if all {
-        run_all(&run_lock, stop_on_failure)
+        run_all(&run_lock, &run_config, stop_on_failure)
     } else {
-        match run_one(&run_lock)? {
+        match run_one(&run_lock, &run_config)? {
             RunResult::Success => Ok(()),
             RunResult::Empty => Ok(()),
             RunResult::Skipped => Ok(()),
@@ -496,13 +509,13 @@ enum RunResult {
     Failure(i32),
 }
 
-fn run_all(run_lock: &Lock, stop_on_failure: bool) -> Result<()> {
+fn run_all(run_lock: &Lock, run_config: &RunConfig, stop_on_failure: bool) -> Result<()> {
     let mut merged_count = 0u32;
     let mut failed_count = 0u32;
     let mut skipped_count = 0u32;
 
     loop {
-        match run_one(run_lock)? {
+        match run_one(run_lock, run_config)? {
             RunResult::Success => {
                 merged_count += 1;
             }
@@ -548,8 +561,8 @@ fn run_all(run_lock: &Lock, stop_on_failure: bool) -> Result<()> {
 }
 
 /// Process the next queue item. The caller must hold the run lock, passed
-/// here as evidence.
-fn run_one(_run_lock: &Lock) -> Result<RunResult> {
+/// here as evidence, and supplies the batch-wide configuration.
+fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
     let id = match queue::next_item()? {
         Some(id) => id,
         None => {
@@ -558,19 +571,8 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
         }
     };
 
-    // Acquire config lock to read settings
-    let config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
-    let trunk_bookmark = config::get_trunk_bookmark()?;
-    let check_command = match config::get_check_command()? {
-        Some(cmd) => cmd,
-        None => {
-            drop(config_lock);
-            preferr("check_command not configured (use 'jjq config check_command <cmd>')");
-            return Ok(RunResult::Failure(exit_codes::CONFLICT));
-        }
-    };
-    let strategy = config::get_strategy()?;
-    drop(config_lock);
+    let trunk_bookmark = &run_config.trunk_bookmark;
+    let strategy = run_config.strategy;
 
     prefout(&format!(
         "processing queue item {} ({} strategy)",
@@ -586,7 +588,7 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
     let (candidate_change_id, candidate_commit_id) =
         jj::resolve_revset_full(&format!("bookmarks(exact:{})", queue_bookmark))?;
 
-    // Resolve log path before cd-ing into workspace so it stays in the main repo .jj
+    // Log path lives in the shared .jj so `jjq tail` sees it from any workspace
     let log_path = crate::runlog::log_path()?;
 
     // Capture original description for rebase success path (before queue bookmark is deleted)
@@ -630,14 +632,13 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
     // Record the workspace path in metadata for later recovery by delete/clean
     record_workspace_metadata(id, runner_workspace.path().to_str().unwrap())?;
 
-    let orig_dir = env::current_dir()?;
-    env::set_current_dir(runner_workspace.path())?;
+    let workspace_path = runner_workspace.path().to_path_buf();
 
     // For rebase strategy, edit the duplicate directly so check artifacts
     // are snapshotted into it (workspace add created an empty commit on top)
     if strategy == config::Strategy::Rebase {
         let parent_rev = jj::resolve_revset(&format!("{}@-", run_name))?;
-        jj::edit(&parent_rev)?;
+        jj::edit(&workspace_path, &parent_rev)?;
     }
 
     // Check for conflicts
@@ -654,13 +655,12 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
                 &candidate_change_id,
                 &candidate_commit_id,
                 &trunk_commit_id,
-                runner_workspace.path(),
+                &workspace_path,
                 &strategy,
                 &conflicts,
             ),
         )?;
 
-        env::set_current_dir(&orig_dir)?;
         let _ = runner_workspace.keep();
 
         preferr(&format!("merge {} has conflicts, marked as failed", id));
@@ -699,7 +699,6 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
             }
         }
 
-        env::set_current_dir(&orig_dir)?;
         jj::workspace_forget(&run_name)?;
 
         preferr(&format!(
@@ -711,8 +710,14 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
 
     jj::describe(&workspace_rev, &format!("WIP: attempting merge {}", id))?;
 
-    // Run check command (log_path resolved before cd to workspace)
-    let check_status = crate::runner::run_check_command(&check_command, &log_path)?;
+    // Run check command with the runner workspace as its working directory
+    let check_status =
+        crate::runner::run_check_command(&run_config.check_command, &workspace_path, &log_path)?;
+
+    // The check may have modified files in the runner workspace (build
+    // artifacts, formatters). Snapshot them into the workspace commit so the
+    // revset-based operations below see the post-check tree.
+    jj::snapshot_workspace(&workspace_path)?;
 
     if !check_status.success() {
         // Print log output (skipping sentinel lines)
@@ -734,13 +739,12 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
                 &candidate_change_id,
                 &candidate_commit_id,
                 &trunk_commit_id,
-                runner_workspace.path(),
+                &workspace_path,
                 &strategy,
                 &[],
             ),
         )?;
 
-        env::set_current_dir(&orig_dir)?;
         let _ = runner_workspace.keep();
 
         preferr(&format!("merge {} failed check, marked as failed", id));
@@ -762,7 +766,6 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
                 let _ = jj::abandon(dup_id);
             }
         }
-        env::set_current_dir(&orig_dir)?;
         jj::workspace_forget(&run_name)?;
 
         preferr("trunk bookmark moved during run; queue item left in place, re-run to retry");
@@ -778,12 +781,13 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
 
     match strategy {
         config::Strategy::Merge => {
-            let landed_change_id = jj::resolve_revset("@")?;
-            jj::bookmark_move(&trunk_bookmark, &trunk_commit_id, "@")?;
+            // The workspace-qualified revset resolves to the merge commit,
+            // whose tree was snapshotted above after the check ran.
+            let landed_change_id = jj::resolve_revset(&workspace_rev)?;
+            jj::bookmark_move(trunk_bookmark, &trunk_commit_id, &workspace_rev)?;
             jj::bookmark_delete(&queue_bookmark)?;
-            jj::describe("@", &format!("Success: merge {}", id))?;
+            jj::describe(&workspace_rev, &format!("Success: merge {}", id))?;
 
-            env::set_current_dir(&orig_dir)?;
             jj::workspace_forget(&run_name)?;
 
             prefout(&format!(
@@ -795,9 +799,6 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
             // The duplicate passed checks. Now rebase the ORIGINAL candidate
             // onto trunk to preserve its change ID.
 
-            // Return to original directory for rebase operations
-            env::set_current_dir(&orig_dir)?;
-
             // Rebase original candidate (and its descendants) onto trunk
             jj::rebase_branch_onto(
                 &candidate_change_id,
@@ -806,7 +807,7 @@ fn run_one(_run_lock: &Lock) -> Result<RunResult> {
 
             // Move trunk to the rebased original (not the duplicate)
             // The candidate_change_id is now rebased onto trunk
-            jj::bookmark_move(&trunk_bookmark, &trunk_commit_id, &candidate_change_id)?;
+            jj::bookmark_move(trunk_bookmark, &trunk_commit_id, &candidate_change_id)?;
             jj::bookmark_delete(&queue_bookmark)?;
 
             // Describe the landed commit with trailers
@@ -884,7 +885,7 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
         change_id, check_command
     ));
 
-    // Resolve log path before changing to workspace directory.
+    // Log path lives in the shared .jj so `jjq tail` sees it from any workspace
     let log_path = crate::runlog::log_path()?;
 
     // Create temporary workspace
@@ -897,9 +898,6 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
         &[revset],
     )?;
 
-    let orig_dir = env::current_dir()?;
-    env::set_current_dir(workspace_dir.path())?;
-
     if verbose {
         prefout(&format!("workspace: {}", workspace_dir.path().display()));
         prefout("shell: /bin/sh");
@@ -911,8 +909,9 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
         }
     }
 
-    // Run check command
-    let check_status = crate::runner::run_check_command(&check_command, &log_path)?;
+    // Run check command with the temporary workspace as its working directory
+    let check_status =
+        crate::runner::run_check_command(&check_command, workspace_dir.path(), &log_path)?;
 
     // Print log output (skipping sentinel lines)
     if let Ok(log_contents) = fs::read_to_string(&log_path) {
@@ -926,7 +925,6 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
     let success = check_status.success();
 
     // Always clean up
-    env::set_current_dir(&orig_dir)?;
     jj::workspace_forget(&workspace_name)?;
 
     if success {
@@ -1392,23 +1390,24 @@ pub fn delete(id_str: &str) -> Result<()> {
     bail!("item {} not found in queue or failed", id)
 }
 
-/// Get or set configuration.
+/// Get or set configuration. Reads pin one metadata snapshot and take no
+/// lock; writes serialize inside config::set via the meta lock.
 pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
     match (key, value) {
         (None, None) => {
-            // Show all config
+            // Show all config from a single snapshot
             require_initialized()?;
-            let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
-            let trunk = config::get_trunk_bookmark()?;
-            let check = config::get_check_command()?;
+            let snapshot = config::snapshot()?
+                .ok_or_else(|| anyhow!("jjq metadata missing; run 'jjq doctor'"))?;
 
-            println!("trunk_bookmark = {}", trunk);
+            println!("trunk_bookmark = {}", snapshot.trunk_bookmark()?);
             println!(
                 "check_command = {}",
-                check.unwrap_or_else(|| "(not set)".to_string())
+                snapshot
+                    .check_command()?
+                    .unwrap_or_else(|| "(not set)".to_string())
             );
-            let strategy = config::get_strategy()?;
-            println!("strategy = {}", strategy.as_str());
+            println!("strategy = {}", snapshot.strategy()?.as_str());
             Ok(())
         }
         (Some(k), None) => {
@@ -1422,7 +1421,7 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
             }
 
             // If not initialized, show defaults
-            if !config::is_initialized()? {
+            let Some(snapshot) = config::snapshot()? else {
                 let value = match k {
                     "trunk_bookmark" => config::DEFAULT_TRUNK_BOOKMARK.to_string(),
                     "check_command" => String::new(),
@@ -1431,13 +1430,12 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
                 };
                 println!("{}", value);
                 return Ok(());
-            }
+            };
 
-            let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
             let value = match k {
-                "trunk_bookmark" => config::get_trunk_bookmark()?,
-                "check_command" => config::get_check_command()?.unwrap_or_default(),
-                "strategy" => config::get_strategy()?.as_str().to_string(),
+                "trunk_bookmark" => snapshot.trunk_bookmark()?,
+                "check_command" => snapshot.check_command()?.unwrap_or_default(),
+                "strategy" => snapshot.strategy()?.as_str().to_string(),
                 _ => unreachable!(),
             };
             println!("{}", value);
@@ -1445,7 +1443,6 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
         }
         (Some(k), Some(v)) => {
             // Set value
-            let _config_lock = Lock::acquire_or_fail("config", "config lock unavailable")?;
             config::set(k, v)?;
             prefout(&format!("{} = {}", k, v));
             Ok(())
@@ -1475,8 +1472,31 @@ pub fn doctor() -> Result<()> {
         fails += 1;
     }
 
+    // Config checks share one metadata snapshot; failure to take it (e.g. a
+    // conflicted metadata bookmark) is itself a doctor failure.
+    let snapshot = if initialized {
+        match config::snapshot() {
+            Ok(Some(snap)) => Some(snap),
+            Ok(None) => {
+                print_check("FAIL", "jjq metadata bookmark missing");
+                fails += 1;
+                None
+            }
+            Err(e) => {
+                print_check("FAIL", &format!("cannot read jjq metadata: {}", e));
+                fails += 1;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 3. trunk bookmark exists
-    let trunk_bookmark = config::get_trunk_bookmark()?;
+    let trunk_bookmark = match &snapshot {
+        Some(snap) => snap.trunk_bookmark()?,
+        None => config::DEFAULT_TRUNK_BOOKMARK.to_string(),
+    };
     if jj::bookmark_exists(&trunk_bookmark)? {
         print_check("ok", &format!("trunk bookmark '{}' exists", trunk_bookmark));
     } else {
@@ -1488,10 +1508,9 @@ pub fn doctor() -> Result<()> {
     }
 
     // 4. check command configured
-    let check_configured = if initialized {
-        config::get_check_command()?.is_some()
-    } else {
-        false
+    let check_configured = match &snapshot {
+        Some(snap) => snap.check_command()?.is_some(),
+        None => false,
     };
     if check_configured {
         print_check("ok", "check command configured");
@@ -1502,8 +1521,8 @@ pub fn doctor() -> Result<()> {
     }
 
     // 5. strategy valid
-    if initialized {
-        match config::get_strategy() {
+    if let Some(snap) = &snapshot {
+        match snap.strategy() {
             Ok(s) => print_check("ok", &format!("strategy: {}", s.as_str())),
             Err(e) => {
                 print_check("FAIL", &format!("invalid strategy: {}", e));
@@ -1512,16 +1531,41 @@ pub fn doctor() -> Result<()> {
         }
     }
 
+    // 6. sequence counter readable
+    if let Some(snap) = &snapshot {
+        match snap.file("last_id") {
+            Ok(Some(contents)) if contents.trim().parse::<u32>().is_ok() => {
+                print_check("ok", &format!("sequence counter at {}", contents.trim()));
+            }
+            Ok(Some(contents)) => {
+                print_check(
+                    "FAIL",
+                    &format!("sequence counter (last_id) unparseable: {:?}", contents.trim()),
+                );
+                fails += 1;
+            }
+            Ok(None) => {
+                print_check("FAIL", "sequence counter (last_id) missing from metadata branch");
+                print_hint("metadata branch may be corrupted; pushes will fail until repaired");
+                fails += 1;
+            }
+            Err(e) => {
+                print_check("FAIL", &format!("cannot read sequence counter: {}", e));
+                fails += 1;
+            }
+        }
+    }
+
     // 6. jj log filter hides jjq metadata
     if let Ok(Some(current_log)) = jj::config_get("revsets.log")
-        && current_log.contains(config::JJQ_BOOKMARK)
+        && current_log.contains(meta::JJQ_BOOKMARK)
     {
         print_check("ok", "jj log hides jjq metadata");
     } else {
         print_check("WARN", "jj log does not hide jjq metadata");
         print_hint(&format!(
             "to fix: jj config set --repo revsets.log '~ ::{}'",
-            config::JJQ_BOOKMARK
+            meta::JJQ_BOOKMARK
         ));
         warns += 1;
     }
@@ -1535,11 +1579,11 @@ pub fn doctor() -> Result<()> {
         }
     }
 
-    // (id lock)
-    match lock::lock_state("id")? {
-        lock::LockState::Free => print_check("ok", "id lock is free"),
+    // (meta lock)
+    match lock::lock_state("meta")? {
+        lock::LockState::Free => print_check("ok", "meta lock is free"),
         lock::LockState::Held => {
-            print_check("WARN", "id lock held by another process");
+            print_check("WARN", "meta lock held by another process");
             warns += 1;
         }
     }
@@ -1611,7 +1655,7 @@ pub fn clean() -> Result<()> {
         }
 
         // For run workspaces, extract the queue item ID and look up details.
-        // Config/meta workspaces don't correspond to queue items.
+        // Meta/check workspaces don't correspond to queue items.
         let (label, workspace_path) = if let Some(ws_id_str) = ws_name.strip_prefix("jjq-run-") {
             let plain_id: u32 = ws_id_str.parse().unwrap_or(0);
             let label = if queue::failed_item_exists(plain_id)? {

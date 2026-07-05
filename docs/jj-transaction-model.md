@@ -176,7 +176,7 @@ Lock files are stored in `.jj/jjq-locks/` within the repository:
 
 ```
 .jj/jjq-locks/
-├── id.lock      # Sequence ID lock (held during push/retry)
+├── meta.lock    # Metadata writer lock (sequence IDs, config, workspace records)
 └── run.lock     # Run lock (held during queue processing)
 ```
 

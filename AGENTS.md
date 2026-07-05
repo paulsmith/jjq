@@ -40,8 +40,7 @@ jjq stores all state in the jj repository itself:
 
 2. **Filesystem locks** - Uses `flock(2)` files in `.jj/jjq-locks/`
    - `run` - Ensures only one queue runner at a time
-   - `id` - Protects sequence ID allocation
-   - `config` - Serializes config reads/writes
+   - `meta` - Serializes all writes to the `jjq/_/_` metadata branch (sequence ID allocation, config, workspace records); reads take no lock
 
 3. **Isolated branch** - `jjq/_/_` bookmark points to a branch parented to `root()` that holds:
    - `last_id` file - Current sequence ID
@@ -70,9 +69,9 @@ jjq stores all state in the jj repository itself:
 | Code | Constant | Meaning |
 |------|----------|---------|
 | 0 | *(success)* | Success |
-| 1 | `CONFLICT` | Merge conflict, check failed, trunk moved during run, or another queue runner is active |
+| 1 | `CONFLICT` | Merge conflict, check failed, check command not configured, trunk moved during run, or another queue runner is active |
 | 2 | `PARTIAL` | Batch run processed some items but left failures |
-| 3 | `LOCK_HELD` | Sequence ID allocation lock held (push contention) |
+| 3 | `LOCK_HELD` | Metadata lock still held after the wait timeout (a concurrent writer is stuck) |
 | 10 | `USAGE` | Bad arguments, item not found, invalid revset |
 
 ### Key Concepts
@@ -90,8 +89,9 @@ jjq stores all state in the jj repository itself:
 - `flock(2)` file locks are used as mutexes
 - Lock files stored in `.jj/jjq-locks/` (outside jj's tracked areas)
 - `run` lock ensures only one queue runner at a time
-- `id` lock protects sequence ID allocation
-- `config` lock guards config read/write
+- `meta` lock serializes all metadata-branch writes (sequence IDs, config, workspace records); writers wait up to 15s (`JJQ_META_LOCK_TIMEOUT_MS`) before exiting `LOCK_HELD`
+- Metadata reads take no lock: each group of reads pins the `jjq/_/_` bookmark to a single commit and reads every value in the group from that commit
+- Lock order is run → meta (run_one records workspace metadata while holding the run lock); no code path acquires `run` while holding `meta`
 
 ### Batch Mode (`run --all`)
 

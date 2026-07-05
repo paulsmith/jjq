@@ -105,11 +105,14 @@ fn stream_from_pos(path: &Path, pos: &mut u64) {
     }
 }
 
-/// Run a check command, logging its merged stdout+stderr to `log_path`.
+/// Run a check command with `working_dir` as its working directory, logging
+/// its merged stdout+stderr to `log_path`.
 ///
-/// Returns the child's exit status. A sentinel line is appended to the log
-/// after the child exits regardless of success or failure.
-pub fn run_check_command(command: &str, log_path: &Path) -> Result<ExitStatus> {
+/// The working directory is set on the child process only — the jjq process
+/// itself never changes directory. Returns the child's exit status. A
+/// sentinel line is appended to the log after the child exits regardless of
+/// success or failure.
+pub fn run_check_command(command: &str, working_dir: &Path, log_path: &Path) -> Result<ExitStatus> {
     // Ensure parent directories exist.
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)
@@ -124,6 +127,7 @@ pub fn run_check_command(command: &str, log_path: &Path) -> Result<ExitStatus> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(format!("{} 2>&1", command))
+        .current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

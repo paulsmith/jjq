@@ -5,12 +5,9 @@ use anyhow::{Result, bail};
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
-use tempfile::TempDir;
 
 use crate::jj;
-
-/// The jjq metadata bookmark name.
-pub const JJQ_BOOKMARK: &str = "jjq/_/_";
+use crate::meta::{self, JJQ_BOOKMARK};
 
 /// Default configuration values.
 pub const DEFAULT_TRUNK_BOOKMARK: &str = "main";
@@ -53,75 +50,94 @@ pub fn is_initialized() -> Result<bool> {
     jj::bookmark_exists(JJQ_BOOKMARK)
 }
 
-/// Create the jjq metadata branch. Errors if already initialized.
+/// Create the jjq metadata branch. The branch itself (with its last_id seed)
+/// is created inside the metadata writer, under the meta lock, so concurrent
+/// initializations serialize instead of racing the bookmark. Any metadata
+/// write auto-creates the branch the same way; this exists so `jjq init` can
+/// record an explicit "init jjq" entry in the metadata operation log.
 pub fn initialize() -> Result<()> {
-    // Create new revision parented to root()
-    let change_id = jj::new_rev(&["root()"])?;
-    jj::run_quiet(&["bookmark", "create", "-r", &change_id, JJQ_BOOKMARK])?;
-
-    // Create workspace to set up initial state
-    let temp_dir = TempDir::new()?;
-    let workspace_name = format!("jjq{}", std::process::id());
-
-    jj::workspace_add(
-        temp_dir.path().to_str().unwrap(),
-        &workspace_name,
-        &[JJQ_BOOKMARK],
-    )?;
-
-    // Change to workspace and create last_id file
-    let orig_dir = env::current_dir()?;
-    env::set_current_dir(temp_dir.path())?;
-
-    fs::write("last_id", "0")?;
-    jj::describe("@", "init jjq")?;
-    jj::run_quiet(&["squash"])?;
-
-    env::set_current_dir(&orig_dir)?;
-    jj::workspace_forget(&workspace_name)?;
-
-    Ok(())
+    meta::with_meta_workspace(|_workspace| Ok("init jjq".to_string()))
 }
 
-/// Ensure jjq is initialized, creating metadata branch if needed.
-pub fn ensure_initialized() -> Result<()> {
-    if is_initialized()? {
-        return Ok(());
+/// A point-in-time view of the metadata branch, pinned to one commit so all
+/// reads in a command see the same generation even when a writer lands
+/// concurrently. Reads take no lock.
+pub struct Snapshot {
+    commit_id: String,
+}
+
+/// Pin the current metadata commit. Returns None when jjq is not initialized;
+/// errors when the metadata bookmark is conflicted (e.g. moved out-of-band).
+pub fn snapshot() -> Result<Option<Snapshot>> {
+    match jj::resolve_revset_full(&meta::meta_revset()) {
+        Ok((_change_id, commit_id)) => Ok(Some(Snapshot { commit_id })),
+        Err(e) if e.to_string().contains("multiple revisions") => {
+            bail!("jjq metadata bookmark is conflicted — run 'jjq doctor'")
+        }
+        Err(e) if e.to_string().contains("not found") => Ok(None),
+        Err(e) => Err(e),
     }
-    initialize()
 }
 
-/// Get a config value from the metadata branch.
+impl Snapshot {
+    /// Read a file from the pinned metadata commit. Ok(None) means the file
+    /// does not exist; any other failure (unreadable repo state) is an error.
+    pub fn file(&self, path: &str) -> Result<Option<String>> {
+        match jj::file_show(path, &self.commit_id) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(e) if e.to_string().contains("No such path") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Read a config key from the pinned metadata commit.
+    pub fn get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .file(&format!("config/{}", key))?
+            .map(|v| v.trim().to_string()))
+    }
+
+    /// Get the trunk bookmark name.
+    pub fn trunk_bookmark(&self) -> Result<String> {
+        Ok(self
+            .get("trunk_bookmark")?
+            .unwrap_or_else(|| DEFAULT_TRUNK_BOOKMARK.to_string()))
+    }
+
+    /// Get the check command (None if not configured).
+    pub fn check_command(&self) -> Result<Option<String>> {
+        self.get("check_command")
+    }
+
+    /// Get the merge strategy.
+    pub fn strategy(&self) -> Result<Strategy> {
+        match self.get("strategy")? {
+            Some(value) => Strategy::try_from(value.as_str())
+                .map_err(|_| anyhow::anyhow!("invalid strategy value: {}", value)),
+            None => Ok(DEFAULT_STRATEGY),
+        }
+    }
+}
+
+/// Get a config value, or None when unset or jjq is uninitialized.
 pub fn get(key: &str) -> Result<Option<String>> {
-    let path = format!("config/{}", key);
-    match jj::file_show(&path, JJQ_BOOKMARK) {
-        Ok(value) => Ok(Some(value.trim().to_string())),
-        Err(_) => Ok(None),
+    match snapshot()? {
+        Some(snap) => snap.get(key),
+        None => Ok(None),
     }
-}
-
-/// Get a config value with a default.
-pub fn get_or_default(key: &str, default: &str) -> Result<String> {
-    Ok(get(key)?.unwrap_or_else(|| default.to_string()))
 }
 
 /// Get the trunk bookmark name.
 pub fn get_trunk_bookmark() -> Result<String> {
-    get_or_default("trunk_bookmark", DEFAULT_TRUNK_BOOKMARK)
+    match snapshot()? {
+        Some(snap) => snap.trunk_bookmark(),
+        None => Ok(DEFAULT_TRUNK_BOOKMARK.to_string()),
+    }
 }
 
 /// Get the check command (None if not configured).
 pub fn get_check_command() -> Result<Option<String>> {
     get("check_command")
-}
-
-/// Get the merge strategy.
-pub fn get_strategy() -> Result<Strategy> {
-    match get("strategy")? {
-        Some(value) => Strategy::try_from(value.as_str())
-            .map_err(|_| anyhow::anyhow!("invalid strategy value: {}", value)),
-        None => Ok(DEFAULT_STRATEGY),
-    }
 }
 
 /// Set a config value on the metadata branch.
@@ -143,29 +159,12 @@ pub fn set(key: &str, value: &str) -> Result<()> {
         );
     }
 
-    ensure_initialized()?;
-
-    let temp_dir = TempDir::new()?;
-    let workspace_name = format!("jjq-config-{}", std::process::id());
-
-    jj::workspace_add(
-        temp_dir.path().to_str().unwrap(),
-        &workspace_name,
-        &[JJQ_BOOKMARK],
-    )?;
-
-    let orig_dir = env::current_dir()?;
-    env::set_current_dir(temp_dir.path())?;
-
-    fs::create_dir_all("config")?;
-    fs::write(format!("config/{}", key), value)?;
-    jj::describe("@", &format!("config: set {}", key))?;
-    jj::run_quiet(&["bookmark", "set", JJQ_BOOKMARK])?;
-
-    env::set_current_dir(&orig_dir)?;
-    jj::workspace_forget(&workspace_name)?;
-
-    Ok(())
+    meta::with_meta_workspace(|workspace| {
+        let config_dir = workspace.join("config");
+        fs::create_dir_all(&config_dir)?;
+        fs::write(config_dir.join(key), value)?;
+        Ok(format!("config: set {}", key))
+    })
 }
 
 /// Show a one-time hint about configuring jj log filter.
@@ -203,12 +202,9 @@ pub fn maybe_show_log_hint() -> Result<()> {
 
 /// Check if the log hint has already been shown.
 fn hint_already_shown() -> Result<bool> {
-    if !is_initialized()? {
-        return Ok(false);
-    }
-    match jj::file_show("log_hint_shown", JJQ_BOOKMARK) {
-        Ok(_) => Ok(true),   // File exists = hint was shown
-        Err(_) => Ok(false), // File doesn't exist = hint not shown
+    match snapshot()? {
+        Some(snap) => Ok(snap.file("log_hint_shown")?.is_some()),
+        None => Ok(false),
     }
 }
 
@@ -217,25 +213,8 @@ fn record_hint_shown() -> Result<()> {
     if !is_initialized()? {
         return Ok(());
     }
-
-    let temp_dir = TempDir::new()?;
-    let workspace_name = format!("jjq-hint-{}", std::process::id());
-
-    jj::workspace_add(
-        temp_dir.path().to_str().unwrap(),
-        &workspace_name,
-        &[JJQ_BOOKMARK],
-    )?;
-
-    let orig_dir = env::current_dir()?;
-    env::set_current_dir(temp_dir.path())?;
-
-    fs::write("log_hint_shown", "1")?;
-    jj::describe("@", "record log hint shown")?;
-    jj::run_quiet(&["bookmark", "set", JJQ_BOOKMARK])?;
-
-    env::set_current_dir(&orig_dir)?;
-    jj::workspace_forget(&workspace_name)?;
-
-    Ok(())
+    meta::with_meta_workspace(|workspace| {
+        fs::write(workspace.join("log_hint_shown"), "1")?;
+        Ok("record log hint shown".to_string())
+    })
 }

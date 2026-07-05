@@ -2193,8 +2193,8 @@ fn test_push_from_secondary_workspace_uses_shared_locks() {
     // Locks must live in the primary workspace's .jj so all workspaces share them
     let primary_locks = repo.path().join(".jj").join("jjq-locks");
     assert!(
-        primary_locks.join("id.lock").exists(),
-        "id lock should be in the primary workspace's lock dir: {}",
+        primary_locks.join("meta.lock").exists(),
+        "meta lock should be in the primary workspace's lock dir: {}",
         primary_locks.display()
     );
     let secondary_locks = ws_path.join(".jj").join("jjq-locks");
@@ -2206,7 +2206,7 @@ fn test_push_from_secondary_workspace_uses_shared_locks() {
 }
 
 #[test]
-fn test_push_from_secondary_workspace_respects_id_lock() {
+fn test_push_from_secondary_workspace_respects_meta_lock() {
     use fs2::FileExt;
 
     let repo = TestRepo::with_go_project();
@@ -2220,22 +2220,23 @@ fn test_push_from_secondary_workspace_respects_id_lock() {
     let container = TempDir::new().expect("failed to create workspace container");
     let ws_path = add_secondary_workspace(&repo, &container);
 
-    // Hold the shared sequence ID lock, as a concurrent push would
+    // Hold the shared metadata lock, as a concurrent writer would
     let lock_dir = repo.path().join(".jj").join("jjq-locks");
     fs::create_dir_all(&lock_dir).unwrap();
-    let lock_file = fs::File::create(lock_dir.join("id.lock")).unwrap();
+    let lock_file = fs::File::create(lock_dir.join("meta.lock")).unwrap();
     lock_file.lock_exclusive().unwrap();
 
     // A push from the secondary workspace must observe the held lock
     let output = repo
         .jjq_in(&ws_path)
+        .env("JJQ_META_LOCK_TIMEOUT_MS", "500")
         .args(["push", "feature"])
         .output()
         .expect("failed to run jjq");
     assert_eq!(
         output.status.code(),
         Some(3),
-        "push should exit LOCK_HELD while the id lock is held; stdout: {} stderr: {}",
+        "push should exit LOCK_HELD while the meta lock is held; stdout: {} stderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -2254,7 +2255,7 @@ fn test_push_from_secondary_workspace_respects_id_lock() {
     );
     assert!(
         bookmarks.trim().is_empty(),
-        "no queue entry should be created while the id lock is held: {}",
+        "no queue entry should be created while the meta lock is held: {}",
         bookmarks
     );
 }
@@ -2280,7 +2281,7 @@ fn repo_with_queued_item_and_held_run_lock() -> (TestRepo, fs::File) {
     (repo, lock_file)
 }
 
-/// Assert the queued item is untouched while another runner holds the lock.
+/// Assert the first queued item is still present and untouched.
 fn assert_queue_item_remains(repo: &TestRepo) {
     let bookmarks = run_jj(
         repo.path(),
@@ -2295,7 +2296,7 @@ fn assert_queue_item_remains(repo: &TestRepo) {
     );
     assert!(
         bookmarks.contains("jjq/queue/000001"),
-        "queued item should remain while another runner holds the lock: {}",
+        "queued item should remain untouched: {}",
         bookmarks
     );
 }
@@ -2347,4 +2348,161 @@ fn test_run_exits_when_run_lock_held() {
 
     assert_run_lock_notice(&combined, code);
     assert_queue_item_remains(&repo);
+}
+
+#[test]
+fn test_run_all_missing_check_command_fails_fast() {
+    let repo = TestRepo::with_go_project();
+    // Initialize metadata without a check command: setting any config key
+    // auto-creates the metadata branch, and only init enforces --check.
+    repo.jjq_success(&["config", "trunk_bookmark", "main"]);
+
+    run_jj(repo.path(), &["new", "-m", "feature", "main"]);
+    fs::write(repo.path().join("f1.txt"), "feature").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "f1"]);
+    repo.jjq_success(&["push", "f1"]);
+
+    // Without a check command the run must fail once, promptly — a
+    // regression here loops forever re-reading the same queue item.
+    let (stdout, stderr, code) =
+        repo.jjq_with_timeout(&["run", "--all"], std::time::Duration::from_secs(10));
+    let combined = format!("{}{}", stdout, stderr);
+
+    assert_eq!(
+        code,
+        Some(1),
+        "run --all without check_command should exit CONFLICT (None means killed at timeout): {}",
+        combined
+    );
+    assert_eq!(
+        combined.matches("check_command not configured").count(),
+        1,
+        "notice should appear exactly once: {}",
+        combined
+    );
+    assert_queue_item_remains(&repo);
+}
+
+#[test]
+fn test_push_times_out_when_meta_lock_held() {
+    use fs2::FileExt;
+
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "feature content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feature"]);
+
+    // Hold the metadata writer lock, as a stuck concurrent writer would
+    let lock_dir = repo.path().join(".jj").join("jjq-locks");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lock_file = fs::File::create(lock_dir.join("meta.lock")).unwrap();
+    lock_file.lock_exclusive().unwrap();
+
+    // Push waits for the lock (timeout shortened via env) and then gives up
+    // with LOCK_HELD rather than racing the writer on the metadata bookmark
+    let output = repo
+        .jjq()
+        .env("JJQ_META_LOCK_TIMEOUT_MS", "500")
+        .args(["push", "feature"])
+        .output()
+        .expect("failed to run jjq");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "push should exit LOCK_HELD while the meta lock stays held; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not acquire metadata lock"),
+        "should explain the metadata lock timeout: {}",
+        stderr
+    );
+
+    // LOCK_HELD is raised before bookmark creation, so the queue must be empty
+    let bookmarks = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/queue/??????\")",
+            "-T",
+            "name ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        bookmarks.trim().is_empty(),
+        "no queue entry should be created while the meta lock is held: {}",
+        bookmarks
+    );
+}
+
+#[test]
+fn test_conflicted_metadata_bookmark_reports_cleanly() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Manufacture a conflicted jjq/_/_ by moving the bookmark to two
+    // different targets in concurrent operations (fork the op log with
+    // --at-operation), as racing writers without shared locks would.
+    let side_a = run_jj(repo.path(), &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
+    run_jj(repo.path(), &["new", "-m", "divergent side", "main"]);
+    let side_b = run_jj(repo.path(), &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    let op = run_jj(repo.path(), &["op", "log", "-n1", "--no-graph", "-T", "id.short() ++ \"\\n\""]);
+    run_jj(
+        repo.path(),
+        &["bookmark", "set", "jjq/_/_", "-r", side_a.trim(), "--allow-backwards"],
+    );
+    run_jj(
+        repo.path(),
+        &[
+            "--at-operation",
+            op.trim(),
+            "bookmark",
+            "set",
+            "jjq/_/_",
+            "-r",
+            side_b.trim(),
+            "--allow-backwards",
+        ],
+    );
+    // Any jj command merges the divergent operations, conflicting the bookmark.
+    run_jj(repo.path(), &["status"]);
+
+    // Reads must fail with a short, actionable message — not a wall of raw
+    // jj template errors.
+    let config_out = repo.jjq_failure(&["config", "trunk_bookmark"]);
+    assert!(
+        config_out.contains("run 'jjq doctor'"),
+        "config read should point at doctor: {}",
+        config_out
+    );
+    assert!(
+        !config_out.contains("short-prefixes"),
+        "no raw jj template error wall: {}",
+        config_out
+    );
+    assert!(
+        config_out.lines().count() < 6,
+        "error should be short, got {} lines: {}",
+        config_out.lines().count(),
+        config_out
+    );
+
+    // Doctor must run to completion and diagnose, not crash.
+    let doctor_out = repo.jjq_failure(&["doctor"]);
+    assert!(
+        doctor_out.contains("cannot read jjq metadata"),
+        "doctor should report the unreadable metadata: {}",
+        doctor_out
+    );
+    assert!(
+        doctor_out.contains("failure(s)"),
+        "doctor should reach its summary: {}",
+        doctor_out
+    );
 }

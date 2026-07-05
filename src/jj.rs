@@ -22,20 +22,34 @@ pub fn config_set_repo(key: &str, value: &str) -> Result<()> {
     run_quiet(&["config", "set", "--repo", key, value])
 }
 
-/// Execute a jj command and return the output.
+/// Execute a jj command from the process working directory.
 pub fn run(args: &[&str]) -> Result<Output> {
-    let mut full_args = vec!["--color=never"];
-    full_args.extend_from_slice(args);
-    let output = Command::new("jj")
-        .args(&full_args)
-        .output()
-        .context("failed to execute jj")?;
-    Ok(output)
+    run_from(None, args)
 }
 
-/// Execute a jj command and return stdout as string, failing on non-zero exit.
-pub fn run_ok(args: &[&str]) -> Result<String> {
-    let output = run(args)?;
+/// Execute a jj command with `dir` as its working directory. jj snapshots
+/// the working copy of the workspace containing the command's cwd, so
+/// workspace-scoped operations must run through this rather than chdir'ing
+/// the process (a process-global chdir breaks concurrent work and strands
+/// the process if an error skips the chdir back).
+pub fn run_in(dir: &Path, args: &[&str]) -> Result<Output> {
+    run_from(Some(dir), args)
+}
+
+fn run_from(dir: Option<&Path>, args: &[&str]) -> Result<Output> {
+    let mut full_args = vec!["--color=never"];
+    full_args.extend_from_slice(args);
+    let mut cmd = Command::new("jj");
+    cmd.args(&full_args);
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    cmd.output().context("failed to execute jj")
+}
+
+/// Extract stdout from a jj invocation, failing with stderr context on
+/// non-zero exit.
+fn expect_success(args: &[&str], output: Output) -> Result<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("jj {} failed: {}", args.join(" "), stderr.trim());
@@ -43,14 +57,32 @@ pub fn run_ok(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Execute a jj command and return stdout as string, failing on non-zero exit.
+pub fn run_ok(args: &[&str]) -> Result<String> {
+    expect_success(args, run(args)?)
+}
+
+/// `run_ok` with `dir` as the command's working directory.
+pub fn run_ok_in(dir: &Path, args: &[&str]) -> Result<String> {
+    expect_success(args, run_in(dir, args)?)
+}
+
 /// Execute a jj command silently, only returning error on failure.
 pub fn run_quiet(args: &[&str]) -> Result<()> {
-    let output = run(args)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("jj {} failed: {}", args.join(" "), stderr.trim());
-    }
-    Ok(())
+    run_ok(args).map(|_| ())
+}
+
+/// `run_quiet` with `dir` as the command's working directory.
+pub fn run_quiet_in(dir: &Path, args: &[&str]) -> Result<()> {
+    run_ok_in(dir, args).map(|_| ())
+}
+
+/// Snapshot the working copy of the workspace at `dir` into its @ commit.
+/// jj only snapshots the workspace a command runs in; a cheap read-only
+/// command inside `dir` forces it, so revset-based operations run from other
+/// directories see the workspace's current files.
+pub fn snapshot_workspace(dir: &Path) -> Result<()> {
+    run_quiet_in(dir, &["file", "list", "-r", "@"])
 }
 
 /// Verify we're in a jj repository.
@@ -223,31 +255,42 @@ pub fn list_bookmarks() -> Result<Vec<String>> {
 }
 
 /// Resolve a revset to a single change ID.
+///
+/// The template emits one line per revision so multiple matches (e.g. a
+/// conflicted bookmark) are detectable; without the trailing newline jj
+/// concatenates all revisions into a single line.
 pub fn resolve_revset(revset: &str) -> Result<String> {
-    let output = run(&["log", "-r", revset, "--no-graph", "-T", "change_id.short()"])?;
+    let output = run(&[
+        "log", "-r", revset, "--no-graph", "-T",
+        "change_id.short() ++ \"\\n\"",
+    ])?;
     if !output.status.success() {
-        bail!("revset '{}' not found", revset);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().next().unwrap_or("").trim().to_string();
+        bail!("revset '{}' not found ({})", revset, detail);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let change_id = stdout.trim();
     if change_id.is_empty() {
         bail!("revset '{}' not found", revset);
     }
-    // Check for multiple matches (output would have multiple lines)
     if change_id.contains('\n') {
         bail!("revset '{}' resolves to multiple revisions", revset);
     }
     Ok(change_id.to_string())
 }
 
-/// Resolve a revset to both change ID and commit ID.
+/// Resolve a revset to both change ID and commit ID. One line per revision;
+/// see resolve_revset for why the trailing newline is load-bearing.
 pub fn resolve_revset_full(revset: &str) -> Result<(String, String)> {
     let output = run(&[
         "log", "-r", revset, "--no-graph", "-T",
-        "change_id.short() ++ \" \" ++ commit_id",
+        "change_id.short() ++ \" \" ++ commit_id ++ \"\\n\"",
     ])?;
     if !output.status.success() {
-        bail!("revset '{}' not found", revset);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().next().unwrap_or("").trim().to_string();
+        bail!("revset '{}' not found ({})", revset, detail);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.trim();
@@ -376,9 +419,9 @@ pub fn duplicate_onto(revset: &str, destination: &str) -> Result<Vec<String>> {
     Ok(change_ids)
 }
 
-/// Edit a revision (set it as working copy in current workspace).
-pub fn edit(rev: &str) -> Result<()> {
-    run_quiet(&["edit", rev])
+/// Edit a revision (set it as the working copy of the workspace at `dir`).
+pub fn edit(dir: &Path, rev: &str) -> Result<()> {
+    run_quiet_in(dir, &["edit", rev])
 }
 
 /// Rebase a revision and its ancestors (up to destination) onto the destination.

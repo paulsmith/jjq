@@ -3,15 +3,12 @@
 
 use anyhow::{bail, Result};
 use regex::Regex;
-use std::env;
 use std::fs;
 use std::sync::OnceLock;
-use tempfile::TempDir;
 
-use crate::config::{self, JJQ_BOOKMARK};
 use crate::exit_codes::{self, ExitError};
 use crate::jj;
-use crate::lock::Lock;
+use crate::meta;
 
 /// Validate and parse a sequence ID from user input.
 /// Returns the integer value on success.
@@ -41,51 +38,43 @@ pub fn format_seq_id(id: u32) -> String {
     format!("{:06}", id)
 }
 
-/// Get the next sequence ID, incrementing the counter.
+/// Get the next sequence ID, incrementing the counter. Allocation happens
+/// inside the metadata writer, so the meta lock serializes concurrent pushes.
 pub fn next_id() -> Result<u32> {
-    let _lock = match Lock::acquire("id")? {
-        Some(lock) => lock,
-        None => {
-            return Err(ExitError::new(
-                exit_codes::LOCK_HELD,
-                "could not acquire sequence ID lock (another process may be pushing)",
+    let mut allocated = 0u32;
+    meta::with_meta_workspace(|workspace| {
+        let path = workspace.join("last_id");
+        // A missing or corrupt counter means the metadata branch is damaged;
+        // restarting from 0 would hand out duplicate IDs, so fail hard.
+        let raw = fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot read sequence counter from jjq metadata ({}); run 'jjq doctor'",
+                e
             )
-            .into());
+        })?;
+        let current: u32 = raw.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "sequence counter in jjq metadata is corrupt ({:?}); run 'jjq doctor'",
+                raw.trim()
+            )
+        })?;
+
+        if current >= 999999 {
+            return Err(
+                ExitError::new(exit_codes::USAGE, "sequence ID exhausted (at 999999)").into(),
+            );
         }
-    };
 
-    config::ensure_initialized()?;
-
-    let temp_dir = TempDir::new()?;
-    let workspace_name = format!("jjq{}", std::process::id());
-
-    jj::workspace_add(
-        temp_dir.path().to_str().unwrap(),
-        &workspace_name,
-        &[JJQ_BOOKMARK],
-    )?;
-
-    let orig_dir = env::current_dir()?;
-    env::set_current_dir(temp_dir.path())?;
-
-    // Read current value
-    let current: u32 = fs::read_to_string("last_id")?.trim().parse().unwrap_or(0);
-
-    if current >= 999999 {
-        env::set_current_dir(&orig_dir)?;
-        jj::workspace_forget(&workspace_name)?;
-        return Err(ExitError::new(exit_codes::USAGE, "sequence ID exhausted (at 999999)").into());
-    }
-
-    let new_id = current + 1;
-    fs::write("last_id", new_id.to_string())?;
-    jj::describe("@", &format!("{} -> {}\npid: {}", current, new_id, std::process::id()))?;
-    jj::run_quiet(&["bookmark", "set", JJQ_BOOKMARK])?;
-
-    env::set_current_dir(&orig_dir)?;
-    jj::workspace_forget(&workspace_name)?;
-
-    Ok(new_id)
+        allocated = current + 1;
+        fs::write(&path, allocated.to_string())?;
+        Ok(format!(
+            "{} -> {}\npid: {}",
+            current,
+            allocated,
+            std::process::id()
+        ))
+    })?;
+    Ok(allocated)
 }
 
 /// Compiled regex for matching queue bookmark names.

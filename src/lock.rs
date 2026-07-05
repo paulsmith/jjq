@@ -1,7 +1,7 @@
 // ABOUTME: Filesystem-based locking using flock via the fs2 crate.
 // ABOUTME: Implements the locking protocol from the jjq specification.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use fs2::FileExt;
 use std::fs::{self, File};
 use std::io;
@@ -25,14 +25,6 @@ impl Lock {
             Ok(()) => Ok(Some(Lock { _file: file })),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Acquire a lock, failing with an error if already held.
-    pub fn acquire_or_fail(name: &str, message: &str) -> Result<Lock> {
-        match Lock::acquire(name)? {
-            Some(lock) => Ok(lock),
-            None => bail!("{}", message),
         }
     }
 

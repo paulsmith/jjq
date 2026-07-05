@@ -6,6 +6,7 @@ mod config;
 mod exit_codes;
 mod jj;
 mod lock;
+mod meta;
 mod queue;
 mod runlog;
 mod runner;
@@ -129,9 +130,8 @@ fn run() -> Result<()> {
     // Verify we're in a jj repository
     jj::verify_repo()?;
 
-    // Resolve the shared .jj directory now, while cwd is still the invoking
-    // workspace: commands chdir into temporary workspaces, and the cached
-    // value must reflect the workspace jjq was started from.
+    // Resolve the shared .jj directory up front so the cached value reflects
+    // the workspace jjq was invoked from.
     jj::shared_jj_dir()?;
 
     match cli.command {
