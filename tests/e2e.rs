@@ -175,6 +175,61 @@ impl TestRepo {
         (stdout, stderr, output.status.success())
     }
 
+    /// Run jjq with a wall-clock timeout, killing the process if it exceeds
+    /// it. Returns (stdout, stderr, exit_code); exit_code is None if killed.
+    /// Guards tests where a regression would make jjq loop indefinitely.
+    fn jjq_with_timeout(
+        &self,
+        args: &[&str],
+        timeout: std::time::Duration,
+    ) -> (String, String, Option<i32>) {
+        use std::io::Read;
+
+        let mut child = process::Command::new(&*JJQ_BIN)
+            .current_dir(&self.path)
+            .args(args)
+            .env("NON_INTERACTIVE", "1")
+            .env("JJ_OP_HOSTNAME", "test")
+            .env("JJ_OP_USERNAME", "test")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &self.path)
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn jjq");
+
+        // Drain pipes on threads so the child can't block on a full pipe buffer
+        let mut stdout_pipe = child.stdout.take().unwrap();
+        let mut stderr_pipe = child.stderr.take().unwrap();
+        let stdout_thread = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = stdout_pipe.read_to_string(&mut buf);
+            buf
+        });
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = stderr_pipe.read_to_string(&mut buf);
+            buf
+        });
+
+        let deadline = std::time::Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("failed to poll jjq") {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        let stdout = stdout_thread.join().expect("stdout reader panicked");
+        let stderr = stderr_thread.join().expect("stderr reader panicked");
+        (stdout, stderr, status.and_then(|s| s.code()))
+    }
+
     /// Run jjq with additional environment variables.
     fn jjq_with_env(&self, args: &[&str], env_vars: &[(&str, &str)]) -> String {
         let mut cmd = Command::new(&*JJQ_BIN);
@@ -795,7 +850,6 @@ fn test_run_check_failure() {
     jjq: To resolve:
     jjq:   # fix the issue in <CHANGE_ID>
     jjq:   jjq push <CHANGE_ID>
-    jjq: merge 1 check failed
     ");
 
     let status_output = repo.jjq_success(&["status"]);
@@ -988,7 +1042,6 @@ fn test_full_workflow_with_prs() {
     jjq:   jj rebase -r <CHANGE_ID> -d main
     jjq:   # resolve conflicts in <CHANGE_ID>
     jjq:   jjq push <CHANGE_ID>
-    jjq: merge 2 has conflicts
     ");
 
     // Check status shows failed item and landed item
@@ -2204,4 +2257,94 @@ fn test_push_from_secondary_workspace_respects_id_lock() {
         "no queue entry should be created while the id lock is held: {}",
         bookmarks
     );
+}
+
+/// Set up a repo with one queued item and the run lock held by this process,
+/// as if another queue runner were active. The returned File holds the lock.
+fn repo_with_queued_item_and_held_run_lock() -> (TestRepo, fs::File) {
+    use fs2::FileExt;
+
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "feature content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feature"]);
+    repo.jjq_success(&["push", "feature"]);
+
+    let lock_dir = repo.path().join(".jj").join("jjq-locks");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lock_file = fs::File::create(lock_dir.join("run.lock")).unwrap();
+    lock_file.lock_exclusive().unwrap();
+
+    (repo, lock_file)
+}
+
+/// Assert the queued item is untouched while another runner holds the lock.
+fn assert_queue_item_remains(repo: &TestRepo) {
+    let bookmarks = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/queue/??????\")",
+            "-T",
+            "name ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        bookmarks.contains("jjq/queue/000001"),
+        "queued item should remain while another runner holds the lock: {}",
+        bookmarks
+    );
+}
+
+/// Assert a lock-held run exited CONFLICT with a single short notice.
+fn assert_run_lock_notice(combined: &str, code: Option<i32>) {
+    assert_eq!(
+        code,
+        Some(1),
+        "should exit CONFLICT while the run lock is held (None means killed at timeout); output: {}",
+        combined
+    );
+    assert_eq!(
+        combined.matches("another queue runner is active").count(),
+        1,
+        "notice should appear exactly once: {}",
+        combined
+    );
+    assert!(
+        combined.lines().count() < 5,
+        "output should be a short notice, not a retry log: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_run_all_exits_when_run_lock_held() {
+    let (repo, _lock_file) = repo_with_queued_item_and_held_run_lock();
+
+    // A second runner must notice the held lock and exit at once — not spin
+    // on the lock or count the contention as item failures. The timeout
+    // bounds the test if a regression reintroduces the retry loop.
+    let (stdout, stderr, code) =
+        repo.jjq_with_timeout(&["run", "--all"], std::time::Duration::from_secs(10));
+    let combined = format!("{}{}", stdout, stderr);
+
+    assert_run_lock_notice(&combined, code);
+    assert_queue_item_remains(&repo);
+}
+
+#[test]
+fn test_run_exits_when_run_lock_held() {
+    let (repo, _lock_file) = repo_with_queued_item_and_held_run_lock();
+
+    // A single run must also observe the lock before touching the queue
+    let (stdout, stderr, code) =
+        repo.jjq_with_timeout(&["run"], std::time::Duration::from_secs(10));
+    let combined = format!("{}{}", stdout, stderr);
+
+    assert_run_lock_notice(&combined, code);
+    assert_queue_item_remains(&repo);
 }

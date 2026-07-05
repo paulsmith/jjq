@@ -465,14 +465,26 @@ pub fn push(revset: &str) -> Result<()> {
 pub fn run(all: bool, stop_on_failure: bool) -> Result<()> {
     require_initialized()?;
 
+    // Take the run lock before reading queue or config state, so a concurrent
+    // runner exits immediately instead of contending with the active one.
+    let run_lock = match Lock::acquire("run")? {
+        Some(lock) => lock,
+        None => {
+            return Err(
+                ExitError::new(exit_codes::CONFLICT, "another queue runner is active").into(),
+            );
+        }
+    };
+
     if all {
-        run_all(stop_on_failure)
+        run_all(&run_lock, stop_on_failure)
     } else {
-        match run_one()? {
+        match run_one(&run_lock)? {
             RunResult::Success => Ok(()),
             RunResult::Empty => Ok(()),
             RunResult::Skipped => Ok(()),
-            RunResult::Failure(code, msg) => Err(ExitError::new(code, msg).into()),
+            // run_one already reported the failure in detail
+            RunResult::Failure(code) => Err(ExitError::code_only(code).into()),
         }
     }
 }
@@ -481,16 +493,16 @@ enum RunResult {
     Success,
     Empty,
     Skipped,
-    Failure(i32, String),
+    Failure(i32),
 }
 
-fn run_all(stop_on_failure: bool) -> Result<()> {
+fn run_all(run_lock: &Lock, stop_on_failure: bool) -> Result<()> {
     let mut merged_count = 0u32;
     let mut failed_count = 0u32;
     let mut skipped_count = 0u32;
 
     loop {
-        match run_one()? {
+        match run_one(run_lock)? {
             RunResult::Success => {
                 merged_count += 1;
             }
@@ -500,7 +512,7 @@ fn run_all(stop_on_failure: bool) -> Result<()> {
             RunResult::Skipped => {
                 skipped_count += 1;
             }
-            RunResult::Failure(_code, msg) => {
+            RunResult::Failure(_code) => {
                 if stop_on_failure {
                     if merged_count > 0 {
                         prefout(&format!(
@@ -508,7 +520,7 @@ fn run_all(stop_on_failure: bool) -> Result<()> {
                             merged_count
                         ));
                     }
-                    return Err(ExitError::new(exit_codes::CONFLICT, msg).into());
+                    return Err(ExitError::code_only(exit_codes::CONFLICT).into());
                 }
                 failed_count += 1;
             }
@@ -521,14 +533,7 @@ fn run_all(stop_on_failure: bool) -> Result<()> {
                 "processed {} item(s), {} failed",
                 merged_count, failed_count
             ));
-            return Err(ExitError::new(
-                exit_codes::PARTIAL,
-                format!(
-                    "processed {} item(s), {} failed",
-                    merged_count, failed_count
-                ),
-            )
-            .into());
+            return Err(ExitError::code_only(exit_codes::PARTIAL).into());
         }
         if skipped_count > 0 {
             prefout(&format!(
@@ -542,7 +547,9 @@ fn run_all(stop_on_failure: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_one() -> Result<RunResult> {
+/// Process the next queue item. The caller must hold the run lock, passed
+/// here as evidence.
+fn run_one(_run_lock: &Lock) -> Result<RunResult> {
     let id = match queue::next_item()? {
         Some(id) => id,
         None => {
@@ -559,10 +566,7 @@ fn run_one() -> Result<RunResult> {
         None => {
             drop(config_lock);
             preferr("check_command not configured (use 'jjq config check_command <cmd>')");
-            return Ok(RunResult::Failure(
-                exit_codes::CONFLICT,
-                "check_command not configured".to_string(),
-            ));
+            return Ok(RunResult::Failure(exit_codes::CONFLICT));
         }
     };
     let strategy = config::get_strategy()?;
@@ -573,18 +577,6 @@ fn run_one() -> Result<RunResult> {
         id,
         strategy.as_str()
     ));
-
-    // Acquire run lock
-    let run_lock = match Lock::acquire("run")? {
-        Some(lock) => lock,
-        None => {
-            preferr("queue runner lock already held");
-            return Ok(RunResult::Failure(
-                exit_codes::CONFLICT,
-                "run lock unavailable".to_string(),
-            ));
-        }
-    };
 
     // Record trunk commit ID
     let trunk_commit_id = jj::get_commit_id(&format!("bookmarks(exact:{})", trunk_bookmark))?;
@@ -670,7 +662,6 @@ fn run_one() -> Result<RunResult> {
 
         env::set_current_dir(&orig_dir)?;
         let _ = runner_workspace.keep();
-        drop(run_lock);
 
         preferr(&format!("merge {} has conflicts, marked as failed", id));
         preferr(&format!("  candidate: {}", candidate_change_id));
@@ -688,10 +679,7 @@ fn run_one() -> Result<RunResult> {
             candidate_change_id
         ));
         preferr(&format!("  jjq push {}", candidate_change_id));
-        return Ok(RunResult::Failure(
-            exit_codes::CONFLICT,
-            format!("merge {} has conflicts", id),
-        ));
+        return Ok(RunResult::Failure(exit_codes::CONFLICT));
     }
 
     // Check for empty commit (no changes vs trunk).
@@ -713,7 +701,6 @@ fn run_one() -> Result<RunResult> {
 
         env::set_current_dir(&orig_dir)?;
         jj::workspace_forget(&run_name)?;
-        drop(run_lock);
 
         preferr(&format!(
             "queue item {} is empty (no changes vs {}), skipping",
@@ -755,7 +742,6 @@ fn run_one() -> Result<RunResult> {
 
         env::set_current_dir(&orig_dir)?;
         let _ = runner_workspace.keep();
-        drop(run_lock);
 
         preferr(&format!("merge {} failed check, marked as failed", id));
         preferr(&format!("  candidate: {}", candidate_change_id));
@@ -763,10 +749,7 @@ fn run_one() -> Result<RunResult> {
         preferr("To resolve:");
         preferr(&format!("  # fix the issue in {}", candidate_change_id));
         preferr(&format!("  jjq push {}", candidate_change_id));
-        return Ok(RunResult::Failure(
-            exit_codes::CONFLICT,
-            format!("merge {} check failed", id),
-        ));
+        return Ok(RunResult::Failure(exit_codes::CONFLICT));
     }
 
     // Verify trunk hasn't moved
@@ -781,13 +764,9 @@ fn run_one() -> Result<RunResult> {
         }
         env::set_current_dir(&orig_dir)?;
         jj::workspace_forget(&run_name)?;
-        drop(run_lock);
 
         preferr("trunk bookmark moved during run; queue item left in place, re-run to retry");
-        return Ok(RunResult::Failure(
-            exit_codes::CONFLICT,
-            "trunk moved during run".to_string(),
-        ));
+        return Ok(RunResult::Failure(exit_codes::CONFLICT));
     }
 
     // Success path — order matters for crash safety:
@@ -806,7 +785,6 @@ fn run_one() -> Result<RunResult> {
 
             env::set_current_dir(&orig_dir)?;
             jj::workspace_forget(&run_name)?;
-            drop(run_lock);
 
             prefout(&format!(
                 "merged {} to {} (now at {})",
@@ -845,7 +823,6 @@ fn run_one() -> Result<RunResult> {
             }
 
             jj::workspace_forget(&run_name)?;
-            drop(run_lock);
 
             prefout(&format!(
                 "rebased {} to {} (now at {})",

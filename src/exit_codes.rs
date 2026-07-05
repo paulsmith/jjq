@@ -19,6 +19,12 @@ impl ExitError {
     pub fn new(code: i32, message: impl Into<String>) -> Self {
         ExitError { code, message: message.into() }
     }
+
+    /// An error that sets the exit code without further output, for failures
+    /// that have already been reported in full to the user.
+    pub fn code_only(code: i32) -> Self {
+        ExitError { code, message: String::new() }
+    }
 }
 
 impl fmt::Display for ExitError {

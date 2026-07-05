@@ -106,7 +106,10 @@ enum Commands {
 fn main() {
     if let Err(e) = run() {
         if let Some(exit_err) = e.downcast_ref::<exit_codes::ExitError>() {
-            eprintln!("jjq: {}", exit_err.message);
+            // code_only errors were already reported in full by the command
+            if !exit_err.message.is_empty() {
+                eprintln!("jjq: {}", exit_err.message);
+            }
             std::process::exit(exit_err.code);
         }
         eprintln!("jjq: {}", e);

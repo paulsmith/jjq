@@ -70,7 +70,7 @@ jjq stores all state in the jj repository itself:
 | Code | Constant | Meaning |
 |------|----------|---------|
 | 0 | *(success)* | Success |
-| 1 | `CONFLICT` | Merge conflict, check failed, trunk moved during run, or run lock unavailable |
+| 1 | `CONFLICT` | Merge conflict, check failed, trunk moved during run, or another queue runner is active |
 | 2 | `PARTIAL` | Batch run processed some items but left failures |
 | 3 | `LOCK_HELD` | Sequence ID allocation lock held (push contention) |
 | 10 | `USAGE` | Bad arguments, item not found, invalid revset |
