@@ -28,6 +28,23 @@ impl Lock {
         }
     }
 
+    /// Try to acquire a named lock in shared mode. Any number of shared
+    /// holders may coexist (e.g. concurrent `jjq check` runs), while an
+    /// exclusive `acquire` of the same name fails as long as one lives —
+    /// which is how `jjq clean` detects active checks.
+    pub fn acquire_shared(name: &str) -> Result<Option<Lock>> {
+        let path = lock_file_path(name)?;
+        fs::create_dir_all(path.parent().unwrap())?;
+        let file = File::create(&path)?;
+        // Qualified call: std::fs::File has grown an inherent
+        // try_lock_shared with a different error type, which would shadow
+        // the fs2 trait method the rest of this module uses.
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => Ok(Some(Lock { _file: file })),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 /// State of a named lock.

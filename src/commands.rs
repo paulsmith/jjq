@@ -2,9 +2,11 @@
 // ABOUTME: Each function implements one jjq subcommand per the specification.
 
 use anyhow::{Result, anyhow, bail};
+use regex::Regex;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::sync::OnceLock;
 use tempfile::TempDir;
 
 use serde::Serialize;
@@ -18,7 +20,8 @@ use crate::queue;
 
 #[derive(Serialize)]
 struct StatusOutput {
-    running: bool,
+    runner_active: bool,
+    running: Vec<QueueItem>,
     queue: Vec<QueueItem>,
     failed: Vec<FailedItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -53,11 +56,18 @@ struct LandedItem {
     description: String,
 }
 
-/// Check if a workspace name belongs to jjq (and should be cleaned up by doctor/clean).
-/// Covers the workspace naming patterns jjq-run-*, jjq-meta-*, and jjq-check-*,
-/// plus names left behind by earlier layouts (jjq{PID}, jjq-config-*, jjq-hint-*).
+/// Check if a workspace name belongs to jjq (and should be cleaned up by
+/// doctor/clean). Matches exactly the names jjq generates — jjq-run-NNNNNN,
+/// jjq-meta-<pid>-<seq>, jjq-check-<pid> — plus names left behind by earlier
+/// layouts (jjq<pid>, jjq-config-<pid>, jjq-hint-<pid>). Clean destroys
+/// whatever this matches, so a user workspace that merely starts with "jjq"
+/// (e.g. jjq-experiments) must not match.
 fn is_jjq_workspace(name: &str) -> bool {
-    name.starts_with("jjq-") || (name.starts_with("jjq") && name.len() > 3)
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^jjq(-run-\d{6}|-meta-\d+-\d+|-check-\d+|-config-\d+|-hint-\d+|\d+)$").unwrap()
+    });
+    re.is_match(name)
 }
 
 /// Output with jjq: prefix to stdout.
@@ -143,6 +153,21 @@ fn lookup_workspace_path(id: u32) -> Option<String> {
             None
         }
         Err(_) => None,
+    }
+}
+
+/// Best-effort removal of a run's workspace registration and directory.
+/// Used when clearing failed items and stale claims; the workspace may
+/// already be gone, so nothing here is an error.
+fn cleanup_run_workspace(id: u32) {
+    let run_name = format!("jjq-run-{}", queue::format_seq_id(id));
+    let workspace_path = lookup_workspace_path(id);
+    let _ = jj::workspace_forget(&run_name);
+    if let Some(ref path) = workspace_path {
+        let p = std::path::Path::new(path);
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(p);
+        }
     }
 }
 
@@ -371,35 +396,57 @@ pub fn push(revset: &str) -> Result<()> {
         .into());
     }
 
-    // Idempotent push: clean up existing queue/failed entries for this change
+    // Idempotent push: clean up existing queue/failed entries for this change.
+    // Entries are enumerated by ID and their bookmark names derived — never
+    // listed by revset: `jj bookmark list -r` returns every bookmark on the
+    // matched commits, including the user's own co-located bookmarks.
 
-    // Scan queue bookmarks (one subprocess per bookmark for both IDs)
-    let queue_bookmarks = jj::bookmark_list_glob("jjq/queue/??????")?;
-    for bookmark in &queue_bookmarks {
+    for entry_id in queue::get_queue()? {
+        let bookmark = queue::queue_bookmark(entry_id);
         let revset = format!("bookmarks(exact:{})", bookmark);
         let (entry_change_id, entry_commit_id) = jj::resolve_revset_full(&revset)?;
         if entry_commit_id == commit_id {
-            let entry_id = extract_id_from_bookmark(bookmark);
             preferr(&format!("revision already queued at {}", entry_id));
             return Err(ExitError::new(exit_codes::USAGE, "revision already queued").into());
         }
         if entry_change_id == change_id {
-            let entry_id = extract_id_from_bookmark(bookmark);
-            jj::bookmark_delete(bookmark)?;
+            jj::bookmark_delete(&bookmark)?;
             prefout(&format!("replacing queued entry {}", entry_id));
         }
     }
 
-    // Scan failed bookmarks: extract candidate change ID from jjq-candidate trailer
-    let failed_bookmarks = jj::bookmark_list_glob("jjq/failed/??????")?;
-    for bookmark in &failed_bookmarks {
+    // Running claims: an item claimed by an active runner must not be
+    // replaced or cleared out from under it. Holding the run lock across the
+    // mutation (not just probing it) keeps a starting runner from re-claiming
+    // the entry mid-replacement; with the lock unavailable the runner is live
+    // and the push is refused.
+    for entry_id in queue::get_running()? {
+        let bookmark = queue::running_bookmark(entry_id);
+        let revset = format!("bookmarks(exact:{})", bookmark);
+        let (entry_change_id, entry_commit_id) = jj::resolve_revset_full(&revset)?;
+        if entry_change_id == change_id || entry_commit_id == commit_id {
+            let Some(_run_lock) = Lock::acquire("run")? else {
+                return Err(ExitError::new(
+                    exit_codes::USAGE,
+                    format!("revision is currently being processed (item {})", entry_id),
+                )
+                .into());
+            };
+            jj::bookmark_delete(&bookmark)?;
+            prefout(&format!("replacing interrupted entry {}", entry_id));
+            cleanup_run_workspace(entry_id);
+        }
+    }
+
+    // Failed entries: match on the jjq-candidate trailer.
+    for entry_id in queue::get_failed()? {
+        let bookmark = queue::failed_bookmark(entry_id);
         let desc = jj::get_description(&format!("bookmarks(exact:{})", bookmark))?;
         let trailers = extract_trailers(&desc);
         if let Some(candidate_change_id) = trailers.get("candidate")
             && *candidate_change_id == change_id
         {
-            let entry_id = extract_id_from_bookmark(bookmark);
-            jj::bookmark_delete(bookmark)?;
+            jj::bookmark_delete(&bookmark)?;
             prefout(&format!("clearing failed entry {}", entry_id));
         }
     }
@@ -564,9 +611,34 @@ fn run_all(run_lock: &Lock, run_config: &RunConfig, stop_on_failure: bool) -> Re
     Ok(())
 }
 
+/// Move a stale running claim back to its queue position (same ID). Callers
+/// must know the claim is orphaned: either they hold the run lock, or they
+/// verified the run lock is free.
+fn recover_claim(id: u32) -> Result<()> {
+    let running_bookmark = queue::running_bookmark(id);
+    if !queue::queue_item_exists(id)? {
+        jj::bookmark_create(
+            &queue::queue_bookmark(id),
+            &format!("bookmarks(exact:{})", running_bookmark),
+        )?;
+    }
+    jj::bookmark_delete(&running_bookmark)
+}
+
 /// Process the next queue item. The caller must hold the run lock, passed
 /// here as evidence, and supplies the batch-wide configuration.
 fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
+    // Under the run lock any existing claim is an orphan from a crashed
+    // runner; move it back to its queue position. Recovery keeps the same
+    // ID, so FIFO order is preserved (the lowest ID processes next anyway).
+    // The crashed runner also leaves its jjq-run-<id> workspace registered —
+    // it must go now, or re-claiming the item dies on the name collision.
+    for stale_id in queue::get_running()? {
+        cleanup_run_workspace(stale_id);
+        recover_claim(stale_id)?;
+        prefout(&format!("recovered interrupted item {}", stale_id));
+    }
+
     let id = match queue::next_item()? {
         Some(id) => id,
         None => {
@@ -584,20 +656,31 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
         strategy.as_str()
     ));
 
+    // Claim the item: the queue -> running rename, made under the run lock,
+    // marks it as being processed. delete/requeue/push refuse to touch a
+    // running item while the run lock is held, so user commands cannot
+    // silently lose against this runner (see pre-land verification below for
+    // the out-of-band case).
+    let running_bookmark = queue::running_bookmark(id);
+    jj::bookmark_create(
+        &running_bookmark,
+        &format!("bookmarks(exact:{})", queue::queue_bookmark(id)),
+    )?;
+    jj::bookmark_delete(&queue::queue_bookmark(id))?;
+
     // Record trunk commit ID
     let trunk_commit_id = jj::get_commit_id(&format!("bookmarks(exact:{})", trunk_bookmark))?;
 
     // Capture candidate change ID before creating workspace
-    let queue_bookmark = queue::queue_bookmark(id);
     let (candidate_change_id, candidate_commit_id) =
-        jj::resolve_revset_full(&format!("bookmarks(exact:{})", queue_bookmark))?;
+        jj::resolve_revset_full(&format!("bookmarks(exact:{})", running_bookmark))?;
 
     // Log path lives in the shared .jj so `jjq tail` sees it from any workspace
     let log_path = crate::runlog::log_path()?;
 
-    // Capture original description for rebase success path (before queue bookmark is deleted)
+    // Capture original description for rebase success path (before the claim is deleted)
     let candidate_description =
-        jj::get_description(&format!("bookmarks(exact:{})", queue_bookmark)).unwrap_or_default();
+        jj::get_description(&format!("bookmarks(exact:{})", running_bookmark)).unwrap_or_default();
 
     // Create workspace — strategy determines how
     let runner_workspace = TempDir::new()?;
@@ -613,14 +696,14 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
                 &run_name,
                 &[
                     &format!("bookmarks(exact:{})", trunk_bookmark),
-                    &format!("bookmarks(exact:{})", queue_bookmark),
+                    &format!("bookmarks(exact:{})", running_bookmark),
                 ],
             )?;
         }
         config::Strategy::Rebase => {
             // Duplicate candidate onto trunk (creates rebased copy without touching original)
             rebase_duplicate_ids = jj::duplicate_onto(
-                &format!("bookmarks(exact:{})", queue_bookmark),
+                &format!("bookmarks(exact:{})", running_bookmark),
                 &format!("bookmarks(exact:{})", trunk_bookmark),
             )?;
             // Create workspace on the tip duplicate (last in the list)
@@ -649,8 +732,10 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
     let workspace_rev = format!("{}@", run_name);
     if jj::has_conflicts(&workspace_rev)? {
         let conflicts = jj::conflict_paths(&workspace_rev)?;
-        jj::bookmark_delete(&queue_bookmark)?;
+        // Create the failed entry before deleting the claim so a crash
+        // between the two duplicates the item instead of losing it.
         jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
+        jj::bookmark_delete(&running_bookmark)?;
         jj::describe(
             &workspace_rev,
             &failure_description(
@@ -694,7 +779,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
         &workspace_rev,
     )?;
     if is_empty {
-        jj::bookmark_delete(&queue_bookmark)?;
+        jj::bookmark_delete(&running_bookmark)?;
 
         // For rebase, abandon all duplicates we created
         if strategy == config::Strategy::Rebase {
@@ -733,8 +818,10 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             }
         }
 
-        jj::bookmark_delete(&queue_bookmark)?;
+        // Failed entry before claim delete: a crash between the two
+        // duplicates the item instead of losing it.
         jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
+        jj::bookmark_delete(&running_bookmark)?;
         jj::describe(
             &workspace_rev,
             &failure_description(
@@ -772,13 +859,37 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
         }
         jj::workspace_forget(&run_name)?;
 
+        // The item was not at fault; the claim goes back to its queue
+        // position so the next run retries it.
+        recover_claim(id)?;
         preferr("trunk bookmark moved during run; queue item left in place, re-run to retry");
+        return Ok(RunResult::Failure(exit_codes::CONFLICT));
+    }
+
+    // Pre-land verification: the claim can vanish despite the run lock
+    // (out-of-band bookmark surgery, or a stale-claim delete that raced this
+    // runner's startup). Landing anyway would silently override that
+    // removal, so discard the temporary work instead. This runs immediately
+    // before the landing sequence: before rebase_branch_onto rewrites the
+    // user's original change (rebase) and before trunk moves (merge).
+    if !queue::running_item_exists(id)? {
+        if strategy == config::Strategy::Rebase {
+            for dup_id in &rebase_duplicate_ids {
+                let _ = jj::abandon(dup_id);
+            }
+        }
+        jj::workspace_forget(&run_name)?;
+
+        preferr(&format!(
+            "item {} was removed while being processed; discarding result",
+            id
+        ));
         return Ok(RunResult::Failure(exit_codes::CONFLICT));
     }
 
     // Success path — order matters for crash safety:
     // 1. Move trunk first (most critical)
-    // 2. Delete queue bookmark
+    // 2. Delete the running claim
     // 3. Describe commit
     // For rebase: we tested against a duplicate, now rebase the original to
     // preserve change ID, then move trunk to the rebased original.
@@ -789,7 +900,13 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             // whose tree was snapshotted above after the check ran.
             let landed_change_id = jj::resolve_revset(&workspace_rev)?;
             jj::bookmark_move(trunk_bookmark, &trunk_commit_id, &workspace_rev)?;
-            jj::bookmark_delete(&queue_bookmark)?;
+            if !queue::running_item_exists(id)? {
+                preferr(&format!(
+                    "note: item {} was removed during landing; it landed anyway",
+                    id
+                ));
+            }
+            jj::bookmark_delete(&running_bookmark)?;
             jj::describe(&workspace_rev, &format!("Success: merge {}", id))?;
 
             jj::workspace_forget(&run_name)?;
@@ -812,7 +929,13 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             // Move trunk to the rebased original (not the duplicate)
             // The candidate_change_id is now rebased onto trunk
             jj::bookmark_move(trunk_bookmark, &trunk_commit_id, &candidate_change_id)?;
-            jj::bookmark_delete(&queue_bookmark)?;
+            if !queue::running_item_exists(id)? {
+                preferr(&format!(
+                    "note: item {} was removed during landing; it landed anyway",
+                    id
+                ));
+            }
+            jj::bookmark_delete(&running_bookmark)?;
 
             // Describe the landed commit with trailers
             let desc = format!(
@@ -892,6 +1015,22 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
     // Log path lives in the shared .jj so `jjq tail` sees it from any workspace
     let log_path = crate::runlog::log_path()?;
 
+    // Hold the check lock in shared mode for the workspace's lifetime, so
+    // concurrent checks coexist but `jjq clean` (which probes it
+    // exclusively) cannot destroy a live check workspace. Lock order: check
+    // takes only this lock; clean takes run then check; no path takes run
+    // while holding check.
+    let _check_lock = match Lock::acquire_shared("check")? {
+        Some(lock) => lock,
+        None => {
+            return Err(ExitError::new(
+                exit_codes::CONFLICT,
+                "jjq clean is in progress; retry when it finishes",
+            )
+            .into());
+        }
+    };
+
     // Create temporary workspace
     let workspace_dir = TempDir::new()?;
     let workspace_name = format!("jjq-check-{}", std::process::id());
@@ -939,9 +1078,8 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
     }
 }
 
-/// Build a QueueItem by resolving data from the bookmark target.
-fn build_queue_item(id: u32) -> Result<QueueItem> {
-    let bookmark = queue::queue_bookmark(id);
+/// Build a QueueItem by resolving data from a bookmark target.
+fn build_item_at_bookmark(id: u32, bookmark: &str) -> Result<QueueItem> {
     let revset = format!("bookmarks(exact:{})", bookmark);
     let (change_id, commit_id) = jj::resolve_revset_full(&revset)?;
     let description = jj::get_description(&revset)?;
@@ -952,6 +1090,16 @@ fn build_queue_item(id: u32) -> Result<QueueItem> {
         commit_id,
         description,
     })
+}
+
+/// Build a QueueItem for a queued entry.
+fn build_queue_item(id: u32) -> Result<QueueItem> {
+    build_item_at_bookmark(id, &queue::queue_bookmark(id))
+}
+
+/// Build a QueueItem for a running (claimed) entry.
+fn build_running_item(id: u32) -> Result<QueueItem> {
+    build_item_at_bookmark(id, &queue::running_bookmark(id))
 }
 
 /// Build a FailedItem by parsing trailers from the bookmark target description.
@@ -1065,7 +1213,8 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
     if !config::is_initialized()? {
         if json {
             let output = StatusOutput {
-                running: false,
+                runner_active: false,
+                running: vec![],
                 queue: vec![],
                 failed: vec![],
                 landed: vec![],
@@ -1077,10 +1226,16 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
         return Ok(());
     }
 
-    let running = lock::is_held("run")?;
+    let runner_active = lock::is_held("run")?;
 
+    let running_ids = queue::get_running()?;
     let queue_ids = queue::get_queue()?;
     let failed_ids = queue::get_failed()?;
+
+    let running_items: Vec<QueueItem> = running_ids
+        .iter()
+        .map(|&id| build_running_item(id))
+        .collect::<Result<_>>()?;
 
     let queue_items: Vec<QueueItem> = queue_ids
         .iter()
@@ -1097,24 +1252,39 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
 
     if json {
         let output = StatusOutput {
-            running,
+            runner_active,
+            running: running_items,
             queue: queue_items,
             failed: failed_items,
             landed: landed_items,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        if running {
+        if runner_active {
             prefout("Run in progress");
             println!();
         }
 
-        if queue_items.is_empty() && failed_items.is_empty() && landed_items.is_empty() {
+        if running_items.is_empty()
+            && queue_items.is_empty()
+            && failed_items.is_empty()
+            && landed_items.is_empty()
+        {
             prefout("queue is empty");
             return Ok(());
         }
 
+        if !running_items.is_empty() {
+            prefout("Running:");
+            for item in &running_items {
+                println!("  {}: {} {}", item.id, item.change_id, item.description);
+            }
+        }
+
         if !queue_items.is_empty() {
+            if !running_items.is_empty() {
+                println!();
+            }
             prefout("Queued:");
             for item in &queue_items {
                 println!("  {}: {} {}", item.id, item.change_id, item.description);
@@ -1122,7 +1292,7 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
         }
 
         if !failed_items.is_empty() {
-            if !queue_items.is_empty() {
+            if !running_items.is_empty() || !queue_items.is_empty() {
                 println!();
             }
             prefout("Failed (recent):");
@@ -1145,7 +1315,7 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
         }
 
         if !landed_items.is_empty() {
-            if !queue_items.is_empty() || !failed_items.is_empty() {
+            if !running_items.is_empty() || !queue_items.is_empty() || !failed_items.is_empty() {
                 println!();
             }
             prefout("Landed (recent):");
@@ -1165,6 +1335,8 @@ fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<
             (id, true)
         } else if queue::failed_item_exists(id)? {
             (id, false)
+        } else if queue::running_item_exists(id)? {
+            bail!("item {} is currently being processed (run in progress)", id)
         } else {
             bail!("item {} not found in queue or failed", id)
         }
@@ -1264,6 +1436,26 @@ pub fn requeue(id_str: &str) -> Result<()> {
                 ExitError::new(exit_codes::USAGE, format!("item {} is already queued", id)).into(),
             );
         }
+        if queue::running_item_exists(id)? {
+            // Hold the run lock across the recovery (not just a probe): a
+            // starting runner could otherwise re-claim the item mid-recovery.
+            let Some(_run_lock) = Lock::acquire("run")? else {
+                return Err(ExitError::new(
+                    exit_codes::USAGE,
+                    format!(
+                        "item {} is being processed by a running queue runner (jjq requeue can only act on it after the run finishes)",
+                        id
+                    ),
+                )
+                .into());
+            };
+            // Stale claim from a crashed runner: recover it to its queue
+            // position, which is what requeue would achieve anyway.
+            cleanup_run_workspace(id);
+            recover_claim(id)?;
+            prefout(&format!("recovered interrupted item {}; it is queued again", id));
+            return Ok(());
+        }
         return Err(
             ExitError::new(exit_codes::USAGE, format!("failed item {} not found", id)).into(),
         );
@@ -1361,7 +1553,45 @@ pub fn delete(id_str: &str) -> Result<()> {
     // Check queue first
     if queue::queue_item_exists(id)? {
         jj::bookmark_delete(&queue::queue_bookmark(id))?;
+        // A crash between claim-create and queue-delete leaves both
+        // bookmarks; remove the leftover claim too, or the next run's
+        // recovery resurrects and lands the item just deleted. If a live
+        // runner is mid-claim, its pre-land verification discards the
+        // result — the delete still wins.
+        if queue::running_item_exists(id)? {
+            jj::bookmark_delete(&queue::running_bookmark(id))?;
+        }
         prefout(&format!("deleted queued item {}", id));
+        return Ok(());
+    }
+
+    // A running item is claimed by a queue runner. With the run lock held
+    // the runner is live and deleting would be silently overridden when it
+    // lands the item; with the lock free the claim is an orphan from a
+    // crashed runner and safe to remove. The lock is held across the
+    // removal (not just probed) so a starting runner cannot re-claim the
+    // item mid-delete.
+    if queue::running_item_exists(id)? {
+        let Some(_run_lock) = Lock::acquire("run")? else {
+            return Err(ExitError::new(
+                exit_codes::USAGE,
+                format!(
+                    "item {} is being processed by a running queue runner (jjq delete can only remove it after the run finishes)",
+                    id
+                ),
+            )
+            .into());
+        };
+
+        jj::bookmark_delete(&queue::running_bookmark(id))?;
+        prefout(&format!(
+            "deleted interrupted item {} (stale claim from a crashed runner)",
+            id
+        ));
+
+        // Clean up whatever the crashed runner left behind, as for failed items.
+        cleanup_run_workspace(id);
+
         return Ok(());
     }
 
@@ -1645,6 +1875,22 @@ pub fn doctor(fix: bool) -> Result<()> {
         }
     }
 
+    // Stale running claims: with the run lock free, jjq/running/* bookmarks
+    // are leftovers from a crashed runner. Reported only when present, since
+    // they are transient (the next run requeues them).
+    if !lock::is_held("run")? {
+        for id in queue::get_running()? {
+            print_check(
+                "WARN",
+                &format!(
+                    "interrupted run left item {} claimed; the next run will requeue it",
+                    id
+                ),
+            );
+            warns += 1;
+        }
+    }
+
     // 10. orphaned workspaces
     let ws_output = jj::workspace_list()?;
     let orphaned: usize = ws_output
@@ -1690,7 +1936,7 @@ pub fn doctor(fix: bool) -> Result<()> {
 /// also show up in the listing and are filtered out by prefix.
 fn conflicted_jjq_bookmarks() -> Result<Vec<String>> {
     let revset = format!(
-        "{} | bookmarks(glob:\"jjq/queue/*\") | bookmarks(glob:\"jjq/failed/*\")",
+        "{} | bookmarks(glob:\"jjq/queue/*\") | bookmarks(glob:\"jjq/running/*\") | bookmarks(glob:\"jjq/failed/*\")",
         meta::meta_revset()
     );
     let output = jj::run_ok_with_config(
@@ -1912,6 +2158,34 @@ fn print_hint(msg: &str) {
 
 /// Remove all jjq workspaces and their directories.
 pub fn clean() -> Result<()> {
+    // Hold the run lock for the whole cleanup: an active runner's workspace
+    // must not be destroyed out from under its check process. Lock order is
+    // run, then check (and run -> meta elsewhere; see src/meta.rs) — no path
+    // takes run while holding check, so the order stays acyclic.
+    let _run_lock = match Lock::acquire("run")? {
+        Some(lock) => lock,
+        None => {
+            return Err(ExitError::new(
+                exit_codes::CONFLICT,
+                "a queue runner is active; not cleaning (re-run when it finishes)",
+            )
+            .into());
+        }
+    };
+
+    // Probe the check lock exclusively: `jjq check` holds it shared for its
+    // workspace's lifetime, so acquisition fails while any check is active.
+    let _check_lock = match Lock::acquire("check")? {
+        Some(lock) => lock,
+        None => {
+            return Err(ExitError::new(
+                exit_codes::CONFLICT,
+                "a check is active; not cleaning (re-run when it finishes)",
+            )
+            .into());
+        }
+    };
+
     let ws_output = jj::workspace_list()?;
 
     let mut removed = 0u32;

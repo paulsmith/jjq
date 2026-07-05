@@ -96,6 +96,16 @@ filtering for the jjq-namespaced bookmarks.
 
 An empty queue is a normal condition and is a no-op for a jjq run.
 
+Before processing an item, the runner claims it by renaming its bookmark from
+`jjq/queue/NNNNNN` to `jjq/running/NNNNNN`. The claim makes the in-flight item
+visible (`jjq status` shows a "Running" section) and protects it: `jjq delete`,
+`jjq requeue`, and a `jjq push` of the same revision refuse to touch a running
+item while the run lock is held. Immediately before landing, the runner
+verifies the claim still exists and discards its result if the item was removed
+out-of-band. If a runner crashes, its claim remains; the next run (or a
+`jjq delete`/`jjq requeue` issued while the run lock is free) recovers the
+orphaned claim back to its queue position under the same sequence ID.
+
 ### Concurrency
 
 Because jjq is meant to support multiple changes on a single jj repo, it must
@@ -112,6 +122,14 @@ Running the queue also takes a lock — only one merge can be attempted at a
 time. The `run` lock uses `.jj/jjq-locks/run.lock`. A runner may take the
 meta lock while holding the run lock, never the reverse, so the two locks
 cannot deadlock.
+
+`jjq clean` holds the run lock for its whole cleanup, so it refuses to run
+while a queue runner is active rather than destroying the runner's live
+workspace. Each `jjq check` holds a shared `check` lock
+(`.jj/jjq-locks/check.lock`) for its workspace's lifetime; concurrent checks
+coexist, and clean probes the lock exclusively, refusing while any check is
+active. The lock order is run → meta and run → check; no code path acquires
+the run lock while holding either of the others.
 
 ### Landed revision
 
@@ -204,8 +222,11 @@ back onto the queue; this runs a pre-flight conflict check before re-queuing.
 ### Status
 
 jjq users can get a list of the current queue via the CLI's status command,
-including recent failures (all are shown, newest first) and recently landed
-items (discovered by scanning trunk ancestors for jjq metadata).
+including the item currently being processed (when a run is active), recent
+failures (all are shown, newest first), and recently landed items (discovered
+by scanning trunk ancestors for jjq metadata). The `--json` output carries a
+`runner_active` boolean plus `running`, `queue`, `failed`, and `landed`
+arrays.
 
 Failed items display conflicting file paths when available, e.g.
 `(conflicts: main.go, util.go)`, giving immediate visibility into what went
@@ -266,6 +287,9 @@ Users may configure:
 jj bookmarks indicate queue and failed items and the metadata branch head:
 
 - `jjq/queue/NNNNNN` — queued items (zero-padded sequence ID)
+- `jjq/running/NNNNNN` — the item currently claimed by the queue runner; a
+  claim left behind by a crashed runner is recovered to the queue on the
+  next run
 - `jjq/failed/NNNNNN` — failed merge attempts
 - `jjq/_/_` — head of the isolated metadata branch (last_id, config, ops log)
 

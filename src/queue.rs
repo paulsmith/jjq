@@ -89,6 +89,12 @@ fn failed_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^jjq/failed/(\d{6})$").unwrap())
 }
 
+/// Compiled regex for matching running (claimed) bookmark names.
+fn running_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^jjq/running/(\d{6})$").unwrap())
+}
+
 /// Get all queued items sorted by sequence ID (ascending).
 pub fn get_queue() -> Result<Vec<u32>> {
     let re = queue_re();
@@ -125,6 +131,26 @@ pub fn get_failed() -> Result<Vec<u32>> {
     Ok(ids)
 }
 
+/// Get all running (claimed) items sorted by sequence ID (ascending). While
+/// a runner is active these are the items it is processing; with the run
+/// lock free they are orphans from a crashed runner.
+pub fn get_running() -> Result<Vec<u32>> {
+    let re = running_re();
+    let bookmarks = jj::bookmark_list_glob("jjq/running/??????")?;
+
+    let mut ids: Vec<u32> = bookmarks
+        .iter()
+        .filter_map(|b| {
+            re.captures(b)
+                .and_then(|c| c.get(1))
+                .and_then(|m| m.as_str().parse().ok())
+        })
+        .collect();
+
+    ids.sort();
+    Ok(ids)
+}
+
 /// Get the next item to process (lowest sequence ID).
 pub fn next_item() -> Result<Option<u32>> {
     let queue = get_queue()?;
@@ -141,6 +167,11 @@ pub fn failed_bookmark(id: u32) -> String {
     format!("jjq/failed/{}", format_seq_id(id))
 }
 
+/// Get the running (claim) bookmark name for an ID.
+pub fn running_bookmark(id: u32) -> String {
+    format!("jjq/running/{}", format_seq_id(id))
+}
+
 /// Check if a queue item exists.
 pub fn queue_item_exists(id: u32) -> Result<bool> {
     jj::bookmark_exists(&queue_bookmark(id))
@@ -149,4 +180,9 @@ pub fn queue_item_exists(id: u32) -> Result<bool> {
 /// Check if a failed item exists.
 pub fn failed_item_exists(id: u32) -> Result<bool> {
     jj::bookmark_exists(&failed_bookmark(id))
+}
+
+/// Check if a running (claimed) item exists.
+pub fn running_item_exists(id: u32) -> Result<bool> {
+    jj::bookmark_exists(&running_bookmark(id))
 }

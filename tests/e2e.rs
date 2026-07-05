@@ -251,6 +251,23 @@ impl TestRepo {
         normalize_output(&combined, &self.path)
     }
 
+    /// Spawn jjq as a background child process with the standard test
+    /// environment, stdout/stderr piped. Callers wait via wait_with_output.
+    fn spawn_jjq(&self, args: &[&str]) -> process::Child {
+        process::Command::new(&*JJQ_BIN)
+            .current_dir(&self.path)
+            .args(args)
+            .env("NON_INTERACTIVE", "1")
+            .env("JJ_OP_HOSTNAME", "test")
+            .env("JJ_OP_USERNAME", "test")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &self.path)
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn jjq")
+    }
+
     /// Initialize jjq with default settings (check command = "true").
     fn init_jjq(&self) {
         self.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
@@ -1338,7 +1355,8 @@ fn test_status_json_empty() {
 
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("status --json should return valid JSON");
-    assert_eq!(parsed["running"], false);
+    assert_eq!(parsed["runner_active"], false);
+    assert_eq!(parsed["running"], serde_json::json!([]));
     assert_eq!(parsed["queue"], serde_json::json!([]));
     assert_eq!(parsed["failed"], serde_json::json!([]));
 }
@@ -2637,6 +2655,328 @@ fn test_doctor_fix_refuses_without_readable_last_id() {
         sides.contains(&side_a.trim()) && sides.contains(&side_b.trim()),
         "both sides should survive a refused repair: {:?}",
         sides
+    );
+}
+
+/// A check command that signals it has started by creating `started`, then
+/// blocks until `release` exists. The wait is bounded so an aborted test
+/// cannot leave the child running forever.
+fn gated_check_command(started: &Path, release: &Path) -> String {
+    format!(
+        "touch {} && for i in $(seq 1 200); do [ -f {} ] && exit 0; sleep 0.1; done; exit 1",
+        started.display(),
+        release.display()
+    )
+}
+
+/// Wait for a file to appear, panicking after `timeout`.
+fn wait_for_file(path: &Path, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !path.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {}", path.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Set up a repo with one pushed item whose check blocks on the gate files,
+/// returning (repo, sync_dir); the gate files are `started`/`release` inside
+/// sync_dir.
+fn repo_with_gated_check() -> (TestRepo, TempDir) {
+    let repo = TestRepo::with_go_project();
+    let sync = TempDir::new().expect("failed to create sync dir");
+    let check = gated_check_command(&sync.path().join("started"), &sync.path().join("release"));
+    repo.init_jjq_with_check(&check);
+
+    run_jj(repo.path(), &["new", "-m", "slow feature", "main"]);
+    fs::write(repo.path().join("slow.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "slow"]);
+    repo.jjq_success(&["push", "slow"]);
+
+    (repo, sync)
+}
+
+#[test]
+fn test_delete_during_run_refused() {
+    let (repo, sync) = repo_with_gated_check();
+
+    let child = repo.spawn_jjq(&["run"]);
+    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+
+    // The runner has claimed the item and is inside the check; deleting it
+    // now would be silently overridden by the landing, so delete must refuse.
+    let output = repo
+        .jjq()
+        .args(["delete", "1"])
+        .output()
+        .expect("failed to run jjq delete");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(10),
+        "delete of an in-flight item should refuse with USAGE; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr
+    );
+    assert!(
+        stderr.contains("being processed"),
+        "refusal should explain the item is being processed: {}",
+        stderr
+    );
+
+    // Release the check; the run completes and lands the item (the delete
+    // was refused, so landing it respects the user's visible state).
+    fs::write(sync.path().join("release"), "").unwrap();
+    let run_output = child.wait_with_output().expect("failed to wait for run");
+    assert!(
+        run_output.status.success(),
+        "run should complete successfully; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert!(
+        repo.jj_file_exists("slow.txt", "main"),
+        "item should have landed on main"
+    );
+}
+
+#[test]
+fn test_delete_stale_running_claim() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    run_jj(repo.path(), &["new", "-m", "interrupted feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feature"]);
+
+    // Manufacture a stale claim, as a runner crash mid-processing leaves it.
+    // No run is active, so the run lock is free.
+    run_jj(
+        repo.path(),
+        &["bookmark", "create", "-r", "feature", "jjq/running/000001"],
+    );
+
+    let output = repo.jjq_success(&["delete", "1"]);
+    assert!(
+        output.contains("deleted"),
+        "delete should remove the stale claim: {}",
+        output
+    );
+
+    let bookmarks = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/running/??????\")",
+            "-T",
+            "name ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        bookmarks.trim().is_empty(),
+        "stale running bookmark should be gone: {}",
+        bookmarks
+    );
+}
+
+#[test]
+fn test_run_recovers_stale_claim() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    run_jj(repo.path(), &["new", "-m", "interrupted feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feature"]);
+    repo.jjq_success(&["push", "feature"]);
+
+    // Simulate a runner that crashed mid-check: the queue bookmark became
+    // jjq/running/000001, the jjq-run-000001 workspace stayed registered,
+    // and the process died. Recovery must clear the workspace too, or
+    // re-claiming the item dies on the name collision.
+    run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "create",
+            "-r",
+            "jjq/queue/000001",
+            "jjq/running/000001",
+        ],
+    );
+    run_jj(repo.path(), &["bookmark", "delete", "jjq/queue/000001"]);
+    let crashed_ws = TempDir::new().expect("failed to create temp dir");
+    run_jj(
+        repo.path(),
+        &[
+            "workspace",
+            "add",
+            "-r",
+            "jjq/running/000001",
+            "--name",
+            "jjq-run-000001",
+            crashed_ws.path().to_str().unwrap(),
+        ],
+    );
+
+    let output = repo.jjq_success(&["run"]);
+    assert!(
+        output.contains("recovered interrupted item 1"),
+        "run should recover the orphaned claim: {}",
+        output
+    );
+    assert!(
+        repo.jj_file_exists("feature.txt", "main"),
+        "recovered item should land on main"
+    );
+
+    let bookmarks = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/*/??????\")",
+            "-T",
+            "name ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        bookmarks.trim().is_empty(),
+        "no queue/running/failed bookmarks should remain: {}",
+        bookmarks
+    );
+}
+
+#[test]
+fn test_clean_refused_during_run() {
+    let (repo, sync) = repo_with_gated_check();
+
+    let child = repo.spawn_jjq(&["run"]);
+    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+
+    // The runner's workspace is live; clean must refuse rather than destroy
+    // it out from under the check process.
+    let output = repo
+        .jjq()
+        .args(["clean"])
+        .output()
+        .expect("failed to run jjq clean");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "clean during a run should exit CONFLICT; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr
+    );
+    assert!(
+        stderr.contains("queue runner is active"),
+        "refusal should name the active runner: {}",
+        stderr
+    );
+
+    // The run completes untouched.
+    fs::write(sync.path().join("release"), "").unwrap();
+    let run_output = child.wait_with_output().expect("failed to wait for run");
+    assert!(
+        run_output.status.success(),
+        "run should complete successfully after refused clean; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+}
+
+#[test]
+fn test_clean_spares_user_jjq_prefixed_workspace() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // A user workspace whose name merely starts with "jjq" must survive.
+    let user_ws = TempDir::new().unwrap();
+    run_jj(
+        repo.path(),
+        &[
+            "workspace",
+            "add",
+            "--name",
+            "jjq-experiments",
+            user_ws.path().to_str().unwrap(),
+        ],
+    );
+
+    // A manufactured stale runner workspace matching the generated pattern
+    // must be cleaned.
+    let stale_ws = TempDir::new().unwrap();
+    run_jj(
+        repo.path(),
+        &[
+            "workspace",
+            "add",
+            "--name",
+            "jjq-run-000042",
+            stale_ws.path().to_str().unwrap(),
+        ],
+    );
+
+    let output = repo.jjq_success(&["clean"]);
+    assert!(
+        output.contains("jjq-run-000042"),
+        "stale runner workspace should be cleaned: {}",
+        output
+    );
+
+    let list = run_jj(repo.path(), &["workspace", "list"]);
+    assert!(
+        list.contains("jjq-experiments"),
+        "user workspace should survive clean: {}",
+        list
+    );
+    assert!(
+        !list.contains("jjq-run-000042"),
+        "stale runner workspace should be forgotten: {}",
+        list
+    );
+}
+
+#[test]
+fn test_status_shows_running_item_during_run() {
+    let (repo, sync) = repo_with_gated_check();
+
+    let child = repo.spawn_jjq(&["run"]);
+    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+
+    let (stdout, _stderr, success) = repo.jjq_raw_output(&["status", "--json"]);
+    assert!(success, "status --json should succeed during a run");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("status --json should return valid JSON");
+    assert_eq!(
+        parsed["runner_active"], true,
+        "runner_active should be true during a run: {}",
+        stdout
+    );
+    let running = parsed["running"]
+        .as_array()
+        .expect("running should be an array");
+    assert_eq!(running.len(), 1, "one item should be running: {}", stdout);
+    assert_eq!(running[0]["id"], 1);
+    assert_eq!(running[0]["description"], "slow feature");
+
+    let text = repo.jjq_success(&["status"]);
+    assert!(
+        text.contains("Running:"),
+        "text status should show a Running section: {}",
+        text
+    );
+
+    fs::write(sync.path().join("release"), "").unwrap();
+    let run_output = child.wait_with_output().expect("failed to wait for run");
+    assert!(
+        run_output.status.success(),
+        "run should complete; stderr: {}",
+        String::from_utf8_lossy(&run_output.stderr)
     );
 }
 
