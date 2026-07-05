@@ -72,6 +72,26 @@ pub fn run_quiet(args: &[&str]) -> Result<()> {
     run_ok(args).map(|_| ())
 }
 
+/// Per-invocation config override disabling jj's short-prefixes index. jj
+/// computes that index from revsets.log; a filter there naming a conflicted
+/// bookmark as a bare symbol makes every command warn or fail outright. The
+/// value is TOML, so the inner double quotes are literal.
+pub const NO_SHORT_PREFIXES: &str = r#"revsets.short-prefixes="""#;
+
+/// Execute a jj command with a per-invocation --config override, returning
+/// stdout on success. The override never touches the user's repo config, so
+/// a crash mid-command cannot destroy their settings.
+pub fn run_ok_with_config(config: &str, args: &[&str]) -> Result<String> {
+    let mut full = vec!["--config", config];
+    full.extend_from_slice(args);
+    run_ok(&full)
+}
+
+/// `run_ok_with_config` discarding stdout.
+pub fn run_quiet_with_config(config: &str, args: &[&str]) -> Result<()> {
+    run_ok_with_config(config, args).map(|_| ())
+}
+
 /// `run_quiet` with `dir` as the command's working directory.
 pub fn run_quiet_in(dir: &Path, args: &[&str]) -> Result<()> {
     run_ok_in(dir, args).map(|_| ())

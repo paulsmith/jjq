@@ -83,7 +83,11 @@ enum Commands {
     /// Remove jjq workspaces
     Clean,
     /// Validate configuration and environment
-    Doctor,
+    Doctor {
+        /// Repair a conflicted jjq metadata bookmark before running checks
+        #[arg(long)]
+        fix: bool,
+    },
     /// Get or set configuration
     Config {
         /// Configuration key
@@ -150,7 +154,7 @@ fn run() -> Result<()> {
         Commands::Requeue { id } => commands::requeue(&id),
         Commands::Delete { id } => commands::delete(&id),
         Commands::Clean => commands::clean(),
-        Commands::Doctor => commands::doctor(),
+        Commands::Doctor { fix } => commands::doctor(fix),
         Commands::Config { key, value } => commands::config(key.as_deref(), value.as_deref()),
         Commands::Tail { all, no_follow } => tail::tail(all, !no_follow),
         Commands::Quickstart => unreachable!(),

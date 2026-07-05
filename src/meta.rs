@@ -61,8 +61,10 @@ fn lock_timeout() -> Duration {
 
 /// Acquire the metadata lock, waiting up to the timeout for a concurrent
 /// writer to finish. Metadata writes are short (a few jj calls), so waiting
-/// briefly beats failing a push that raced a config write.
-fn acquire_lock() -> Result<Lock> {
+/// briefly beats failing a push that raced a config write. Exposed so
+/// `doctor --fix` can hold the same lock while repairing the metadata
+/// bookmark in place; everything else writes via with_meta_workspace.
+pub fn acquire() -> Result<Lock> {
     let timeout = lock_timeout();
     let deadline = Instant::now() + timeout;
     loop {
@@ -116,7 +118,7 @@ impl Drop for WorkspaceGuard {
 /// workspace is always forgotten, on success or error, and the process
 /// working directory is never changed.
 pub fn with_meta_workspace(mutate: impl FnOnce(&Path) -> Result<String>) -> Result<()> {
-    let _lock = acquire_lock()?;
+    let _lock = acquire()?;
 
     // Create the metadata branch under the lock on first use.
     let created = if jj::bookmark_exists(JJQ_BOOKMARK)? {

@@ -277,7 +277,7 @@ pub fn init(trunk: Option<&str>, check: Option<&str>, strategy: &str) -> Result<
 
     // Run doctor
     println!("Running doctor...");
-    doctor()?;
+    doctor(false)?;
 
     println!();
     println!("Ready to go! Queue revisions with 'jjq push <revset>'.");
@@ -286,9 +286,13 @@ pub fn init(trunk: Option<&str>, check: Option<&str>, strategy: &str) -> Result<
 }
 
 /// Configure jj's revsets.log to exclude jjq metadata from `jj log`.
-/// Composes with any existing filter value.
+/// Composes with any existing filter value. The bookmarks(exact:) form is
+/// load-bearing: jj builds its short-prefixes index from revsets.log, and a
+/// bare `jjq/_/_` symbol there makes every jj command warn or fail should
+/// the bookmark ever become conflicted, while bookmarks(exact:) tolerates a
+/// conflicted ref.
 fn setup_log_filter() -> Result<()> {
-    let exclude = format!("~ ::{}", meta::JJQ_BOOKMARK);
+    let exclude = format!("~ ::{}", meta::meta_revset());
 
     let value = if let Ok(Some(current)) = jj::config_get("revsets.log") {
         if current.contains(meta::JJQ_BOOKMARK) {
@@ -1453,8 +1457,13 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
     }
 }
 
-/// Validate configuration and environment.
-pub fn doctor() -> Result<()> {
+/// Validate configuration and environment. With `fix`, first repair a
+/// conflicted metadata bookmark, then run the checks to verify the repair.
+pub fn doctor(fix: bool) -> Result<()> {
+    if fix {
+        fix_conflicted_meta()?;
+    }
+
     println!("jjq doctor:");
 
     let mut fails = 0u32;
@@ -1470,6 +1479,34 @@ pub fn doctor() -> Result<()> {
     } else {
         print_check("FAIL", "jjq not initialized (run 'jjq init')");
         fails += 1;
+    }
+
+    // 3. no conflicted jjq bookmarks (concurrent out-of-band moves conflict
+    // a bookmark, making the queue item or metadata unreadable)
+    match conflicted_jjq_bookmarks() {
+        Ok(conflicted) if conflicted.is_empty() => {
+            print_check("ok", "no conflicted jjq bookmarks");
+        }
+        Ok(conflicted) => {
+            for name in &conflicted {
+                print_check("FAIL", &format!("bookmark '{}' is conflicted", name));
+                if name == meta::JJQ_BOOKMARK {
+                    print_hint("to fix: jjq doctor --fix");
+                } else {
+                    // Queue/failed bookmarks point at user commits; picking a
+                    // side automatically could land the wrong revision.
+                    print_hint(&format!(
+                        "to fix: jjq delete {}, then push the intended revision again",
+                        extract_id_from_bookmark(name)
+                    ));
+                }
+                fails += 1;
+            }
+        }
+        Err(e) => {
+            print_check("FAIL", &format!("cannot list jjq bookmarks: {}", e));
+            fails += 1;
+        }
     }
 
     // Config checks share one metadata snapshot; failure to take it (e.g. a
@@ -1492,7 +1529,7 @@ pub fn doctor() -> Result<()> {
         None
     };
 
-    // 3. trunk bookmark exists
+    // 4. trunk bookmark exists
     let trunk_bookmark = match &snapshot {
         Some(snap) => snap.trunk_bookmark()?,
         None => config::DEFAULT_TRUNK_BOOKMARK.to_string(),
@@ -1507,7 +1544,7 @@ pub fn doctor() -> Result<()> {
         fails += 1;
     }
 
-    // 4. check command configured
+    // 5. check command configured
     let check_configured = match &snapshot {
         Some(snap) => snap.check_command()?.is_some(),
         None => false,
@@ -1520,7 +1557,7 @@ pub fn doctor() -> Result<()> {
         fails += 1;
     }
 
-    // 5. strategy valid
+    // 6. strategy valid
     if let Some(snap) = &snapshot {
         match snap.strategy() {
             Ok(s) => print_check("ok", &format!("strategy: {}", s.as_str())),
@@ -1531,7 +1568,7 @@ pub fn doctor() -> Result<()> {
         }
     }
 
-    // 6. sequence counter readable
+    // 7. sequence counter readable
     if let Some(snap) = &snapshot {
         match snap.file("last_id") {
             Ok(Some(contents)) if contents.trim().parse::<u32>().is_ok() => {
@@ -1556,21 +1593,41 @@ pub fn doctor() -> Result<()> {
         }
     }
 
-    // 6. jj log filter hides jjq metadata
-    if let Ok(Some(current_log)) = jj::config_get("revsets.log")
-        && current_log.contains(meta::JJQ_BOOKMARK)
-    {
-        print_check("ok", "jj log hides jjq metadata");
-    } else {
-        print_check("WARN", "jj log does not hide jjq metadata");
-        print_hint(&format!(
-            "to fix: jj config set --repo revsets.log '~ ::{}'",
-            meta::JJQ_BOOKMARK
-        ));
-        warns += 1;
+    // 8. jj log filter hides jjq metadata. Either form hides it, but the
+    // old bare-symbol form breaks jj's short-prefixes index (and with it
+    // every jj command) the moment the bookmark becomes conflicted, so it
+    // gets a migration warning.
+    let current_log = jj::config_get("revsets.log").ok().flatten();
+    match current_log {
+        Some(ref value) if value.contains(&meta::meta_revset()) => {
+            print_check("ok", "jj log hides jjq metadata");
+        }
+        Some(ref value) if value.contains(meta::JJQ_BOOKMARK) => {
+            print_check("ok", "jj log hides jjq metadata");
+            print_check(
+                "WARN",
+                "revsets.log names the jjq metadata bookmark as a bare symbol",
+            );
+            print_hint(
+                "the bare form breaks jj commands if the bookmark becomes conflicted; bookmarks(exact:) tolerates that",
+            );
+            print_hint(&format!(
+                "to fix: jj config set --repo revsets.log '~ ::{}'",
+                meta::meta_revset()
+            ));
+            warns += 1;
+        }
+        _ => {
+            print_check("WARN", "jj log does not hide jjq metadata");
+            print_hint(&format!(
+                "to fix: jj config set --repo revsets.log '~ ::{}'",
+                meta::meta_revset()
+            ));
+            warns += 1;
+        }
     }
 
-    // 7. locks
+    // 9. locks
     match lock::lock_state("run")? {
         lock::LockState::Free => print_check("ok", "run lock is free"),
         lock::LockState::Held => {
@@ -1588,7 +1645,7 @@ pub fn doctor() -> Result<()> {
         }
     }
 
-    // 8. orphaned workspaces
+    // 10. orphaned workspaces
     let ws_output = jj::workspace_list()?;
     let orphaned: usize = ws_output
         .lines()
@@ -1625,6 +1682,219 @@ pub fn doctor() -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Bookmark names in the jjq namespace that are conflicted. A conflicted
+/// bookmark can emit one line per underlying ref (local plus remote-tracking),
+/// so names are deduped; other bookmarks sharing a commit with a jjq bookmark
+/// also show up in the listing and are filtered out by prefix.
+fn conflicted_jjq_bookmarks() -> Result<Vec<String>> {
+    let revset = format!(
+        "{} | bookmarks(glob:\"jjq/queue/*\") | bookmarks(glob:\"jjq/failed/*\")",
+        meta::meta_revset()
+    );
+    let output = jj::run_ok_with_config(
+        jj::NO_SHORT_PREFIXES,
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            &revset,
+            "-T",
+            "name ++ if(conflict, \" CONFLICTED\") ++ \"\\n\"",
+        ],
+    )?;
+    let mut names: Vec<String> = output
+        .lines()
+        .filter_map(|line| line.strip_suffix(" CONFLICTED"))
+        .filter(|name| name.starts_with("jjq/"))
+        .map(|name| name.to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// Commit IDs the metadata bookmark points at: one for a healthy bookmark,
+/// one per conflict side for a conflicted one, none when jjq is
+/// uninitialized. Deduped, preserving jj's log order (newest first).
+fn meta_bookmark_sides() -> Result<Vec<String>> {
+    let output = jj::run_ok_with_config(
+        jj::NO_SHORT_PREFIXES,
+        &[
+            "log",
+            "-r",
+            &meta::meta_revset(),
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    )?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter(|commit| seen.insert(commit.to_string()))
+        .map(|commit| commit.to_string())
+        .collect())
+}
+
+/// Repair a conflicted jjq metadata bookmark in place: keep the side with
+/// the highest sequence counter (last_id) and abandon the rest. Only the
+/// metadata bookmark is auto-repaired — its sides are jjq's own metadata
+/// commits — while conflicted queue/failed bookmarks point at user commits
+/// and keep their manual hints.
+///
+/// Every jj invocation here carries a per-invocation short-prefixes override:
+/// a conflicted bookmark named bare in revsets.log can degrade jj revset
+/// resolution (observed behavior varies by jj version), and the override
+/// sidesteps that without mutating the user's repo config (a crash
+/// mid-repair must not destroy their settings).
+fn fix_conflicted_meta() -> Result<()> {
+    // The repair moves the metadata bookmark, so it holds the same lock as
+    // every other metadata writer.
+    let _lock = meta::acquire()?;
+
+    // Gate on the same ref-conflict flag doctor's detection uses: a
+    // delete-vs-move divergence is conflicted with only ONE remaining add,
+    // so side count alone would wrongly report nothing to repair.
+    if !conflicted_jjq_bookmarks()?
+        .iter()
+        .any(|name| name == meta::JJQ_BOOKMARK)
+    {
+        prefout(&format!(
+            "--fix: metadata bookmark ({}) is not conflicted; nothing to repair",
+            meta::JJQ_BOOKMARK
+        ));
+        return Ok(());
+    }
+
+    let sides = meta_bookmark_sides()?;
+    if sides.is_empty() {
+        prefout(&format!(
+            "--fix: metadata bookmark ({}) has no remaining targets; nothing to repair",
+            meta::JJQ_BOOKMARK
+        ));
+        return Ok(());
+    }
+
+    prefout(&format!(
+        "repairing conflicted metadata bookmark ({})",
+        meta::JJQ_BOOKMARK
+    ));
+
+    // Read the sequence counter on every side. The winner is the side with
+    // the highest last_id (first side wins ties), so the counter can only
+    // keep or grow its value and no sequence IDs are ever reused.
+    let last_ids: Vec<Option<u32>> = sides
+        .iter()
+        .map(|commit| {
+            jj::run_ok_with_config(
+                jj::NO_SHORT_PREFIXES,
+                &["file", "show", "last_id", "-r", commit],
+            )
+            .ok()
+            .and_then(|contents| contents.trim().parse::<u32>().ok())
+        })
+        .collect();
+    let winner_idx = last_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(i, id)| id.map(|n| (i, n)))
+        .max_by(|(ia, na), (ib, nb)| na.cmp(nb).then(ib.cmp(ia)))
+        .map(|(i, _)| i);
+
+    let Some(winner_idx) = winner_idx else {
+        // No side is recognizable metadata; picking one would be guessing.
+        return Err(ExitError::new(
+            exit_codes::CONFLICT,
+            format!(
+                "cannot repair {bm}: no conflict side has a readable sequence counter (last_id)\n\
+                 inspect the sides and pick one manually:\n  \
+                 jj --config '{cfg}' log -r '{rs}' --no-graph\n  \
+                 jj --config '{cfg}' bookmark set '{bm}' -r <commit-id> --allow-backwards",
+                bm = meta::JJQ_BOOKMARK,
+                cfg = jj::NO_SHORT_PREFIXES,
+                rs = meta::meta_revset(),
+            ),
+        )
+        .into());
+    };
+    let winner = &sides[winner_idx];
+
+    for (i, commit) in sides.iter().enumerate() {
+        let counter = match last_ids[i] {
+            Some(n) => format!("last_id={}", n),
+            None => "last_id unreadable".to_string(),
+        };
+        let role = if i == winner_idx { "keep" } else { "discard" };
+        prefout(&format!("  side {} ({}): {}", &commit[..12], counter, role));
+    }
+
+    // Move the bookmark to the winner. --allow-backwards is required — jj
+    // cannot order conflict sides — and safe here: this is an explicit,
+    // user-invoked repair, and the sides are jjq's own metadata commits.
+    jj::run_quiet_with_config(
+        jj::NO_SHORT_PREFIXES,
+        &[
+            "bookmark",
+            "set",
+            meta::JJQ_BOOKMARK,
+            "-r",
+            winner,
+            "--allow-backwards",
+        ],
+    )?;
+
+    // Abandon the losing sides, discarding their metadata writes (config
+    // changes / workspace records). A loser inside the winner's ancestry is
+    // already part of the kept history; abandoning it would rewrite the
+    // winner itself. All losers go in ONE abandon invocation so jj handles
+    // nested losers (one descending from another) atomically instead of the
+    // first abandon rebasing the rest out from under the loop.
+    let mut losers: Vec<&str> = Vec::new();
+    for (i, commit) in sides.iter().enumerate() {
+        if i == winner_idx {
+            continue;
+        }
+        let in_winner_history = !jj::run_ok_with_config(
+            jj::NO_SHORT_PREFIXES,
+            &[
+                "log",
+                "-r",
+                &format!("{} & ::{}", commit, winner),
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+        )?
+        .trim()
+        .is_empty();
+        if in_winner_history {
+            prefout(&format!(
+                "  kept {} (already in the winning side's history)",
+                &commit[..12]
+            ));
+            continue;
+        }
+        losers.push(commit);
+    }
+    if !losers.is_empty() {
+        let mut args = vec!["abandon"];
+        args.extend_from_slice(&losers);
+        jj::run_quiet_with_config(jj::NO_SHORT_PREFIXES, &args)?;
+    }
+
+    // Fail fast if the repair did not take; the checks that follow
+    // re-validate everything on top of this.
+    config::snapshot()?;
+
+    prefout(
+        "repaired: kept the highest sequence counter, so no IDs are reused; \
+         discarded the losing sides' metadata writes (config changes / workspace records)",
+    );
+    println!();
+    Ok(())
 }
 
 fn print_check(status: &str, msg: &str) {

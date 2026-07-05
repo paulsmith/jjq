@@ -188,10 +188,12 @@ pub fn maybe_show_log_hint() -> Result<()> {
         return Ok(());
     }
 
-    // Show hint
+    // Show hint. The bookmarks(exact:) form tolerates a conflicted bookmark;
+    // a bare symbol would break jj's short-prefixes index if the metadata
+    // bookmark ever became conflicted.
     eprintln!();
     eprintln!("hint: To hide jjq metadata from 'jj log', run:");
-    eprintln!("  jj config set --repo revsets.log '~ ::{}'", JJQ_BOOKMARK);
+    eprintln!("  jj config set --repo revsets.log '~ ::{}'", meta::meta_revset());
     eprintln!();
 
     // Record hint shown

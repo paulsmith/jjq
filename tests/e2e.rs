@@ -701,11 +701,12 @@ fn test_init_sets_log_filter() {
     let repo = TestRepo::with_go_project();
     repo.init_jjq();
 
-    // init should automatically configure jj to hide jjq metadata
+    // init should automatically configure jj to hide jjq metadata, using the
+    // bookmarks(exact:) form that stays harmless if the bookmark conflicts
     let config_output = run_jj(repo.path(), &["config", "get", "revsets.log"]);
     assert!(
-        config_output.contains("jjq/_/_"),
-        "init should set revsets.log to hide jjq metadata: {}",
+        config_output.contains("bookmarks(exact:\"jjq/_/_\")"),
+        "init should set revsets.log to hide jjq metadata via bookmarks(exact:): {}",
         config_output
     );
 }
@@ -724,7 +725,7 @@ fn test_init_log_filter_preserves_existing() {
 
     let config_output = run_jj(repo.path(), &["config", "get", "revsets.log"]);
     assert!(
-        config_output.contains("(all()) ~ ::jjq/_/_"),
+        config_output.contains("(all()) ~ ::bookmarks(exact:\"jjq/_/_\")"),
         "init should wrap existing filter and append exclusion: {}",
         config_output
     );
@@ -2441,21 +2442,19 @@ fn test_push_times_out_when_meta_lock_held() {
     );
 }
 
-#[test]
-fn test_conflicted_metadata_bookmark_reports_cleanly() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
-
-    // Manufacture a conflicted jjq/_/_ by moving the bookmark to two
-    // different targets in concurrent operations (fork the op log with
-    // --at-operation), as racing writers without shared locks would.
-    let side_a = run_jj(repo.path(), &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
-    run_jj(repo.path(), &["new", "-m", "divergent side", "main"]);
-    let side_b = run_jj(repo.path(), &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
-    let op = run_jj(repo.path(), &["op", "log", "-n1", "--no-graph", "-T", "id.short() ++ \"\\n\""]);
+/// Force the jjq metadata bookmark into a conflicted state whose sides are
+/// the two given commits, by moving it to each in divergent operations (fork
+/// the op log with --at-operation), as racing writers without shared locks
+/// would. Neither side may equal the bookmark's current target, or jj
+/// resolves the conflict trivially.
+fn conflict_meta_bookmark(repo: &TestRepo, side_a: &str, side_b: &str) {
+    let op = run_jj(
+        repo.path(),
+        &["op", "log", "-n1", "--no-graph", "-T", "id.short() ++ \"\\n\""],
+    );
     run_jj(
         repo.path(),
-        &["bookmark", "set", "jjq/_/_", "-r", side_a.trim(), "--allow-backwards"],
+        &["bookmark", "set", "jjq/_/_", "-r", side_a, "--allow-backwards"],
     );
     run_jj(
         repo.path(),
@@ -2466,12 +2465,23 @@ fn test_conflicted_metadata_bookmark_reports_cleanly() {
             "set",
             "jjq/_/_",
             "-r",
-            side_b.trim(),
+            side_b,
             "--allow-backwards",
         ],
     );
     // Any jj command merges the divergent operations, conflicting the bookmark.
     run_jj(repo.path(), &["status"]);
+}
+
+#[test]
+fn test_conflicted_metadata_bookmark_reports_cleanly() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    let side_a = run_jj(repo.path(), &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
+    run_jj(repo.path(), &["new", "-m", "divergent side", "main"]);
+    let side_b = run_jj(repo.path(), &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    conflict_meta_bookmark(&repo, side_a.trim(), side_b.trim());
 
     // Reads must fail with a short, actionable message — not a wall of raw
     // jj template errors.
@@ -2504,5 +2514,154 @@ fn test_conflicted_metadata_bookmark_reports_cleanly() {
         doctor_out.contains("failure(s)"),
         "doctor should reach its summary: {}",
         doctor_out
+    );
+}
+
+#[test]
+fn test_doctor_fix_repairs_conflicted_metadata_bookmark() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // A real post-push metadata commit carries last_id=1; it must win.
+    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "feature content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feature"]);
+    repo.jjq_success(&["push", "feature"]);
+    let winner = run_jj(
+        repo.path(),
+        &["log", "-r", "bookmarks(exact:\"jjq/_/_\")", "--no-graph", "-T", "commit_id"],
+    )
+    .trim()
+    .to_string();
+
+    // A metadata-like commit outside the winner's history with a lower
+    // sequence counter, as a racing writer's losing side would be.
+    run_jj(repo.path(), &["new", "-m", "losing meta side", "root()"]);
+    fs::write(repo.path().join("last_id"), "0").unwrap();
+    let loser = run_jj(repo.path(), &["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+        .trim()
+        .to_string();
+    run_jj(repo.path(), &["new", "main"]);
+
+    // One more metadata write so the bookmark's pre-conflict target differs
+    // from both sides (a side equal to the base would auto-resolve).
+    repo.jjq_success(&["config", "check_command", "true"]);
+
+    conflict_meta_bookmark(&repo, &loser, &winner);
+
+    // Doctor detects the conflicted metadata bookmark and points at --fix.
+    let doctor_out = repo.jjq_failure(&["doctor"]);
+    assert!(
+        doctor_out.contains("conflicted"),
+        "doctor should flag the conflicted bookmark: {}",
+        doctor_out
+    );
+    assert!(
+        doctor_out.contains("jjq doctor --fix"),
+        "doctor should point at --fix: {}",
+        doctor_out
+    );
+
+    // --fix repairs the bookmark and the subsequent checks pass.
+    let fix_out = repo.jjq_success(&["doctor", "--fix"]);
+    assert!(
+        fix_out.contains("all checks passed"),
+        "checks should pass after repair: {}",
+        fix_out
+    );
+
+    // Config reads work again.
+    let trunk = repo.jjq_success(&["config", "trunk_bookmark"]);
+    assert_eq!(trunk.trim(), "main", "config read should work after repair");
+
+    // The side with the highest last_id was kept, so no IDs are reused.
+    let resolved = run_jj(
+        repo.path(),
+        &["log", "-r", "bookmarks(exact:\"jjq/_/_\")", "--no-graph", "-T", "commit_id ++ \"\\n\""],
+    );
+    assert_eq!(
+        resolved.trim(),
+        winner,
+        "bookmark should point at the side with the highest last_id"
+    );
+    let last_id = run_jj(
+        repo.path(),
+        &["file", "show", "last_id", "-r", "bookmarks(exact:\"jjq/_/_\")"],
+    );
+    assert_eq!(last_id.trim(), "1", "sequence counter should keep the highest value");
+
+    // The losing side was abandoned.
+    let visible = run_jj(
+        repo.path(),
+        &["log", "-r", "all()", "--no-graph", "-T", "commit_id ++ \"\\n\""],
+    );
+    assert!(
+        !visible.contains(&loser),
+        "losing side should be abandoned: {}",
+        loser
+    );
+}
+
+#[test]
+fn test_doctor_fix_refuses_without_readable_last_id() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Conflict sides pointing at ordinary project commits: no side carries a
+    // sequence counter, so there is nothing safe for --fix to pick.
+    let side_a = run_jj(repo.path(), &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
+    run_jj(repo.path(), &["new", "-m", "divergent side", "main"]);
+    let side_b = run_jj(repo.path(), &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    conflict_meta_bookmark(&repo, side_a.trim(), side_b.trim());
+
+    let out = repo.jjq_failure(&["doctor", "--fix"]);
+    assert!(
+        out.contains("cannot repair"),
+        "--fix should refuse when no side has a readable last_id: {}",
+        out
+    );
+    assert!(
+        out.contains("bookmark set"),
+        "--fix refusal should give manual repair instructions: {}",
+        out
+    );
+
+    // The bookmark is untouched: still conflicted with both sides.
+    let sides = run_jj(
+        repo.path(),
+        &["log", "-r", "bookmarks(exact:\"jjq/_/_\")", "--no-graph", "-T", "commit_id ++ \"\\n\""],
+    );
+    let sides: Vec<&str> = sides.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(sides.len(), 2, "bookmark should remain conflicted: {:?}", sides);
+    assert!(
+        sides.contains(&side_a.trim()) && sides.contains(&side_b.trim()),
+        "both sides should survive a refused repair: {:?}",
+        sides
+    );
+}
+
+#[test]
+fn test_doctor_warns_on_bare_symbol_log_filter() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Old jjq versions wrote the filter as a bare bookmark symbol, which
+    // breaks every jj command's short-prefixes index the moment the bookmark
+    // becomes conflicted.
+    run_jj(
+        repo.path(),
+        &["config", "set", "--repo", "revsets.log", "~ ::jjq/_/_"],
+    );
+
+    let out = repo.jjq_success(&["doctor"]);
+    assert!(
+        out.contains("WARN"),
+        "doctor should warn about the old filter form: {}",
+        out
+    );
+    assert!(
+        out.contains("jj config set --repo revsets.log '~ ::bookmarks(exact:\"jjq/_/_\")'"),
+        "migration hint should show the exact command: {}",
+        out
     );
 }
