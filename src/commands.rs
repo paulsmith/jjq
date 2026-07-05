@@ -449,7 +449,7 @@ pub fn push(revset: &str) -> Result<()> {
 
     jj::bookmark_create(&bookmark, revset)?;
 
-    let repo_path = jj::repo_root()?;
+    let repo_path = jj::primary_workspace_root()?;
     prefout(&format!(
         "revision '{}' queued at {} (trunk: {} in {})",
         revset, id, trunk_bookmark, repo_path.display()
@@ -1364,7 +1364,7 @@ pub fn requeue(id_str: &str) -> Result<()> {
         }
     }
 
-    let repo_path = jj::repo_root()?;
+    let repo_path = jj::primary_workspace_root()?;
     prefout(&format!(
         "requeued failed item {} as {} (trunk: {} in {})",
         id, new_id, trunk_bookmark, repo_path.display()

@@ -2,7 +2,8 @@
 // ABOUTME: Provides functions to execute jj commands and parse their output.
 
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
@@ -71,6 +72,81 @@ pub fn repo_root() -> Result<PathBuf> {
     let root = PathBuf::from(output.trim());
     let _ = ROOT.set(root.clone());
     Ok(root)
+}
+
+/// Get the .jj directory shared by all workspaces of this repository
+/// (cached after first call).
+///
+/// In the primary workspace, `<root>/.jj/repo` is a directory and the shared
+/// .jj dir is `<root>/.jj` itself. In a secondary workspace, `<root>/.jj/repo`
+/// is a file containing the path (possibly relative to `<root>/.jj/`) of the
+/// primary workspace's repo directory; the shared .jj dir is that path's
+/// parent. State that must be visible across workspaces — lock files and the
+/// run log — belongs here, never in a workspace-local .jj directory.
+pub fn shared_jj_dir() -> Result<PathBuf> {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(dir) = DIR.get() {
+        return Ok(dir.clone());
+    }
+    let workspace_jj = repo_root()?.join(".jj");
+    let repo_path = workspace_jj.join("repo");
+    let dir = match fs::metadata(&repo_path) {
+        Ok(meta) if meta.is_dir() => workspace_jj,
+        Ok(_) => {
+            // Known secondary workspace: falling back to the workspace-local
+            // .jj here would silently bypass cross-workspace locking, so a
+            // pointer that cannot be resolved is a hard error.
+            resolve_workspace_pointer(&workspace_jj, &repo_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot resolve shared repo from workspace pointer {}: {:#}",
+                    repo_path.display(),
+                    e
+                )
+            })?
+        }
+        Err(e) => {
+            eprintln!(
+                "jjq: warning: cannot resolve shared repo location (cannot stat {}: {}); using workspace-local .jj",
+                repo_path.display(),
+                e
+            );
+            workspace_jj
+        }
+    };
+    let _ = DIR.set(dir.clone());
+    Ok(dir)
+}
+
+/// Resolve the primary workspace's .jj directory from a secondary workspace's
+/// repo pointer file, whose contents are the path (possibly relative to the
+/// workspace's .jj directory) of the primary repo directory.
+fn resolve_workspace_pointer(workspace_jj: &Path, repo_path: &Path) -> Result<PathBuf> {
+    let contents = fs::read_to_string(repo_path)?;
+    let target = contents.trim();
+    if target.is_empty() {
+        bail!("pointer file is empty");
+    }
+    let target = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        workspace_jj.join(target)
+    };
+    let target = target
+        .canonicalize()
+        .with_context(|| format!("cannot canonicalize {}", target.display()))?;
+    match target.parent() {
+        Some(parent) => Ok(parent.to_path_buf()),
+        None => bail!("repo directory {} has no parent", target.display()),
+    }
+}
+
+/// Get the primary workspace root (the directory containing the shared .jj).
+pub fn primary_workspace_root() -> Result<PathBuf> {
+    let dir = shared_jj_dir()?;
+    match dir.parent() {
+        Some(parent) => Ok(parent.to_path_buf()),
+        None => bail!("shared .jj directory {} has no parent", dir.display()),
+    }
 }
 
 /// Check if a bookmark exists.

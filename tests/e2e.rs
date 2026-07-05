@@ -95,6 +95,14 @@ impl TestRepo {
         cmd
     }
 
+    /// Get a jjq Command that runs from the given directory (e.g. a secondary
+    /// workspace) with the same environment as `jjq()`.
+    fn jjq_in(&self, dir: &Path) -> Command {
+        let mut cmd = self.jjq();
+        cmd.current_dir(dir);
+        cmd
+    }
+
     /// Run jjq and return normalized output for snapshots.
     fn jjq_output(&self, args: &[&str]) -> String {
         let output = self.jjq().args(args).output().expect("failed to run jjq");
@@ -2073,4 +2081,127 @@ fn test_status_shows_recently_landed_rebase() {
       2: <CHANGE_ID> feature 2
       1: <CHANGE_ID> feature 1
     ");
+}
+
+/// Add a secondary workspace named `w2` to the repo, returning its root path.
+/// The workspace directory is created inside `container` so it outlives the call.
+fn add_secondary_workspace(repo: &TestRepo, container: &TempDir) -> PathBuf {
+    let ws_path = container.path().join("w2");
+    run_jj(
+        repo.path(),
+        &["workspace", "add", "--name", "w2", ws_path.to_str().unwrap()],
+    );
+    ws_path
+}
+
+#[test]
+fn test_push_from_secondary_workspace_uses_shared_locks() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Create a branch to push
+    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "feature content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feature"]);
+
+    let container = TempDir::new().expect("failed to create workspace container");
+    let ws_path = add_secondary_workspace(&repo, &container);
+
+    let output = repo
+        .jjq_in(&ws_path)
+        .args(["push", "feature"])
+        .output()
+        .expect("failed to run jjq");
+    assert!(
+        output.status.success(),
+        "push from secondary workspace failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // The queue entry was created
+    let bookmarks = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/queue/??????\")",
+            "-T",
+            "name ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        bookmarks.contains("jjq/queue/000001"),
+        "queue entry should exist after push from secondary workspace: {}",
+        bookmarks
+    );
+
+    // Locks must live in the primary workspace's .jj so all workspaces share them
+    let primary_locks = repo.path().join(".jj").join("jjq-locks");
+    assert!(
+        primary_locks.join("id.lock").exists(),
+        "id lock should be in the primary workspace's lock dir: {}",
+        primary_locks.display()
+    );
+    let secondary_locks = ws_path.join(".jj").join("jjq-locks");
+    assert!(
+        !secondary_locks.exists(),
+        "secondary workspace must not get a private lock dir: {}",
+        secondary_locks.display()
+    );
+}
+
+#[test]
+fn test_push_from_secondary_workspace_respects_id_lock() {
+    use fs2::FileExt;
+
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Create a branch to push
+    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "feature content").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feature"]);
+
+    let container = TempDir::new().expect("failed to create workspace container");
+    let ws_path = add_secondary_workspace(&repo, &container);
+
+    // Hold the shared sequence ID lock, as a concurrent push would
+    let lock_dir = repo.path().join(".jj").join("jjq-locks");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lock_file = fs::File::create(lock_dir.join("id.lock")).unwrap();
+    lock_file.lock_exclusive().unwrap();
+
+    // A push from the secondary workspace must observe the held lock
+    let output = repo
+        .jjq_in(&ws_path)
+        .args(["push", "feature"])
+        .output()
+        .expect("failed to run jjq");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "push should exit LOCK_HELD while the id lock is held; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // LOCK_HELD is raised before bookmark creation, so the queue must be empty
+    let bookmarks = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/queue/??????\")",
+            "-T",
+            "name ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        bookmarks.trim().is_empty(),
+        "no queue entry should be created while the id lock is held: {}",
+        bookmarks
+    );
 }

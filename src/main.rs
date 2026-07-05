@@ -126,6 +126,11 @@ fn run() -> Result<()> {
     // Verify we're in a jj repository
     jj::verify_repo()?;
 
+    // Resolve the shared .jj directory now, while cwd is still the invoking
+    // workspace: commands chdir into temporary workspaces, and the cached
+    // value must reflect the workspace jjq was started from.
+    jj::shared_jj_dir()?;
+
     match cli.command {
         Commands::Init { trunk, check, strategy } => {
             commands::init(trunk.as_deref(), check.as_deref(), &strategy)

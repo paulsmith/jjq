@@ -66,8 +66,9 @@ pub fn is_held(name: &str) -> Result<bool> {
     Ok(matches!(lock_state(name)?, LockState::Held))
 }
 
-/// Get the lock file path for a named lock.
+/// Get the lock file path for a named lock. Locks live in the shared .jj
+/// directory so that invocations from any workspace contend on the same files.
 fn lock_file_path(name: &str) -> Result<PathBuf> {
-    let root = jj::repo_root()?;
-    Ok(root.join(".jj").join("jjq-locks").join(format!("{}.lock", name)))
+    let dir = jj::shared_jj_dir()?;
+    Ok(dir.join("jjq-locks").join(format!("{}.lock", name)))
 }
