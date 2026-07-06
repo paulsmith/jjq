@@ -1,5 +1,7 @@
 # jjq Logging Design
 
+> Historical design document; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 ## Overview
 
 Add comprehensive logging to jjq to provide visibility into merge queue operations, aid in debugging failures, and maintain an audit trail of queue activity.

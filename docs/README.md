@@ -265,9 +265,12 @@ check command is sane before queuing items. The workspace is always cleaned up.
 ### Diagnostics
 
 The jjq `doctor` command validates the environment: trunk bookmark exists,
-check command configured, locks not held, and no orphaned workspaces. Each
-check is reported as ok, WARN, or FAIL, with suggested fixes for actionable
-issues.
+check command configured, sequence counter intact, no conflicted jjq
+bookmarks, locks not held, no stale claims from an interrupted run, and no
+orphaned workspaces. Each check is reported as ok, WARN, or FAIL, with
+suggested fixes for actionable issues. `doctor --fix` repairs a conflicted
+jjq metadata bookmark, keeping the conflict side with the highest sequence
+counter.
 
 ### User configuration
 

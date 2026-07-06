@@ -74,7 +74,7 @@ jjq stores all state in the jj repository itself:
 | 1 | `CONFLICT` | Merge conflict, check failed, check command not configured, trunk moved during run, or another queue runner is active |
 | 2 | `PARTIAL` | Batch run processed some items but left failures |
 | 3 | `LOCK_HELD` | Metadata lock still held after the wait timeout (a concurrent writer is stuck) |
-| 10 | `USAGE` | Bad arguments, item not found, invalid revset |
+| 10 | `USAGE` | Bad arguments, invalid revset, duplicate push of an already-queued commit |
 
 ### Key Concepts
 

@@ -1,5 +1,7 @@
 # Failure & Retry Workflow Improvements
 
+> Historical design document; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 Design for addressing issues identified in the 2026-01-28 stress test.
 
 ## Summary

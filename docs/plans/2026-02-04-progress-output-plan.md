@@ -1,5 +1,7 @@
 # Progress Indicators & Output Viewing Implementation Plan
 
+> Historical implementation plan; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add liveness feedback (spinner + elapsed time) during check command execution, interactive output toggle via keypress, and a `jjq tail` command for viewing check output from a separate terminal.

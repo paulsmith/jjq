@@ -1,5 +1,7 @@
 # Replace mkdir Locks with fs2 File Locks
 
+> Historical implementation plan; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Replace the mkdir-based locking mechanism with fs2 flock-based file locks for simplicity and automatic stale lock cleanup.

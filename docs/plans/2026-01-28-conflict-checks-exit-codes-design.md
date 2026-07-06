@@ -1,5 +1,7 @@
 # Pre-flight conflict checks, run --all resilience, and exit codes
 
+> Historical design document; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 Date: 2026-01-28
 Status: Implemented
 

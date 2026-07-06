@@ -178,8 +178,10 @@ jjq tail --no-follow   # dump once and exit
 jjq doctor
 ```
 
-Checks trunk bookmark, check command, lock state, and workspace
-preconditions. Catches common config errors before queue items fail.
+Checks the trunk bookmark, check command, sequence counter, conflicted jjq
+bookmarks, lock state, stale claims, and workspace preconditions. Catches
+common config errors before queue items fail. `jjq doctor --fix` repairs a
+conflicted jjq metadata bookmark.
 
 ## How it works
 

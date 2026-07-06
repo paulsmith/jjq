@@ -1,5 +1,7 @@
 # Status & Observability Design
 
+> Historical design document; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 ## Goal
 
 Make jjq's queue state machine-readable for agent orchestration, while

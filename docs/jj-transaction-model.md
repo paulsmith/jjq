@@ -126,7 +126,8 @@ targets, the bookmark becomes conflicted.
 
 ## Why This Matters for jjq
 
-jjq uses `jj bookmark create` as a mutex lock:
+A tempting design for jjq is to use `jj bookmark create` as a mutex lock
+(jjq specifically avoids this; see below):
 
 ```bash
 if ! jj bookmark create -r "$jjq_bookmark" "$lock" >/dev/null 2>&1; then
@@ -172,10 +173,13 @@ signal), the OS releases the lock automatically.
 
 ### Implementation
 
-Lock files are stored in `.jj/jjq-locks/` within the repository:
+Lock files are stored in `.jj/jjq-locks/` under the shared repository
+directory (secondary workspaces resolve it through their `.jj/repo` pointer),
+so invocations from any jj workspace contend on the same locks:
 
 ```
 .jj/jjq-locks/
+├── check.lock   # Check lock (held shared by each jjq check; probed exclusively by clean)
 ├── meta.lock    # Metadata writer lock (sequence IDs, config, workspace records)
 └── run.lock     # Run lock (held during queue processing)
 ```

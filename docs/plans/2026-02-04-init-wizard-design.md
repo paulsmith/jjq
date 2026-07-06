@@ -1,5 +1,7 @@
 # Init Wizard Design
 
+> Historical design document; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 ## Goal
 
 Replace jjq's silent auto-initialization with an explicit `jjq init` command

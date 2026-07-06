@@ -1,5 +1,7 @@
 # Rust Port Catchup Implementation Plan
 
+> Historical implementation plan; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Bring the Rust port (`.workspaces/rust-impl`) to parity with the bash reference implementation and specification, covering the changes from `mtloxrko` through `wxvowwlq`.

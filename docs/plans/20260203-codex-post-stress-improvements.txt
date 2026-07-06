@@ -1,3 +1,5 @@
+NOTE: Historical improvement notes; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
  Highest Impact
 
   - Add jjq retry <failed-id> [--rev <revset>] [--rebase]:

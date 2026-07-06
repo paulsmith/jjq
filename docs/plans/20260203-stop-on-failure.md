@@ -1,5 +1,7 @@
 # `--stop-on-failure` Flag for `jjq run --all` Implementation Plan
 
+> Historical implementation plan; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Make `jjq run --all` continue processing the queue after failures by default, with `--stop-on-failure` to restore the old stop-immediately behavior.

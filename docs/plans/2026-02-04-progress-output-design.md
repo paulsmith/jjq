@@ -1,5 +1,7 @@
 # Progress Indicators & Output Viewing Design
 
+> Historical design document; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 ## Goal
 
 Provide liveness feedback during long-running check commands and give users

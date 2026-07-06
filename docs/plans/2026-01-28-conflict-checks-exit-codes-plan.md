@@ -1,5 +1,7 @@
 # Conflict Checks, Exit Codes, and Run --all Resilience Implementation Plan
 
+> Historical implementation plan; the locking, metadata, and queue internals described here have since been superseded — see docs/README.md for current behavior.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Make jjq fail fast on conflicts (retry pre-flight check), continue past failures in batch mode (run --all), and return distinct exit codes for programmatic use.
