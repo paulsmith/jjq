@@ -1,6 +1,6 @@
 .\" ABOUTME: Man page for jjq, a local merge queue for jj (Jujutsu VCS).
 .\" ABOUTME: Covers all commands, configuration, data model, and workflows.
-.TH JJQ 1 "2026-07-05" "jjq" "General Commands Manual"
+.TH JJQ 1 "2026-07-06" "jjq" "General Commands Manual"
 .SH NAME
 jjq \- local merge queue for jj
 .SH SYNOPSIS
@@ -109,6 +109,14 @@ re\-queued.
 If the exact same commit ID is already queued, the push is rejected as a
 duplicate (usage error).
 .PP
+If the queued commit is the invoking workspace's working\-copy commit,
+the working copy is moved to a new empty child (as
+.B jj commit
+does) and a note is printed.
+Later edits in the workspace then go to a new change instead of amending
+the queued commit \(em jj bookmarks follow rewritten commits, so once the
+item lands, further amendments would silently move trunk.
+.PP
 .RS
 .nf
 jjq push @              # queue the working copy
@@ -132,6 +140,13 @@ position on the next run.
 .PP
 On success, the trunk bookmark advances and the
 temporary workspace is cleaned up.
+If the landed change is still some workspace's working\-copy commit
+(pushed from a different workspace, so
+.B push
+could not move that working copy), a warning names the workspace: run
+.B jj new
+there before editing, or the workspace's next snapshot amends the landed
+commit and trunk follows it.
 .PP
 On failure (conflicts or check command failure), the item moves to the
 failed list.
@@ -217,7 +232,7 @@ and
 are mutually exclusive.
 .SS requeue \fIid\fR
 Re\-push a failed item back onto the queue under a new sequence ID.
-Runs the same pre\-flight conflict check as
+Runs the same pre\-flight conflict check and working\-copy handling as
 .B push
 and clears the failed entry and its workspace on success.
 A shortcut for retrying an item without changes; use

@@ -29,6 +29,14 @@ branch or the queue.
   out-of-band moves now produces a short, actionable error pointing at
   `jjq doctor` everywhere it is read, instead of raw jj template errors or
   silently reading one side of the conflict.
+- **Landing a live working-copy commit dragged trunk** — Pushing a
+  workspace's `@` left the landed commit as that workspace's live working
+  copy; the next edit was snapshotted as an amendment and the trunk bookmark
+  silently followed, absorbing unchecked changes (under both strategies —
+  directly under `rebase`, via descendant auto-rebase of the merge commit
+  under `merge`). `push` and `requeue` now park the working copy on a fresh
+  empty child of the queued commit (like `jj commit` does), and `run` warns
+  when a landed change is still some other workspace's working-copy commit.
 
 ### Changed
 

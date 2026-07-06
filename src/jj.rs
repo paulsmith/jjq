@@ -372,6 +372,29 @@ pub fn trees_match(from: &str, to: &str) -> Result<bool> {
     Ok(output.trim().is_empty())
 }
 
+/// Move the invoking workspace's working copy to a new empty commit on top
+/// of the current working-copy commit (plain `jj new`).
+pub fn new_working_copy() -> Result<()> {
+    run_quiet(&["new"])
+}
+
+/// Names of workspaces whose working-copy commit is in `revset`.
+pub fn workspaces_at(revset: &str) -> Result<Vec<String>> {
+    let output = run_ok(&[
+        "log",
+        "-r",
+        &format!("({}) & working_copies()", revset),
+        "--no-graph",
+        "-T",
+        "working_copies ++ \"\\n\"",
+    ])?;
+    Ok(output
+        .split_whitespace()
+        .map(|s| s.trim_end_matches('@').to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
 /// Create a new revision with given parent(s).
 pub fn new_rev(parents: &[&str]) -> Result<String> {
     let mut args = vec!["new", "--no-edit"];

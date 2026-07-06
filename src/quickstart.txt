@@ -40,6 +40,8 @@ AFTER A RUN LANDS ITEMS
 
 THINGS TO KNOW
   - Push resolves a jj revset to one revision and queues it by change ID
+  - Pushing your working-copy commit (@) moves the working copy to a new
+    empty child, so edits after the push don't amend the queued commit
   - Queue is processed FIFO; each item gets a temporary workspace
   - Re-pushing the same change ID replaces its queue/failed entry
   - Concurrent pushes are safe: they serialize on a metadata lock, so a

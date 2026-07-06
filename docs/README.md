@@ -54,8 +54,19 @@ the jj revset language, so long as that revset refers to a single revision) to
 be queued, and jjq does the following:
 
   - finds the next sequence ID (see "Sequence IDs" below);
-  - creates a bookmark namespaced to jjq and encoding the sequence ID; and
-  - points the bookmark to the candidate revision.
+  - creates a bookmark namespaced to jjq and encoding the sequence ID;
+  - points the bookmark to the candidate revision; and
+  - if the candidate is the invoking workspace's working-copy commit, moves
+    the working copy to a new empty child (as `jj commit` does).
+
+The last step keeps later edits in the workspace off the queued commit. jj
+bookmarks follow rewritten commits, so once the item lands, a snapshot
+amending it would silently move the trunk bookmark to include unchecked
+edits. A revision pushed from a different workspace can still land as a
+live working-copy commit; the runner then warns and advises `jj new` in
+that workspace, since only a command run inside a workspace can move its
+working copy (and doing so from the runner would first snapshot pending
+edits into the landed commit — the very thing being prevented).
 
 ### Sequence IDs
 

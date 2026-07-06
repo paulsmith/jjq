@@ -57,6 +57,13 @@ CCOOMMMMAANNDDSS
        re-queued.  If the exact same commit ID is already queued, the push is
        rejected as a duplicate (usage error).
 
+       If the queued commit is the invoking workspace's working-copy commit,
+       the working copy is moved to a new empty child (as jjjj ccoommmmiitt does) and
+       a note is printed.  Later edits in the workspace then go to a new
+       change instead of amending the queued commit -- jj bookmarks follow
+       rewritten commits, so once the item lands, further amendments would
+       silently move trunk.
+
               jjq push @              # queue the working copy
               jjq push feat-xyz@      # queue a workspace's working copy
               jjq push abc123         # queue by change ID
@@ -71,7 +78,11 @@ CCOOMMMMAANNDDSS
        run.
 
        On success, the trunk bookmark advances and the temporary workspace is
-       cleaned up.
+       cleaned up.  If the landed change is still some workspace's
+       working-copy commit (pushed from a different workspace, so ppuusshh could
+       not move that working copy), a warning names the workspace: run jjjj nneeww
+       there before editing, or the workspace's next snapshot amends the
+       landed commit and trunk follows it.
 
        On failure (conflicts or check command failure), the item moves to the
        failed list.  The temporary workspace is preserved for debugging.
@@ -124,9 +135,10 @@ CCOOMMMMAANNDDSS
 
    rreeqquueeuuee _i_d
        Re-push a failed item back onto the queue under a new sequence ID.
-       Runs the same pre-flight conflict check as ppuusshh and clears the failed
-       entry and its workspace on success.  A shortcut for retrying an item
-       without changes; use jjjjqq ppuusshh after fixing the revision instead.
+       Runs the same pre-flight conflict check and working-copy handling as
+       ppuusshh and clears the failed entry and its workspace on success.  A
+       shortcut for retrying an item without changes; use jjjjqq ppuusshh after
+       fixing the revision instead.
 
    ddeelleettee _i_d
        Remove an item from the queue or the failed list by its sequence ID.
@@ -309,4 +321,4 @@ SSEEEE AALLSSOO
 AAUUTTHHOORRSS
        Paul Smith
 
-jjq                               2026-07-05                            JJQ(1)
+jjq                               2026-07-06                            JJQ(1)

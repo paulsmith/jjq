@@ -750,7 +750,10 @@ fn test_push_and_status() {
     run_jj(repo.path(), &["bookmark", "create", "feature"]);
 
     let push_output = repo.jjq_success(&["push", "feature"]);
-    insta::assert_snapshot!(push_output, @"jjq: revision 'feature' queued at 1 (trunk: main in <REPO>)");
+    insta::assert_snapshot!(push_output, @r"
+    jjq: revision 'feature' queued at 1 (trunk: main in <REPO>)
+    jjq: working copy moved to a new change; the queued commit stays as pushed
+    ");
 
     let status_output = repo.jjq_success(&["status"]);
     insta::assert_snapshot!(status_output, @r"
@@ -1073,9 +1076,14 @@ fn test_multiple_push_same_revision() {
     let repo = TestRepo::with_go_project();
     repo.init_jjq();
 
-    // Push main once - should succeed
+    // Push main once - should succeed. The template's working copy sits on
+    // the main commit itself, so the push also parks the working copy on a
+    // fresh child.
     let push1 = repo.jjq_success(&["push", "main"]);
-    insta::assert_snapshot!(push1, @"jjq: revision 'main' queued at 1 (trunk: main in <REPO>)");
+    insta::assert_snapshot!(push1, @r"
+    jjq: revision 'main' queued at 1 (trunk: main in <REPO>)
+    jjq: working copy moved to a new change; the queued commit stays as pushed
+    ");
 
     // Push same commit ID again - should be rejected as duplicate
     let push2 = repo.jjq_output(&["push", "main"]);
@@ -2267,6 +2275,267 @@ fn test_push_from_secondary_workspace_respects_meta_lock() {
         bookmarks.trim().is_empty(),
         "no queue entry should be created while the meta lock is held: {}",
         bookmarks
+    );
+}
+
+/// Add a secondary workspace based at `rev`, returning its root path.
+/// The workspace directory is created inside `container` so it outlives the call.
+fn add_workspace_at(repo: &TestRepo, container: &TempDir, name: &str, rev: &str) -> PathBuf {
+    let ws_path = container.path().join(name);
+    run_jj(
+        repo.path(),
+        &[
+            "workspace",
+            "add",
+            "--name",
+            name,
+            "-r",
+            rev,
+            ws_path.to_str().unwrap(),
+        ],
+    );
+    ws_path
+}
+
+/// Run jjq in `dir` expecting success, returning combined stdout+stderr.
+fn jjq_success_in(repo: &TestRepo, dir: &Path, args: &[&str]) -> String {
+    let output = repo
+        .jjq_in(dir)
+        .args(args)
+        .output()
+        .expect("failed to run jjq");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "jjq {:?} in {} failed: {}{}",
+        args,
+        dir.display(),
+        stdout,
+        stderr
+    );
+    format!("{}{}", stdout, stderr)
+}
+
+/// Commit ID a revset resolves to, via the primary workspace.
+fn commit_id_of(repo: &TestRepo, revset: &str) -> String {
+    run_jj(
+        repo.path(),
+        &["log", "-r", revset, "--no-graph", "-T", "commit_id"],
+    )
+    .trim()
+    .to_string()
+}
+
+/// Regression: landing a commit that is a live workspace's working-copy
+/// commit leaves the trunk head as that working copy; the workspace's next
+/// snapshot amends the trunk head and the trunk bookmark follows the rewrite,
+/// silently absorbing unchecked edits. push moves the working copy to a new
+/// change so post-landing edits stay off the landed commit.
+#[test]
+fn test_rebase_landing_wc_commit_post_edit_does_not_move_trunk() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq(); // rebase strategy
+
+    let container = TempDir::new().expect("failed to create workspace container");
+    let ws = add_workspace_at(&repo, &container, "agent2", "main");
+
+    fs::write(ws.join("feature.txt"), "checked\n").unwrap();
+    run_jj(&ws, &["describe", "-m", "agent2 feature"]);
+
+    jjq_success_in(&repo, &ws, &["push", "@"]);
+    jjq_success_in(&repo, &ws, &["run"]);
+
+    let main_after_land = commit_id_of(&repo, "main");
+    assert!(
+        repo.jj_file_exists("feature.txt", "main"),
+        "feature.txt should have landed on main"
+    );
+
+    // Post-landing edit in the workspace must not move main.
+    fs::write(ws.join("feature.txt"), "checked\nUNCHECKED\n").unwrap();
+    run_jj(&ws, &["status"]); // forces a snapshot
+
+    let main_after_edit = commit_id_of(&repo, "main");
+    assert_eq!(
+        main_after_land, main_after_edit,
+        "post-landing edit in the pushing workspace moved main"
+    );
+    let landed = run_jj(repo.path(), &["file", "show", "feature.txt", "-r", "main"]);
+    assert_eq!(
+        landed, "checked\n",
+        "main absorbed an unchecked post-landing edit"
+    );
+}
+
+/// Same hazard under the merge strategy: amending the landed candidate
+/// auto-rebases the merge commit above it and the trunk bookmark follows.
+#[test]
+fn test_merge_landing_wc_commit_post_edit_does_not_move_trunk() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_merge();
+
+    let container = TempDir::new().expect("failed to create workspace container");
+    let ws = add_workspace_at(&repo, &container, "agent2", "main");
+
+    fs::write(ws.join("feature.txt"), "checked\n").unwrap();
+    run_jj(&ws, &["describe", "-m", "agent2 feature"]);
+
+    jjq_success_in(&repo, &ws, &["push", "@"]);
+    jjq_success_in(&repo, &ws, &["run"]);
+
+    let main_after_land = commit_id_of(&repo, "main");
+
+    fs::write(ws.join("feature.txt"), "checked\nUNCHECKED\n").unwrap();
+    run_jj(&ws, &["status"]); // forces a snapshot
+
+    let main_after_edit = commit_id_of(&repo, "main");
+    assert_eq!(
+        main_after_land, main_after_edit,
+        "post-landing edit in the pushing workspace moved main"
+    );
+    let landed = run_jj(repo.path(), &["file", "show", "feature.txt", "-r", "main"]);
+    assert_eq!(
+        landed, "checked\n",
+        "main absorbed an unchecked post-landing edit"
+    );
+}
+
+/// Pushing the working-copy commit moves the working copy to a new empty
+/// child (like `jj commit` does), leaving the queued commit as pushed.
+#[test]
+fn test_push_moves_working_copy_off_queued_commit() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    run_jj(repo.path(), &["new", "-m", "feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    let candidate_commit = commit_id_of(&repo, "@");
+
+    let output = repo.jjq_success(&["push", "@"]);
+    assert!(
+        output.contains("working copy moved to a new change"),
+        "push of @ should report the working-copy move: {}",
+        output
+    );
+
+    let wc_commit = commit_id_of(&repo, "@");
+    assert_ne!(
+        wc_commit, candidate_commit,
+        "working copy should have moved off the queued commit"
+    );
+    let wc_parent = run_jj(
+        repo.path(),
+        &["log", "-r", "@", "--no-graph", "-T", "parents.map(|c| c.commit_id()).join(\"\")"],
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        wc_parent, candidate_commit,
+        "working copy should be a child of the queued commit"
+    );
+    let queued_commit = commit_id_of(&repo, "bookmarks(exact:\"jjq/queue/000001\")");
+    assert_eq!(
+        queued_commit, candidate_commit,
+        "queue entry should point at the original commit"
+    );
+}
+
+/// Pushing a revset that is not the working-copy commit leaves the working
+/// copy alone.
+#[test]
+fn test_push_leaves_working_copy_when_not_wc_commit() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    run_jj(repo.path(), &["new", "-m", "feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feat"]);
+    run_jj(repo.path(), &["new", "main"]);
+    let wc_before = commit_id_of(&repo, "@");
+
+    let output = repo.jjq_success(&["push", "feat"]);
+    assert!(
+        !output.contains("working copy moved"),
+        "push of a non-@ revset should not move the working copy: {}",
+        output
+    );
+    let wc_after = commit_id_of(&repo, "@");
+    assert_eq!(wc_before, wc_after, "working copy should not have moved");
+}
+
+/// requeue of a fixed candidate that is the working-copy commit moves the
+/// working copy off it, same as push.
+#[test]
+fn test_requeue_moves_working_copy_off_requeued_commit() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq_success(&["init", "--trunk", "main", "--check", "false"]);
+
+    run_jj(repo.path(), &["new", "-m", "fixme", "main"]);
+    fs::write(repo.path().join("feature.txt"), "broken\n").unwrap();
+    let candidate_change = run_jj(
+        repo.path(),
+        &["log", "-r", "@", "--no-graph", "-T", "change_id.short()"],
+    )
+    .trim()
+    .to_string();
+
+    repo.jjq_success(&["push", "@"]);
+    repo.jjq_failure(&["run"]); // check command "false" fails the item
+
+    // Fix the candidate in place, then requeue it.
+    run_jj(repo.path(), &["edit", &candidate_change]);
+    fs::write(repo.path().join("feature.txt"), "fixed\n").unwrap();
+    repo.jjq_success(&["config", "check_command", "true"]);
+
+    let output = repo.jjq_success(&["requeue", "1"]);
+    assert!(
+        output.contains("working copy moved to a new change"),
+        "requeue of @ should report the working-copy move: {}",
+        output
+    );
+
+    let candidate_commit = commit_id_of(&repo, &candidate_change);
+    let wc_commit = commit_id_of(&repo, "@");
+    assert_ne!(
+        wc_commit, candidate_commit,
+        "working copy should have moved off the requeued commit"
+    );
+}
+
+/// When the landed commit is another workspace's live working-copy commit
+/// (pushed from elsewhere, so push could not move that working copy), the
+/// runner warns that edits in that workspace will drag trunk.
+#[test]
+fn test_run_warns_when_landing_another_workspaces_wc_commit() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    let container = TempDir::new().expect("failed to create workspace container");
+    let ws = add_workspace_at(&repo, &container, "agent2", "main");
+
+    fs::write(ws.join("feature.txt"), "checked\n").unwrap();
+    run_jj(&ws, &["describe", "-m", "agent2 feature"]);
+
+    // Push agent2's working-copy commit from the primary workspace: push
+    // cannot move agent2's working copy, so the runner must warn instead.
+    let push_output = repo.jjq_success(&["push", "agent2@"]);
+    assert!(
+        !push_output.contains("working copy moved"),
+        "push from another workspace should not move any working copy: {}",
+        push_output
+    );
+
+    let run_output = repo.jjq_success(&["run"]);
+    assert!(
+        run_output.contains("workspace 'agent2'"),
+        "run should warn about landing agent2's working-copy commit: {}",
+        run_output
+    );
+    assert!(
+        run_output.contains("jj new"),
+        "warning should advise running jj new in the workspace: {}",
+        run_output
     );
 }
 

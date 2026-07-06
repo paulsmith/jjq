@@ -54,7 +54,7 @@ jjq stores all state in the jj repository itself:
 | Command | Function |
 |---------|----------|
 | `init [--trunk <bookmark>] [--check <cmd>] [--strategy <strategy>]` | Initialize jjq, set trunk, check command, and strategy |
-| `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID) |
+| `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID; pushing the current workspace's @ moves the working copy to a new empty child) |
 | `run [--all] [--stop-on-failure]` | Process next queue item, or all items in batch; failure output shows concrete jj commands with actual change IDs |
 | `check [--rev <revset>] [-v]` | Run check command against a revision (default @); -v shows workspace/env details |
 | `status [id] [--json] [--resolve]` | Show running/queued items, recent failures (with conflicting file paths), and recently landed items; JSON output has `runner_active` (bool) plus `running`/`queue`/`failed`/`landed` arrays |
@@ -86,6 +86,7 @@ jjq stores all state in the jj repository itself:
 - **Running claim** - The runner renames `jjq/queue/N` to `jjq/running/N` under the run lock before processing; on success/failure the claim is deleted or becomes `jjq/failed/N`. Immediately before landing, the runner verifies the claim still exists and otherwise discards the result. Claims orphaned by a crash are moved back to the queue at the start of the next run ("recovered interrupted item N")
 - **Requeue** - Re-pushes a failed item back onto the queue, running a pre-flight conflict check first; a shortcut for fixing and re-pushing manually
 - **Landing strategy** - How the candidate is landed on trunk: `rebase` (default) or `merge`
+- **Working-copy move-off** - `push`/`requeue` of the invoking workspace's working-copy commit parks the working copy on a new empty child (like `jj commit`), so later snapshots don't amend the queued commit — once landed, trunk would follow those rewrites and absorb unchecked edits (both strategies). `run` warns when a landed change is still another workspace's live working copy
 
 ### Concurrency
 

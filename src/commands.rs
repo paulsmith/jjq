@@ -490,9 +490,29 @@ pub fn push(revset: &str) -> Result<()> {
         revset, id, trunk_bookmark, repo_path.display()
     ));
 
+    move_working_copy_off_queued(&commit_id)?;
+
     // Show one-time hint about configuring jj log
     config::maybe_show_log_hint()?;
 
+    Ok(())
+}
+
+/// Move the invoking workspace's working copy off a just-queued commit.
+///
+/// A queued commit that is also the working-copy commit is amended by every
+/// later snapshot in its workspace, and once it lands, trunk follows those
+/// rewrites (jj bookmarks track rewritten commits) — silently absorbing
+/// edits that were never queued or checked. Parking the working copy on a
+/// fresh child (exactly what `jj commit` does) keeps the queued commit as
+/// pushed. Only the invoking workspace can be moved: jj manipulates the
+/// working copy of the workspace a command runs in, and no other.
+fn move_working_copy_off_queued(queued_commit_id: &str) -> Result<()> {
+    let (_, wc_commit_id) = jj::resolve_revset_full("@")?;
+    if wc_commit_id == queued_commit_id {
+        jj::new_working_copy()?;
+        prefout("working copy moved to a new change; the queued commit stays as pushed");
+    }
     Ok(())
 }
 
@@ -960,6 +980,25 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
                 id, trunk_bookmark, candidate_change_id
             ));
         }
+    }
+
+    // A landed change that is still some workspace's working-copy commit
+    // will be amended by that workspace's next snapshot, and trunk follows
+    // the rewrite (directly under rebase; via descendant auto-rebase of the
+    // merge commit under merge). push moves the pushing workspace off its
+    // own @, but a commit pushed from a different workspace can still land
+    // live — and only a jj command run inside that workspace could move it,
+    // which would itself snapshot pending edits into the landed change. All
+    // this runner can do is warn. Best-effort: the land already succeeded.
+    for ws_name in jj::workspaces_at(&candidate_change_id).unwrap_or_default() {
+        preferr(&format!(
+            "warning: landed change {} is the working-copy commit of workspace '{}'",
+            candidate_change_id, ws_name
+        ));
+        preferr(&format!(
+            "  run `jj new` in that workspace before editing, or {} will absorb the edits",
+            trunk_bookmark
+        ));
     }
 
     Ok(RunResult::Success)
@@ -1478,7 +1517,7 @@ pub fn requeue(id_str: &str) -> Result<()> {
 
     // Resolve the candidate — it may have been rebased since the failure
     let revset = candidate_change_id.as_str();
-    let (_change_id, _commit_id) = jj::resolve_revset_full(revset)
+    let (_change_id, commit_id) = jj::resolve_revset_full(revset)
         .map_err(|e| ExitError::new(exit_codes::USAGE, format!("candidate not found: {}", e)))?;
 
     // Get trunk bookmark for conflict check
@@ -1543,6 +1582,8 @@ pub fn requeue(id_str: &str) -> Result<()> {
         "requeued failed item {} as {} (trunk: {} in {})",
         id, new_id, trunk_bookmark, repo_path.display()
     ));
+
+    move_working_copy_off_queued(&commit_id)?;
 
     Ok(())
 }
