@@ -969,6 +969,7 @@ fn test_delete_not_found() {
 
     let output = repo.jjq_failure(&["delete", "999"]);
     insta::assert_snapshot!(output, @"jjq: item 999 not found in queue or failed");
+    repo.jjq().args(["delete", "999"]).assert().code(10);
 }
 
 #[test]
@@ -1532,6 +1533,7 @@ fn test_status_not_found() {
         "should report not found: {}",
         output
     );
+    repo.jjq().args(["status", "999"]).assert().code(10);
 }
 
 #[test]
@@ -2072,6 +2074,7 @@ fn test_requeue_not_found() {
 
     let output = repo.jjq_failure(&["requeue", "999"]);
     insta::assert_snapshot!(output, @"jjq: failed item 999 not found");
+    repo.jjq().args(["requeue", "999"]).assert().code(10);
 }
 
 #[test]

@@ -1380,7 +1380,11 @@ fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<
         } else if queue::running_item_exists(id)? {
             bail!("item {} is currently being processed (run in progress)", id)
         } else {
-            bail!("item {} not found in queue or failed", id)
+            return Err(ExitError::new(
+                exit_codes::USAGE,
+                format!("item {} not found in queue or failed", id),
+            )
+            .into());
         }
     } else if let Some(change_id) = resolve {
         find_by_change_id(change_id)?
@@ -1665,7 +1669,11 @@ pub fn delete(id_str: &str) -> Result<()> {
         return Ok(());
     }
 
-    bail!("item {} not found in queue or failed", id)
+    Err(ExitError::new(
+        exit_codes::USAGE,
+        format!("item {} not found in queue or failed", id),
+    )
+    .into())
 }
 
 /// Get or set configuration. Reads pin one metadata snapshot and take no

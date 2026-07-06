@@ -215,7 +215,8 @@ EEXXIITT CCOODDEESS
               metadata lock past the wait deadline (see EENNVVIIRROONNMMEENNTT).
 
        1100     Usage error. Bad arguments, ambiguous revset, duplicate push of
-              the exact same commit ID, etc.
+              the exact same commit ID, or an item ID that is not found in the
+              queue or failed set.
 
 CCOONNFFIIGGUURRAATTIIOONN
        jjjjqq stores configuration on an isolated metadata branch (jjjjqq//__//__)

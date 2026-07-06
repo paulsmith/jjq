@@ -37,6 +37,9 @@ branch or the queue.
   under `merge`). `push` and `requeue` now park the working copy on a fresh
   empty child of the queued commit (like `jj commit` does), and `run` warns
   when a landed change is still some other workspace's working-copy commit.
+- **Consistent not-found exit code** — `jjq status <id>` and
+  `jjq delete <id>` on a nonexistent item now exit 10 (`USAGE`), matching
+  `jjq requeue`; previously they exited 1.
 
 ### Changed
 
