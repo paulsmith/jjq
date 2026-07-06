@@ -15,6 +15,5 @@ pub fn sentinel_line(exit_code: i32) -> String {
 /// Return the path to the jjq run log file within the shared .jj directory,
 /// so that a run started in one workspace is visible to `jjq tail` in another.
 pub fn log_path() -> Result<PathBuf> {
-    let dir = crate::jj::shared_jj_dir()?;
-    Ok(dir.join("jjq-run.log"))
+    crate::paths::run_log()
 }

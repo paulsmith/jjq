@@ -7,7 +7,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::PathBuf;
 
-use crate::jj;
+use crate::paths;
 
 /// A held lock that releases on drop (OS releases flock when File is dropped).
 pub struct Lock {
@@ -78,6 +78,5 @@ pub fn is_held(name: &str) -> Result<bool> {
 /// Get the lock file path for a named lock. Locks live in the shared .jj
 /// directory so that invocations from any workspace contend on the same files.
 fn lock_file_path(name: &str) -> Result<PathBuf> {
-    let dir = jj::shared_jj_dir()?;
-    Ok(dir.join("jjq-locks").join(format!("{}.lock", name)))
+    Ok(paths::locks_dir()?.join(format!("{}.lock", name)))
 }

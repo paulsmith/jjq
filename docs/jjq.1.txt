@@ -154,7 +154,7 @@ CCOOMMMMAANNDDSS
        active, so live workspaces are never destroyed mid-check.
 
    ttaaiill [----aallll] [----nnoo--ffoollllooww]
-       View the check command output stored in _._j_j_/_j_j_q_-_r_u_n_._l_o_g.  By default
+       View the check command output stored in _._j_j_/_j_j_q_/_r_u_n_._l_o_g.  By default
        shows the last 20 lines and follows until a sentinel line is seen.
        With ----aallll shows from the beginning. With ----nnoo--ffoollllooww dumps once and
        exits.
@@ -227,7 +227,7 @@ CCOONNFFIIGGUURRAATTIIOONN
        is unset, jjjjqq rruunn will refuse to process items.
 
 LLOOCCKKIINNGG
-       jjjjqq uses flock-based file locks in _._j_j_/_j_j_q_-_l_o_c_k_s_/ under the shared
+       jjjjqq uses flock-based file locks in _._j_j_/_j_j_q_/_l_o_c_k_s_/ under the shared
        repository directory, so invocations from any jj workspace contend on
        the same locks.  Locks are released automatically by the OS when the
        holding process exits, so stale locks cannot occur.

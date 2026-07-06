@@ -7,6 +7,7 @@ mod exit_codes;
 mod jj;
 mod lock;
 mod meta;
+mod paths;
 mod queue;
 mod runlog;
 mod runner;

@@ -258,7 +258,7 @@ Refuses to run while a queue runner or a
 is active, so live workspaces are never destroyed mid\-check.
 .SS tail \fR[\fB\-\-all\fR] [\fB\-\-no-follow\fR]
 View the check command output stored in
-.IR .jj/jjq-run.log .
+.IR .jj/jjq/run.log .
 By default shows the last 20 lines and follows until a sentinel line is seen.
 With
 .B \-\-all
@@ -363,7 +363,7 @@ will refuse to process items.
 .SH LOCKING
 .B jjq
 uses flock\-based file locks in
-.I .jj/jjq\-locks/
+.I .jj/jjq/locks/
 under the shared repository directory, so invocations from any jj
 workspace contend on the same locks.
 Locks are released automatically by the OS when the holding process

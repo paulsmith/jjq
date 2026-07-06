@@ -124,23 +124,31 @@ ensure that certain operations are safe from concurrent access.
 
 All writes to the jjq metadata branch — sequence ID allocation, configuration,
 and workspace records — are serialized by a single OS file lock (`flock(2)`)
-on `.jj/jjq-locks/meta.lock`. Writers wait up to 15 seconds for the lock
+on `.jj/jjq/locks/meta.lock`. Writers wait up to 15 seconds for the lock
 before giving up with `LOCK_HELD`. Reads take no lock: each group of
 reads pins the metadata bookmark to a single commit and reads every value in
 the group from that commit, so a concurrent writer cannot skew a read group.
 
 Running the queue also takes a lock — only one merge can be attempted at a
-time. The `run` lock uses `.jj/jjq-locks/run.lock`. A runner may take the
+time. The `run` lock uses `.jj/jjq/locks/run.lock`. A runner may take the
 meta lock while holding the run lock, never the reverse, so the two locks
 cannot deadlock.
 
 `jjq clean` holds the run lock for its whole cleanup, so it refuses to run
 while a queue runner is active rather than destroying the runner's live
 workspace. Each `jjq check` holds a shared `check` lock
-(`.jj/jjq-locks/check.lock`) for its workspace's lifetime; concurrent checks
+(`.jj/jjq/locks/check.lock`) for its workspace's lifetime; concurrent checks
 coexist, and clean probes the lock exclusively, refusing while any check is
 active. The lock order is run → meta and run → check; no code path acquires
 the run lock while holding either of the others.
+
+### Filesystem layout
+
+jjq filesystem state lives under `.jj/jjq/` in the shared repository `.jj`
+directory, so all workspaces for the same repo share the same locks and logs.
+Today this contains `locks/` for flock files and `run.log` for the last check
+output. New filesystem state should be added under `.jj/jjq/` rather than as a
+new sibling path in `.jj/`.
 
 ### Landed revision
 
@@ -252,7 +260,7 @@ history of jjq's operation.
 
 ### Check output
 
-jjq writes the check command's combined stdout/stderr to `.jj/jjq-run.log` and
+jjq writes the check command's combined stdout/stderr to `.jj/jjq/run.log` and
 provides `jjq tail` to view it (optionally following updates during a run).
 
 ### Deleting queued and failed items.

@@ -1,0 +1,21 @@
+// ABOUTME: Resolves jjq's on-disk state paths, all rooted at .jj/jjq/.
+
+use anyhow::Result;
+use std::path::PathBuf;
+
+use crate::jj;
+
+/// Root of all jjq filesystem state, under the shared .jj directory.
+pub fn jjq_dir() -> Result<PathBuf> {
+    Ok(jj::shared_jj_dir()?.join("jjq"))
+}
+
+/// Directory holding the flock files.
+pub fn locks_dir() -> Result<PathBuf> {
+    Ok(jjq_dir()?.join("locks"))
+}
+
+/// Path to the run log (last check command output).
+pub fn run_log() -> Result<PathBuf> {
+    Ok(jjq_dir()?.join("run.log"))
+}

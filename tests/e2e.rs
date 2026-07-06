@@ -1345,6 +1345,31 @@ fn test_clean_removes_failed_workspaces() {
 }
 
 #[test]
+fn test_clean_removes_legacy_filesystem_state() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    let legacy_locks = repo.path().join(".jj").join("jjq-locks");
+    let legacy_log = repo.path().join(".jj").join("jjq-run.log");
+    fs::create_dir_all(&legacy_locks).unwrap();
+    fs::write(legacy_locks.join("meta.lock"), "").unwrap();
+    fs::write(&legacy_log, "stale log").unwrap();
+
+    repo.jjq_success(&["clean"]);
+
+    assert!(
+        !legacy_locks.exists(),
+        "clean should remove legacy lock directory: {}",
+        legacy_locks.display()
+    );
+    assert!(
+        !legacy_log.exists(),
+        "clean should remove legacy run log: {}",
+        legacy_log.display()
+    );
+}
+
+#[test]
 fn test_status_json_empty() {
     let repo = TestRepo::new();
     let (stdout, _stderr, success) = repo.jjq_raw_output(&["status", "--json"]);
@@ -1680,7 +1705,7 @@ fn test_run_creates_log_file() {
     repo.jjq_success(&["push", "simple-branch"]);
     repo.jjq_success(&["run"]);
 
-    let log_path = repo.path().join(".jj").join("jjq-run.log");
+    let log_path = repo.path().join(".jj").join("jjq").join("run.log");
     assert!(log_path.exists(), "run log file should exist after run");
 
     let contents = fs::read_to_string(&log_path).unwrap();
@@ -1696,7 +1721,7 @@ fn test_log_file_truncated_between_runs() {
     let repo = TestRepo::with_go_project();
     repo.init_jjq_merge_with_check("echo run-output-marker");
 
-    let log_path = repo.path().join(".jj").join("jjq-run.log");
+    let log_path = repo.path().join(".jj").join("jjq").join("run.log");
     // Seed a stale log to verify run truncates rather than appends.
     fs::write(
         &log_path,
@@ -2212,13 +2237,13 @@ fn test_push_from_secondary_workspace_uses_shared_locks() {
     );
 
     // Locks must live in the primary workspace's .jj so all workspaces share them
-    let primary_locks = repo.path().join(".jj").join("jjq-locks");
+    let primary_locks = repo.path().join(".jj").join("jjq").join("locks");
     assert!(
         primary_locks.join("meta.lock").exists(),
         "meta lock should be in the primary workspace's lock dir: {}",
         primary_locks.display()
     );
-    let secondary_locks = ws_path.join(".jj").join("jjq-locks");
+    let secondary_locks = ws_path.join(".jj").join("jjq").join("locks");
     assert!(
         !secondary_locks.exists(),
         "secondary workspace must not get a private lock dir: {}",
@@ -2242,7 +2267,7 @@ fn test_push_from_secondary_workspace_respects_meta_lock() {
     let ws_path = add_workspace(&repo, &container, "w2");
 
     // Hold the shared metadata lock, as a concurrent writer would
-    let lock_dir = repo.path().join(".jj").join("jjq-locks");
+    let lock_dir = repo.path().join(".jj").join("jjq").join("locks");
     fs::create_dir_all(&lock_dir).unwrap();
     let lock_file = fs::File::create(lock_dir.join("meta.lock")).unwrap();
     lock_file.lock_exclusive().unwrap();
@@ -2743,7 +2768,7 @@ fn repo_with_queued_item_and_held_run_lock() -> (TestRepo, fs::File) {
     run_jj(repo.path(), &["bookmark", "create", "feature"]);
     repo.jjq_success(&["push", "feature"]);
 
-    let lock_dir = repo.path().join(".jj").join("jjq-locks");
+    let lock_dir = repo.path().join(".jj").join("jjq").join("locks");
     fs::create_dir_all(&lock_dir).unwrap();
     let lock_file = fs::File::create(lock_dir.join("run.lock")).unwrap();
     lock_file.lock_exclusive().unwrap();
@@ -2865,7 +2890,7 @@ fn test_push_times_out_when_meta_lock_held() {
     run_jj(repo.path(), &["bookmark", "create", "feature"]);
 
     // Hold the metadata writer lock, as a stuck concurrent writer would
-    let lock_dir = repo.path().join(".jj").join("jjq-locks");
+    let lock_dir = repo.path().join(".jj").join("jjq").join("locks");
     fs::create_dir_all(&lock_dir).unwrap();
     let lock_file = fs::File::create(lock_dir.join("meta.lock")).unwrap();
     lock_file.lock_exclusive().unwrap();
@@ -3299,6 +3324,37 @@ fn test_run_recovers_stale_claim() {
         "no queue/running/failed bookmarks should remain: {}",
         bookmarks
     );
+}
+
+#[test]
+fn test_doctor_reports_legacy_filesystem_state_without_fixing() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    let legacy_locks = repo.path().join(".jj").join("jjq-locks");
+    let legacy_log = repo.path().join(".jj").join("jjq-run.log");
+    fs::create_dir_all(&legacy_locks).unwrap();
+    fs::write(legacy_locks.join("run.lock"), "").unwrap();
+    fs::write(&legacy_log, "stale log").unwrap();
+
+    let out = repo.jjq_success(&["doctor"]);
+    assert!(
+        out.contains("legacy jjq filesystem state"),
+        "doctor should report legacy state: {}",
+        out
+    );
+    assert!(
+        out.contains("jjq clean"),
+        "doctor should point to clean for legacy state: {}",
+        out
+    );
+
+    repo.jjq_success(&["doctor", "--fix"]);
+    assert!(
+        legacy_locks.exists(),
+        "doctor --fix should not remove legacy lock directory"
+    );
+    assert!(legacy_log.exists(), "doctor --fix should not remove legacy log");
 }
 
 #[test]

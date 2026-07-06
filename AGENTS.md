@@ -39,12 +39,17 @@ jjq stores all state in the jj repository itself:
    - `jjq/running/NNNNNN` - Item claimed by the active queue runner; with the run lock free it is a stale claim from a crashed runner (the next run requeues it)
    - `jjq/failed/NNNNNN` - Failed merge attempts
 
-2. **Filesystem locks** - Uses `flock(2)` files in `.jj/jjq-locks/`
+2. **Filesystem locks** - Uses `flock(2)` files in `.jj/jjq/locks/`
    - `run` - Ensures only one queue runner at a time; also held by `clean` for its whole cleanup
    - `meta` - Serializes all writes to the `jjq/_/_` metadata branch (sequence ID allocation, config, workspace records); reads take no lock
    - `check` - Held shared by each `jjq check` for its workspace's lifetime; `clean` probes it exclusively to refuse while a check is active
 
-3. **Isolated branch** - `jjq/_/_` bookmark points to a branch parented to `root()` that holds:
+3. **Filesystem layout** - `.jj/jjq/` is the home for jjq filesystem state under the shared repository `.jj` directory
+   - `locks/` - `flock(2)` lock files shared by all workspaces for the repo
+   - `run.log` - Combined stdout/stderr of the last check command, viewed by `jjq tail`
+   - New filesystem state should live under `.jj/jjq/`, not as a new sibling path in `.jj/`
+
+4. **Isolated branch** - `jjq/_/_` bookmark points to a branch parented to `root()` that holds:
    - `last_id` file - Current sequence ID
    - `config/` directory - User configuration
    - Commit messages serve as operation log (with trailers for structured data)
@@ -91,7 +96,7 @@ jjq stores all state in the jj repository itself:
 ### Concurrency
 
 - `flock(2)` file locks are used as mutexes
-- Lock files stored in `.jj/jjq-locks/` (outside jj's tracked areas), resolved through the shared repo `.jj` directory so invocations from any workspace contend on the same files
+- Lock files stored in `.jj/jjq/locks/` (outside jj's tracked areas), resolved through the shared repo `.jj` directory so invocations from any workspace contend on the same files
 - `run` lock ensures only one queue runner at a time
 - `meta` lock serializes all metadata-branch writes (sequence IDs, config, workspace records); writers wait up to 15s (`JJQ_META_LOCK_TIMEOUT_MS`) before exiting `LOCK_HELD`
 - Metadata reads take no lock: each group of reads pins the `jjq/_/_` bookmark to a single commit and reads every value in the group from that commit

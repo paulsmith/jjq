@@ -16,6 +16,7 @@ use crate::exit_codes::{self, ExitError};
 use crate::jj;
 use crate::lock::{self, Lock};
 use crate::meta;
+use crate::paths;
 use crate::queue;
 
 #[derive(Serialize)]
@@ -1960,6 +1961,22 @@ pub fn doctor(fix: bool) -> Result<()> {
         warns += 1;
     }
 
+    let legacy_paths = legacy_filesystem_state_paths()?;
+    if !legacy_paths.is_empty() {
+        let current_dir = paths::jjq_dir()?;
+        print_check(
+            "info",
+            &format!(
+                "legacy jjq filesystem state found; current state lives in {}",
+                current_dir.display()
+            ),
+        );
+        for path in legacy_paths {
+            print_hint(&format!("legacy path: {}", path.display()));
+        }
+        print_hint("to remove legacy state: jjq clean");
+    }
+
     // Summary
     println!();
     if fails == 0 && warns == 0 {
@@ -2208,6 +2225,36 @@ fn print_hint(msg: &str) {
     println!("       {}", msg);
 }
 
+fn legacy_locks_dir() -> Result<std::path::PathBuf> {
+    Ok(jj::shared_jj_dir()?.join("jjq-locks"))
+}
+
+fn legacy_run_log() -> Result<std::path::PathBuf> {
+    Ok(jj::shared_jj_dir()?.join("jjq-run.log"))
+}
+
+fn legacy_filesystem_state_paths() -> Result<Vec<std::path::PathBuf>> {
+    let paths = [legacy_locks_dir()?, legacy_run_log()?];
+    Ok(paths
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>())
+}
+
+fn remove_legacy_filesystem_state() -> Result<()> {
+    let legacy_locks = legacy_locks_dir()?;
+    if legacy_locks.exists() {
+        fs::remove_dir_all(&legacy_locks)?;
+    }
+
+    let legacy_log = legacy_run_log()?;
+    if legacy_log.exists() {
+        fs::remove_file(&legacy_log)?;
+    }
+
+    Ok(())
+}
+
 /// Remove all jjq workspaces and their directories.
 pub fn clean() -> Result<()> {
     // Hold the run lock for the whole cleanup: an active runner's workspace
@@ -2281,6 +2328,8 @@ pub fn clean() -> Result<()> {
         details.push(format!("  {} ({}){}", ws_name, label, path_info));
         removed += 1;
     }
+
+    remove_legacy_filesystem_state()?;
 
     if removed == 0 {
         prefout("no workspaces to clean");

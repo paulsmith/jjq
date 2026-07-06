@@ -1,6 +1,6 @@
 ---
 name: using-jjq
-description: Use when landing, merging, or pushing changes to trunk (main) in a jj (Jujutsu) repository that uses jjq — signs include .jj/jjq-locks/ existing, jjq/queue or jjq/failed bookmarks, jjq mentioned in project docs, or jjq on PATH. Also use when a change needs to land on main, when a jjq push or run reports a conflict or failed check, or when a queue item needs retrying, deleting, or debugging.
+description: Use when landing, merging, or pushing changes to trunk (main) in a jj (Jujutsu) repository that uses jjq — signs include .jj/jjq/ existing, jjq/queue or jjq/failed bookmarks, jjq mentioned in project docs, or jjq on PATH. Also use when a change needs to land on main, when a jjq push or run reports a conflict or failed check, or when a queue item needs retrying, deleting, or debugging.
 ---
 
 # Using jjq (merge queue for jj)
