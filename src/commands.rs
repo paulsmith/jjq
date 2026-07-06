@@ -744,6 +744,13 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
     record_workspace_metadata(id, runner_workspace.path().to_str().unwrap())?;
 
     let workspace_path = runner_workspace.path().to_path_buf();
+    let failure_context = FailureContext {
+        candidate_change_id: &candidate_change_id,
+        candidate_commit_id: &candidate_commit_id,
+        trunk_commit_id: &trunk_commit_id,
+        workspace_path: &workspace_path,
+        strategy: &strategy,
+    };
 
     // For rebase strategy, edit the duplicate directly so check artifacts
     // are snapshotted into it (workspace add created an empty commit on top)
@@ -765,11 +772,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             &failure_description(
                 id,
                 "conflicts",
-                &candidate_change_id,
-                &candidate_commit_id,
-                &trunk_commit_id,
-                &workspace_path,
-                &strategy,
+                &failure_context,
                 &conflicts,
             ),
         )?;
@@ -851,11 +854,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             &failure_description(
                 id,
                 "check",
-                &candidate_change_id,
-                &candidate_commit_id,
-                &trunk_commit_id,
-                &workspace_path,
-                &strategy,
+                &failure_context,
                 &[],
             ),
         )?;
@@ -1005,26 +1004,30 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
     Ok(RunResult::Success)
 }
 
+struct FailureContext<'a> {
+    candidate_change_id: &'a str,
+    candidate_commit_id: &'a str,
+    trunk_commit_id: &'a str,
+    workspace_path: &'a std::path::Path,
+    strategy: &'a Strategy,
+}
+
 fn failure_description(
     id: u32,
     reason: &str,
-    candidate_change_id: &str,
-    candidate_commit_id: &str,
-    trunk_commit_id: &str,
-    workspace_path: &std::path::Path,
-    strategy: &Strategy,
+    context: &FailureContext<'_>,
     conflict_paths: &[String],
 ) -> String {
     let mut desc = format!(
         "Failed: merge {} ({})\n\njjq-candidate: {}\njjq-candidate-commit: {}\njjq-trunk: {}\njjq-workspace: {}\njjq-failure: {}\njjq-strategy: {}",
         id,
         reason,
-        candidate_change_id,
-        candidate_commit_id,
-        trunk_commit_id,
-        workspace_path.display(),
+        context.candidate_change_id,
+        context.candidate_commit_id,
+        context.trunk_commit_id,
+        context.workspace_path.display(),
         reason,
-        strategy.as_str()
+        context.strategy.as_str()
     );
     if !conflict_paths.is_empty() {
         desc.push_str(&format!("\njjq-conflicts: {}", conflict_paths.join(",")));
