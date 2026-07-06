@@ -548,7 +548,7 @@ pub fn run(all: bool, stop_on_failure: bool) -> Result<()> {
             RunResult::Empty => Ok(()),
             RunResult::Skipped => Ok(()),
             // run_one already reported the failure in detail
-            RunResult::Failure(code) => Err(ExitError::code_only(code).into()),
+            RunResult::Failure => Err(ExitError::code_only(exit_codes::CONFLICT).into()),
         }
     }
 }
@@ -557,7 +557,10 @@ enum RunResult {
     Success,
     Empty,
     Skipped,
-    Failure(i32),
+    /// The item failed (conflict, check failure, trunk moved, or removed
+    /// mid-run). run_one reports the details; in single-run mode this maps
+    /// to exit code CONFLICT.
+    Failure,
 }
 
 fn run_all(run_lock: &Lock, run_config: &RunConfig, stop_on_failure: bool) -> Result<()> {
@@ -576,7 +579,7 @@ fn run_all(run_lock: &Lock, run_config: &RunConfig, stop_on_failure: bool) -> Re
             RunResult::Skipped => {
                 skipped_count += 1;
             }
-            RunResult::Failure(_code) => {
+            RunResult::Failure => {
                 if stop_on_failure {
                     if merged_count > 0 {
                         prefout(&format!(
@@ -768,7 +771,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             candidate_change_id
         ));
         preferr(&format!("  jjq push {}", candidate_change_id));
-        return Ok(RunResult::Failure(exit_codes::CONFLICT));
+        return Ok(RunResult::Failure);
     }
 
     // Check for empty commit (no changes vs trunk).
@@ -844,7 +847,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
         preferr("To resolve:");
         preferr(&format!("  # fix the issue in {}", candidate_change_id));
         preferr(&format!("  jjq push {}", candidate_change_id));
-        return Ok(RunResult::Failure(exit_codes::CONFLICT));
+        return Ok(RunResult::Failure);
     }
 
     // Verify trunk hasn't moved
@@ -863,7 +866,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
         // position so the next run retries it.
         recover_claim(id)?;
         preferr("trunk bookmark moved during run; queue item left in place, re-run to retry");
-        return Ok(RunResult::Failure(exit_codes::CONFLICT));
+        return Ok(RunResult::Failure);
     }
 
     // Pre-land verification: the claim can vanish despite the run lock
@@ -884,7 +887,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             "item {} was removed while being processed; discarding result",
             id
         ));
-        return Ok(RunResult::Failure(exit_codes::CONFLICT));
+        return Ok(RunResult::Failure);
     }
 
     // Success path — order matters for crash safety:

@@ -82,9 +82,12 @@ impl TestRepo {
         TestRepo { dir, path }
     }
 
-    /// Get a jjq Command configured for this repo.
-    fn jjq(&self) -> Command {
-        let mut cmd = Command::new(&*JJQ_BIN);
+    /// Base jjq invocation as a std::process::Command with the shared test
+    /// environment applied. Helpers that need process-level control
+    /// (timeouts, background children) build on this; `jjq()` wraps it for
+    /// assert_cmd assertions.
+    fn jjq_std(&self) -> process::Command {
+        let mut cmd = process::Command::new(&*JJQ_BIN);
         cmd.current_dir(&self.path);
         cmd.env("NON_INTERACTIVE", "1");
         // Speed up jj subprocess calls within jjq
@@ -93,6 +96,11 @@ impl TestRepo {
         cmd.env("GIT_CONFIG_NOSYSTEM", "1");
         cmd.env("HOME", &self.path);
         cmd
+    }
+
+    /// Get a jjq Command configured for this repo.
+    fn jjq(&self) -> Command {
+        Command::from_std(self.jjq_std())
     }
 
     /// Get a jjq Command that runs from the given directory (e.g. a secondary
@@ -185,14 +193,9 @@ impl TestRepo {
     ) -> (String, String, Option<i32>) {
         use std::io::Read;
 
-        let mut child = process::Command::new(&*JJQ_BIN)
-            .current_dir(&self.path)
+        let mut child = self
+            .jjq_std()
             .args(args)
-            .env("NON_INTERACTIVE", "1")
-            .env("JJ_OP_HOSTNAME", "test")
-            .env("JJ_OP_USERNAME", "test")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("HOME", &self.path)
             .stdout(process::Stdio::piped())
             .stderr(process::Stdio::piped())
             .spawn()
@@ -232,13 +235,7 @@ impl TestRepo {
 
     /// Run jjq with additional environment variables.
     fn jjq_with_env(&self, args: &[&str], env_vars: &[(&str, &str)]) -> String {
-        let mut cmd = Command::new(&*JJQ_BIN);
-        cmd.current_dir(&self.path);
-        cmd.env("NON_INTERACTIVE", "1");
-        cmd.env("JJ_OP_HOSTNAME", "test");
-        cmd.env("JJ_OP_USERNAME", "test");
-        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
-        cmd.env("HOME", &self.path);
+        let mut cmd = self.jjq();
         for (key, value) in env_vars {
             cmd.env(key, value);
         }
@@ -254,14 +251,8 @@ impl TestRepo {
     /// Spawn jjq as a background child process with the standard test
     /// environment, stdout/stderr piped. Callers wait via wait_with_output.
     fn spawn_jjq(&self, args: &[&str]) -> process::Child {
-        process::Command::new(&*JJQ_BIN)
-            .current_dir(&self.path)
+        self.jjq_std()
             .args(args)
-            .env("NON_INTERACTIVE", "1")
-            .env("JJ_OP_HOSTNAME", "test")
-            .env("JJ_OP_USERNAME", "test")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("HOME", &self.path)
             .stdout(process::Stdio::piped())
             .stderr(process::Stdio::piped())
             .spawn()
@@ -2155,13 +2146,13 @@ fn test_status_shows_recently_landed_rebase() {
     ");
 }
 
-/// Add a secondary workspace named `w2` to the repo, returning its root path.
+/// Add a secondary workspace with the given name, returning its root path.
 /// The workspace directory is created inside `container` so it outlives the call.
-fn add_secondary_workspace(repo: &TestRepo, container: &TempDir) -> PathBuf {
-    let ws_path = container.path().join("w2");
+fn add_workspace(repo: &TestRepo, container: &TempDir, name: &str) -> PathBuf {
+    let ws_path = container.path().join(name);
     run_jj(
         repo.path(),
-        &["workspace", "add", "--name", "w2", ws_path.to_str().unwrap()],
+        &["workspace", "add", "--name", name, ws_path.to_str().unwrap()],
     );
     ws_path
 }
@@ -2177,7 +2168,7 @@ fn test_push_from_secondary_workspace_uses_shared_locks() {
     run_jj(repo.path(), &["bookmark", "create", "feature"]);
 
     let container = TempDir::new().expect("failed to create workspace container");
-    let ws_path = add_secondary_workspace(&repo, &container);
+    let ws_path = add_workspace(&repo, &container, "w2");
 
     let output = repo
         .jjq_in(&ws_path)
@@ -2237,7 +2228,7 @@ fn test_push_from_secondary_workspace_respects_meta_lock() {
     run_jj(repo.path(), &["bookmark", "create", "feature"]);
 
     let container = TempDir::new().expect("failed to create workspace container");
-    let ws_path = add_secondary_workspace(&repo, &container);
+    let ws_path = add_workspace(&repo, &container, "w2");
 
     // Hold the shared metadata lock, as a concurrent writer would
     let lock_dir = repo.path().join(".jj").join("jjq-locks");
@@ -2276,6 +2267,194 @@ fn test_push_from_secondary_workspace_respects_meta_lock() {
         bookmarks.trim().is_empty(),
         "no queue entry should be created while the meta lock is held: {}",
         bookmarks
+    );
+}
+
+/// Spawn a `jjq push` child in `dir` with a generous metadata lock timeout,
+/// so a loaded test machine cannot turn ordinary lock waiting into a
+/// spurious exit 3. Callers wait via wait_with_output.
+fn spawn_push(repo: &TestRepo, dir: &Path, revset: &str) -> process::Child {
+    let mut cmd = repo.jjq_std();
+    cmd.current_dir(dir)
+        .env("JJQ_META_LOCK_TIMEOUT_MS", "60000")
+        .args(["push", revset])
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped());
+    cmd.spawn().expect("failed to spawn jjq push")
+}
+
+/// Queue bookmark names in the repo, sorted. `jj bookmark list -r` returns
+/// every bookmark on the matched commits (including the user's own), hence
+/// the name filter.
+fn queue_bookmark_names(repo: &TestRepo) -> Vec<String> {
+    let out = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/queue/??????\")",
+            "-T",
+            "name ++ \"\\n\"",
+        ],
+    );
+    let mut names: Vec<String> = out
+        .lines()
+        .filter(|l| l.starts_with("jjq/queue/"))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Assert no bookmark in the repo is conflicted (racing metadata writers
+/// used to conflict jjq/_/_).
+fn assert_no_conflicted_bookmarks(repo: &TestRepo) {
+    let all = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-T",
+            "name ++ if(conflict, \" CONFLICTED\") ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        !all.to_lowercase().contains("conflicted"),
+        "no bookmark should be conflicted: {}",
+        all
+    );
+}
+
+/// The sequence counter on the metadata branch.
+fn meta_last_id(repo: &TestRepo) -> String {
+    run_jj(
+        repo.path(),
+        &["file", "show", "last_id", "-r", "bookmarks(exact:\"jjq/_/_\")"],
+    )
+    .trim()
+    .to_string()
+}
+
+/// THE regression test for the original metadata corruption: two pushes
+/// racing from two workspaces used to allocate the same sequence ID and
+/// conflict the metadata bookmark. The blocking meta lock serializes them —
+/// the loser waits instead of failing — so simply spawning both and waiting
+/// is deterministic; no sleeps needed.
+#[test]
+fn test_concurrent_pushes_from_two_workspaces() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    // Two distinct changes to push.
+    run_jj(repo.path(), &["new", "-m", "feature a", "main"]);
+    fs::write(repo.path().join("a.txt"), "content a").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "fa"]);
+    run_jj(repo.path(), &["new", "-m", "feature b", "main"]);
+    fs::write(repo.path().join("b.txt"), "content b").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "fb"]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    let container = TempDir::new().expect("failed to create workspace container");
+    let ws_a = add_workspace(&repo, &container, "wa");
+    let ws_b = add_workspace(&repo, &container, "wb");
+
+    let child_a = spawn_push(&repo, &ws_a, "fa");
+    let child_b = spawn_push(&repo, &ws_b, "fb");
+
+    let out_a = child_a.wait_with_output().expect("failed to wait for push a");
+    let out_b = child_b.wait_with_output().expect("failed to wait for push b");
+    for (name, out) in [("fa", &out_a), ("fb", &out_b)] {
+        assert!(
+            out.status.success(),
+            "push {} should succeed (exit {:?}); stdout: {} stderr: {}",
+            name,
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    assert_eq!(
+        queue_bookmark_names(&repo),
+        vec!["jjq/queue/000001", "jjq/queue/000002"],
+        "racing pushes must allocate unique consecutive sequence IDs"
+    );
+    assert_no_conflicted_bookmarks(&repo);
+    assert_eq!(
+        meta_last_id(&repo),
+        "2",
+        "sequence counter should equal the number of pushes"
+    );
+}
+
+/// Push storm: six distinct changes pushed from three workspaces
+/// concurrently — three parallel streams of two sequential pushes each.
+/// Pushes within one workspace are sequential because jj itself does not
+/// support concurrent commands mutating a single working copy (racing
+/// snapshots diverge the workspace's operation pointer, failing with a
+/// "sibling operation" error independent of jjq's locking). Ignored by
+/// default because it spawns many concurrent jj processes; run it manually
+/// with:
+///   cargo test -- --ignored stress_concurrent_push_storm
+#[test]
+#[ignore = "manual stress test; run with: cargo test -- --ignored stress_concurrent_push_storm"]
+fn stress_concurrent_push_storm() {
+    const WORKSPACES: usize = 3;
+    const PUSHES_PER_WORKSPACE: usize = 2;
+    const N: usize = WORKSPACES * PUSHES_PER_WORKSPACE;
+
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    for i in 0..N {
+        run_jj(
+            repo.path(),
+            &["new", "-m", &format!("storm feature {}", i), "main"],
+        );
+        fs::write(repo.path().join(format!("storm-{}.txt", i)), "content").unwrap();
+        run_jj(repo.path(), &["bookmark", "create", &format!("storm-{}", i)]);
+    }
+    run_jj(repo.path(), &["new", "main"]);
+
+    let container = TempDir::new().expect("failed to create workspace container");
+    let workspaces: Vec<PathBuf> = (0..WORKSPACES)
+        .map(|i| add_workspace(&repo, &container, &format!("storm-ws-{}", i)))
+        .collect();
+
+    std::thread::scope(|scope| {
+        for (w, ws_path) in workspaces.iter().enumerate() {
+            let repo = &repo;
+            scope.spawn(move || {
+                for k in 0..PUSHES_PER_WORKSPACE {
+                    let i = w + k * WORKSPACES;
+                    let child = spawn_push(repo, ws_path, &format!("storm-{}", i));
+                    let out = child.wait_with_output().expect("failed to wait for push");
+                    assert!(
+                        out.status.success(),
+                        "storm push {} should succeed (exit {:?}); stdout: {} stderr: {}",
+                        i,
+                        out.status.code(),
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr),
+                    );
+                }
+            });
+        }
+    });
+
+    // Contiguous unique ID set 1..=N, all still queued.
+    let expected: Vec<String> = (1..=N).map(|id| format!("jjq/queue/{:06}", id)).collect();
+    assert_eq!(
+        queue_bookmark_names(&repo),
+        expected,
+        "storm pushes must allocate a contiguous unique sequence ID set"
+    );
+    assert_no_conflicted_bookmarks(&repo);
+    assert_eq!(
+        meta_last_id(&repo),
+        N.to_string(),
+        "sequence counter should equal the number of pushes"
     );
 }
 

@@ -1,6 +1,6 @@
 .\" ABOUTME: Man page for jjq, a local merge queue for jj (Jujutsu VCS).
 .\" ABOUTME: Covers all commands, configuration, data model, and workflows.
-.TH JJQ 1 "2026-02-04" "jjq" "General Commands Manual"
+.TH JJQ 1 "2026-07-05" "jjq" "General Commands Manual"
 .SH NAME
 jjq \- local merge queue for jj
 .SH SYNOPSIS
@@ -30,12 +30,16 @@ jjq \- local merge queue for jj
 .RB [ \-\-resolve
 .IR change_id ]
 .br
+.B jjq requeue
+.I id
+.br
 .B jjq delete
 .I id
 .br
 .B jjq clean
 .br
 .B jjq doctor
+.RB [ \-\-fix ]
 .br
 .B jjq config
 .RI [ key
@@ -114,8 +118,17 @@ jjq push abc123         # queue by change ID
 .RE
 .SS run \fR[\fB\-\-all\fR] [\fB\-\-stop-on-failure\fR]
 Process the next queued item.
-Creates a temporary jj workspace to test the candidate against trunk,
+Claims the item by renaming its bookmark from
+.BI jjq/queue/ NNNNNN
+to
+.BI jjq/running/ NNNNNN ,
+creates a temporary jj workspace to test the candidate against trunk,
 then runs the configured check command inside it.
+While claimed, the item shows under \(lqRunning\(rq in
+.B jjq status
+and cannot be deleted or requeued.
+A claim left behind by a crashed runner is recovered back to its queue
+position on the next run.
 .PP
 On success, the trunk bookmark advances and the
 temporary workspace is cleaned up.
@@ -135,8 +148,9 @@ processing continues unless
 is set. Reports the count of successes and failures.
 .PP
 Returns 0 if all processed items succeeded (or the queue was empty). Returns 2
-if any items failed. Returns 1 if the run lock is unavailable, a conflict is
-detected, or trunk moved during processing.
+if any items failed. Returns 1 if another queue runner is active, the check
+command is not configured, a conflict is detected, or trunk moved during
+processing.
 .SS check \fR[\fB\-\-rev \fIrevset\fR] [\fB\-v\fR]
 Run the configured check command against a revision in a temporary
 workspace without any queue processing.
@@ -162,18 +176,20 @@ and recent failures (descending by sequence ID).
 Each entry shows its sequence ID, change ID prefix, and first line of
 the commit description.
 .PP
-Also indicates if a run lock is currently held (another
-.B jjq run
-is in progress).
+Also indicates whether a queue runner is active and lists any item it
+has claimed under \(lqRunning\(rq.
 .PP
 With
 .BR \-\-json ,
-outputs structured JSON with
+outputs structured JSON with a
+.B runner_active
+boolean plus
 .BR running ,
 .BR queue ,
+.BR failed ,
 and
-.B failed
-fields.
+.B landed
+arrays.
 Queue items include
 .BR change_id ,
 .BR commit_id ,
@@ -199,6 +215,14 @@ looks up an item by its candidate change ID.
 and
 .B \-\-resolve
 are mutually exclusive.
+.SS requeue \fIid\fR
+Re\-push a failed item back onto the queue under a new sequence ID.
+Runs the same pre\-flight conflict check as
+.B push
+and clears the failed entry and its workspace on success.
+A shortcut for retrying an item without changes; use
+.B jjq push
+after fixing the revision instead.
 .SS delete \fIid\fR
 Remove an item from the queue or the failed list by its sequence ID. The
 sequence ID is the number shown in
@@ -206,12 +230,17 @@ sequence ID is the number shown in
 output and
 .B push
 confirmation messages.
+An item claimed by an active queue runner cannot be deleted until the
+run finishes; a stale claim left by a crashed runner is removed along
+with its leftover workspace.
 .SS clean
-Remove jjq workspaces left behind by failed merges. Removes all directories
-named like
-.BR jjq-run-XXXXXX .
-Safe to run at any time \(em only removes jjq-owned workspaces, never user
-workspaces.
+Remove jjq workspaces left behind by failed merges. Removes only the exact
+workspace names jjq generates (such as
+.BR jjq-run-XXXXXX ),
+never user workspaces.
+Refuses to run while a queue runner or a
+.B jjq check
+is active, so live workspaces are never destroyed mid\-check.
 .SS tail \fR[\fB\-\-all\fR] [\fB\-\-no-follow\fR]
 View the check command output stored in
 .IR .jj/jjq-run.log .
@@ -223,16 +252,24 @@ shows from the beginning. With
 dumps once and exits.
 .SS quickstart
 Print a brief quickstart guide for LLM agents.
-.SS doctor
+.SS doctor \fR[\fB\-\-fix\fR]
 Validate that the jjq environment is correctly configured.
-Checks the trunk bookmark, check command, lock state, and workspace
-preconditions.
+Checks the trunk bookmark, check command, sequence counter, conflicted
+jjq bookmarks, lock state, stale claims, and workspace preconditions.
 Each check is reported as
 .BR ok ,
 .BR WARN ,
 or
 .BR FAIL .
 When a check fails, a suggested fix is shown.
+.PP
+With
+.BR \-\-fix ,
+repairs a conflicted jjq metadata bookmark before running the checks:
+the conflict side with the highest sequence counter is kept, so no
+sequence IDs are ever reused.
+Conflicted queue or failed bookmarks point at user commits and are never
+repaired automatically.
 .PP
 Exits 0 if no failures are found (warnings are tolerated).
 Exits 1 if any check fails.
@@ -276,14 +313,16 @@ Success.
 .TP
 .B 1
 Conflict during push or run, check failure in single-run mode, trunk moved, or
-run lock unavailable.
+another queue runner is active.
 .TP
 .B 2
 Partial batch run: at least one item failed while processing
 .BR "jjq run --all" .
 .TP
 .B 3
-Sequence ID allocation lock held (another push in progress).
+Metadata lock timeout: a concurrent jjq process held the metadata lock
+past the wait deadline (see
+.BR ENVIRONMENT ).
 .TP
 .B 10
 Usage error. Bad arguments, ambiguous revset, duplicate push of the exact same
@@ -310,26 +349,41 @@ will refuse to process items.
 .B jjq
 uses flock\-based file locks in
 .I .jj/jjq\-locks/
-to coordinate concurrent access.
+under the shared repository directory, so invocations from any jj
+workspace contend on the same locks.
 Locks are released automatically by the OS when the holding process
 exits, so stale locks cannot occur.
-.TP
-.B id
-Protects sequence ID allocation (brief, during push).
-.TP
-.B config
-Protects configuration reads and writes.
 .TP
 .B run
 Ensures only one
 .B jjq run
 processes the queue at a time.
+A second runner exits immediately with code 1
+(\(lqanother queue runner is active\(rq).
+.TP
+.B meta
+Serializes all writes to the metadata branch: sequence ID allocation,
+configuration, and workspace records.
+Writers wait for a concurrent writer to finish (concurrent pushes
+serialize) and exit with code 3 only after the timeout.
+Reads take no lock; each command pins one metadata commit and reads
+every value from it.
+.TP
+.B check
+Held shared by each
+.B jjq check
+for its workspace's lifetime; concurrent checks coexist, while
+.B jjq clean
+probes the lock exclusively and refuses while any check is active.
 .SH DATA MODEL
 Queue items are jj bookmarks named
 .BI jjq/queue/ NNNNNN
 where
 .I NNNNNN
 is a zero\-padded sequence ID.
+The item claimed by an active queue runner is renamed to
+.BI jjq/running/ NNNNNN
+for the duration of its run.
 Failed items use
 .BI jjq/failed/ NNNNNN .
 The metadata branch at
@@ -396,6 +450,12 @@ It invokes
 .B jj
 as a subprocess and expects it to be on
 .BR PATH .
+.TP
+.B JJQ_META_LOCK_TIMEOUT_MS
+How long a metadata writer waits for the
+.B meta
+lock before exiting with code 3.
+Defaults to 15000 (15 seconds).
 .SH TIPS
 .B jjq init
 automatically configures
@@ -405,7 +465,7 @@ For repositories initialized before this feature, run:
 .PP
 .RS
 .nf
-jj config set \-\-repo revsets.log '~ ::jjq/_/_'
+jj config set \-\-repo revsets.log '~ ::bookmarks(exact:"jjq/_/_")'
 .fi
 .RE
 .PP

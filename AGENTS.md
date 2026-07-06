@@ -25,8 +25,8 @@ jjq run       # land it on main
 
 - `src/` - root of the Rust implementation
 - `tests/e2e.rs` - end-to-end integration tests (insta snapshots)
-- `docs/README.md` - high-level overview
-- `docs/specification.md` - RFC-style specification
+- `docs/README.md` - high-level overview and design specification
+- `docs/jjq.1` - man page (roff source); `docs/jjq.1.txt` is generated from it via `mandoc -Tascii -O width=78 docs/jjq.1 > docs/jjq.1.txt`
 
 ## Architecture
 
@@ -62,7 +62,7 @@ jjq stores all state in the jj repository itself:
 | `delete <id>` | Remove item from queue/failed; refuses an item being processed by an active runner (removes stale claims when the run lock is free) |
 | `config [key] [value]` | Get/set configuration |
 | `clean` | Remove all jjq-generated workspaces; refuses while a run or check is active |
-| `doctor` | Validate config, locks, and workspace preconditions |
+| `doctor [--fix]` | Validate config, conflicted jjq bookmarks, sequence counter, locks, stale claims, and workspace preconditions; `--fix` repairs a conflicted metadata bookmark (keeps the side with the highest `last_id`) |
 | `tail [--all] [--no-follow]` | View the last check output (with optional follow) |
 | `quickstart` | Print a short guide for LLM agents |
 
@@ -90,7 +90,7 @@ jjq stores all state in the jj repository itself:
 ### Concurrency
 
 - `flock(2)` file locks are used as mutexes
-- Lock files stored in `.jj/jjq-locks/` (outside jj's tracked areas)
+- Lock files stored in `.jj/jjq-locks/` (outside jj's tracked areas), resolved through the shared repo `.jj` directory so invocations from any workspace contend on the same files
 - `run` lock ensures only one queue runner at a time
 - `meta` lock serializes all metadata-branch writes (sequence IDs, config, workspace records); writers wait up to 15s (`JJQ_META_LOCK_TIMEOUT_MS`) before exiting `LOCK_HELD`
 - Metadata reads take no lock: each group of reads pins the `jjq/_/_` bookmark to a single commit and reads every value in the group from that commit
@@ -103,6 +103,7 @@ When running in batch mode, jjq processes items in sequence:
 - Failed items are recorded and processing continues unless `--stop-on-failure` is set
 - Summary reports merged and failed counts
 - Exits 0 if all items merged or queue was empty; exits 2 (`PARTIAL`) if any items failed
+- Exits 1 up front — even with an empty queue — when another runner is active or `check_command` is not configured
 
 ## Testing
 

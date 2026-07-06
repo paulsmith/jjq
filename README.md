@@ -187,6 +187,7 @@ jjq stores its state in your jj repository using bookmarks and an isolated
 branch:
 
 - Queue items: `jjq/queue/000001`, `jjq/queue/000002`, ...
+- Running item: `jjq/running/000001` (claimed by an active queue runner)
 - Failed items: `jjq/failed/000001`, ...
 - Metadata branch: `jjq/_/_` (parented to `root()`)
 
@@ -194,7 +195,7 @@ branch:
 For repositories initialized before this feature, run:
 
 ```sh
-jj config set --repo revsets.log '~ ::jjq/_/_'
+jj config set --repo revsets.log '~ ::bookmarks(exact:"jjq/_/_")'
 ```
 
 ## Configuration

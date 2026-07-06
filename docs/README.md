@@ -195,7 +195,7 @@ from `jj log` by adding:
 
 ```
 [revsets]
-log = "~ ::jjq/_/_"
+log = '~ ::bookmarks(exact:"jjq/_/_")'
 ```
 
 to the repo's local config.toml. Note that the bookmark `jjq/_/_` is a special

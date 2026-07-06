@@ -32,10 +32,20 @@ RESOLVING FAILURES
     4. jjq push <your-rev>   Re-push (automatically clears the failed entry)
   Or, to retry without changes: jjq requeue <id>
 
+AFTER A RUN LANDS ITEMS
+  A jj workspace whose working copy sat on a landed change goes stale:
+  every jj command there errors until you run, in that workspace:
+    jj workspace update-stale
+  If your jj commands suddenly fail after a merge, run this first.
+
 THINGS TO KNOW
   - Push resolves a jj revset to one revision and queues it by change ID
   - Queue is processed FIFO; each item gets a temporary workspace
   - Re-pushing the same change ID replaces its queue/failed entry
+  - Concurrent pushes are safe: they serialize on a metadata lock, so a
+    push may wait briefly; it exits 3 only after a 15s timeout
+  - The item being processed shows under "Running:" in status; it cannot
+    be deleted or requeued while a runner is active
   - Use 'jjq check @' to test before pushing — catches conflicts early
   - Status shows recently landed items and conflicting file paths for failures
   - Failure output shows concrete jj commands with your actual change IDs
