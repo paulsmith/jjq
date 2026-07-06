@@ -91,6 +91,29 @@ jjq push @      # push current revision
 jjq push abc    # push revision by change ID
 ```
 
+Common push choices:
+
+```sh
+jjq push @       # queue the working-copy commit
+jjq push @-      # queue the parent of an empty working-copy commit
+jjq push feature # queue the tip of a named workspace or bookmark
+```
+
+For a stack of related revisions, push the tip revision as one queue item.
+`jjq push` accepts a revset that resolves to one revision, so do not push a
+range like `base::tip`. If `feature` points at the final meaningful revision in
+a stack, `jjq push feature` queues the whole branch of changes ending there.
+
+With the default `rebase` strategy, jjq tests the branch from trunk to that tip
+and then rebases the branch onto the latest trunk before moving the trunk
+bookmark. With the `merge` strategy, jjq creates a merge commit with the current
+trunk and the queued tip as parents.
+
+If your current `@` is only an empty parking commit above the finished stack,
+prefer `jjq push @-` or a bookmark/workspace name that points at the stack tip.
+Pushing the empty `@` can still include the ancestor changes, but the queued
+revision itself is the empty tip.
+
 ### Run the queue
 
 Process the next item in the queue:
