@@ -260,8 +260,10 @@ history of jjq's operation.
 
 ### Check output
 
-jjq writes the check command's combined stdout/stderr to `.jj/jjq/run.log` and
-provides `jjq tail` to view it (optionally following updates during a run).
+jjq writes the latest check command's combined stdout/stderr to
+`.jj/jjq/run.log` and provides `jjq tail` to view it (optionally following
+updates during a run). Failed queue-item checks are archived by sequence ID;
+`jjq tail <id>` views that item's output.
 
 ### Deleting queued and failed items.
 

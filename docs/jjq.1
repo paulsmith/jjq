@@ -46,6 +46,7 @@ jjq \- local merge queue for jj
 .RI [ value ]]
 .br
 .B jjq tail
+.RI [ id ]
 .RB [ \-\-all ]
 .RB [ \-\-no-follow ]
 .br
@@ -256,9 +257,13 @@ never user workspaces.
 Refuses to run while a queue runner or a
 .B jjq check
 is active, so live workspaces are never destroyed mid\-check.
-.SS tail \fR[\fB\-\-all\fR] [\fB\-\-no-follow\fR]
-View the check command output stored in
+.SS tail \fR[\fIid\fR] [\fB\-\-all\fR] [\fB\-\-no-follow\fR]
+View the latest check command output stored in
 .IR .jj/jjq/run.log .
+When an
+.I id
+is given, view the archived check output for that failed queue item from
+.IR .jj/jjq/failed-logs/NNNNNN.log .
 By default shows the last 20 lines and follows until a sentinel line is seen.
 With
 .B \-\-all

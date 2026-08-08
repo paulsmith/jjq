@@ -10,11 +10,19 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 /// In dump mode (`!follow`), prints existing log content and exits.
 /// In follow mode, prints initial content then polls for new lines until
 /// a sentinel or runner exit is detected.
-pub fn tail(all: bool, follow: bool) -> Result<()> {
-    let path = crate::runlog::log_path()?;
+pub fn tail(id: Option<&str>, all: bool, follow: bool) -> Result<()> {
+    let id = id.map(crate::queue::parse_seq_id).transpose()?;
+    let path = match id {
+        Some(id) => crate::runlog::failed_log_path(id)?,
+        None => crate::runlog::log_path()?,
+    };
 
     if !path.exists() {
-        eprintln!("jjq: no run output available");
+        if let Some(id) = id {
+            eprintln!("jjq: no failed check output available for item {}", id);
+        } else {
+            eprintln!("jjq: no run output available");
+        }
         return Ok(());
     }
 

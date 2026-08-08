@@ -14,7 +14,7 @@ SSYYNNOOPPSSIISS
        jjjjqq cclleeaann
        jjjjqq ddooccttoorr [----ffiixx]
        jjjjqq ccoonnffiigg [_k_e_y [_v_a_l_u_e]]
-       jjjjqq ttaaiill [----aallll] [----nnoo--ffoollllooww]
+       jjjjqq ttaaiill [_i_d] [----aallll] [----nnoo--ffoollllooww]
        jjjjqq qquuiicckkssttaarrtt
 
 DDEESSCCRRIIPPTTIIOONN
@@ -153,11 +153,12 @@ CCOOMMMMAANNDDSS
        user workspaces.  Refuses to run while a queue runner or a jjjjqq cchheecckk is
        active, so live workspaces are never destroyed mid-check.
 
-   ttaaiill [----aallll] [----nnoo--ffoollllooww]
-       View the check command output stored in _._j_j_/_j_j_q_/_r_u_n_._l_o_g.  By default
-       shows the last 20 lines and follows until a sentinel line is seen.
-       With ----aallll shows from the beginning. With ----nnoo--ffoollllooww dumps once and
-       exits.
+   ttaaiill [_i_d] [----aallll] [----nnoo--ffoollllooww]
+       View the latest check command output stored in _._j_j_/_j_j_q_/_r_u_n_._l_o_g.  When
+       an _i_d is given, view the archived check output for that failed queue
+       item from _._j_j_/_j_j_q_/_f_a_i_l_e_d_-_l_o_g_s_/_N_N_N_N_N_N_._l_o_g.  By default shows the last 20
+       lines and follows until a sentinel line is seen.  With ----aallll shows from
+       the beginning. With ----nnoo--ffoollllooww dumps once and exits.
 
    qquuiicckkssttaarrtt
        Print a brief quickstart guide for LLM agents.

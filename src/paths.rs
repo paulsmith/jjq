@@ -19,3 +19,10 @@ pub fn locks_dir() -> Result<PathBuf> {
 pub fn run_log() -> Result<PathBuf> {
     Ok(jjq_dir()?.join("run.log"))
 }
+
+/// Path to the archived check output for a failed queue item.
+pub fn failed_log(id: u32) -> Result<PathBuf> {
+    Ok(jjq_dir()?
+        .join("failed-logs")
+        .join(format!("{:06}.log", id)))
+}

@@ -945,6 +945,8 @@ fn test_delete_failed() {
 
     // Run to create failed item
     repo.jjq_failure(&["run"]);
+    let failed_log = repo.path().join(".jj/jjq/failed-logs/000001.log");
+    assert!(failed_log.exists(), "failed check log should be archived");
 
     let status_before = repo.jjq_success(&["status"]);
     insta::assert_snapshot!(status_before, @r"
@@ -957,6 +959,10 @@ fn test_delete_failed() {
     jjq: deleted failed item 1
     jjq: removed workspace <TEMP_PATH>
     ");
+    assert!(
+        !failed_log.exists(),
+        "delete should remove the archived log"
+    );
 
     let status_after = repo.jjq_success(&["status"]);
     insta::assert_snapshot!(status_after, @"jjq: queue is empty");
@@ -1293,6 +1299,8 @@ fn test_push_idempotent_clears_failed() {
 
     // Run to create failed item
     repo.jjq_failure(&["run"]);
+    let failed_log = repo.path().join(".jj/jjq/failed-logs/000001.log");
+    assert!(failed_log.exists(), "failed check log should be archived");
 
     // Verify failed item exists
     let status = repo.jjq_success(&["status"]);
@@ -1312,6 +1320,10 @@ fn test_push_idempotent_clears_failed() {
         repush.contains("clearing failed entry"),
         "should clear failed entry: {}",
         repush
+    );
+    assert!(
+        !failed_log.exists(),
+        "idempotent push should remove the archived log"
     );
 }
 
@@ -1674,6 +1686,42 @@ fn test_tail_all_flag() {
     assert!(output.contains("line1"), "should show all output: {}", output);
     assert!(output.contains("line2"), "should show all output: {}", output);
     assert!(output.contains("line3"), "should show all output: {}", output);
+}
+
+#[test]
+fn test_tail_failed_item_after_batch_continues() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    repo.init_jjq_merge_with_check(
+        "if [ -f f1.txt ]; then echo failed-item-marker; exit 1; else echo landed-item-marker; fi",
+    );
+
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+    repo.jjq().args(["run", "--all"]).assert().code(2);
+
+    let latest = repo.jjq_success(&["tail", "--all", "--no-follow"]);
+    assert!(
+        latest.contains("landed-item-marker"),
+        "latest output: {}",
+        latest
+    );
+    assert!(
+        !latest.contains("failed-item-marker"),
+        "latest output should only contain item 2: {}",
+        latest
+    );
+
+    let failed = repo.jjq_success(&["tail", "1", "--all", "--no-follow"]);
+    assert!(
+        failed.contains("failed-item-marker"),
+        "failed output: {}",
+        failed
+    );
+    assert!(
+        !failed.contains("landed-item-marker"),
+        "archived output should only contain item 1: {}",
+        failed
+    );
 }
 
 #[test]
@@ -2069,6 +2117,8 @@ fn test_requeue_basic() {
 
     // Run — fails because check command is "false"
     repo.jjq_output(&["run"]);
+    let failed_log = repo.path().join(".jj/jjq/failed-logs/000001.log");
+    assert!(failed_log.exists(), "failed check log should be archived");
 
     // Verify item 1 is in failed state
     let status = repo.jjq_success(&["status"]);
@@ -2080,6 +2130,10 @@ fn test_requeue_basic() {
     // Requeue the failed item
     let output = repo.jjq_success(&["requeue", "1"]);
     insta::assert_snapshot!(output, @"jjq: requeued failed item 1 as 2 (trunk: main in <REPO>)");
+    assert!(
+        !failed_log.exists(),
+        "requeue should remove the archived log"
+    );
 
     // Status should show the item back in queue, no failed items
     let status = repo.jjq_success(&["status"]);

@@ -98,6 +98,8 @@ enum Commands {
     },
     /// View check command output
     Tail {
+        /// Sequence ID of a failed item whose archived output to view
+        id: Option<String>,
         /// Show output from the beginning (default: last 20 lines)
         #[arg(long)]
         all: bool,
@@ -157,7 +159,11 @@ fn run() -> Result<()> {
         Commands::Clean => commands::clean(),
         Commands::Doctor { fix } => commands::doctor(fix),
         Commands::Config { key, value } => commands::config(key.as_deref(), value.as_deref()),
-        Commands::Tail { all, no_follow } => tail::tail(all, !no_follow),
+        Commands::Tail {
+            id,
+            all,
+            no_follow,
+        } => tail::tail(id.as_deref(), all, !no_follow),
         Commands::Quickstart => unreachable!(),
     }
 }

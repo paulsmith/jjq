@@ -172,6 +172,12 @@ fn cleanup_run_workspace(id: u32) {
     }
 }
 
+/// Delete a failed bookmark and its archived check output.
+fn remove_failed_entry(id: u32) -> Result<()> {
+    jj::bookmark_delete(&queue::failed_bookmark(id))?;
+    crate::runlog::remove_failed(id)
+}
+
 /// Record workspace path in metadata for later recovery by delete/clean.
 /// Called while holding the run lock; takes the meta lock inside (run → meta,
 /// never the reverse — see src/meta.rs).
@@ -447,7 +453,7 @@ pub fn push(revset: &str) -> Result<()> {
         if let Some(candidate_change_id) = trailers.get("candidate")
             && *candidate_change_id == change_id
         {
-            jj::bookmark_delete(&bookmark)?;
+            remove_failed_entry(entry_id)?;
             prefout(&format!("clearing failed entry {}", entry_id));
         }
     }
@@ -844,6 +850,8 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
                 }
             }
         }
+
+        crate::runlog::archive_failed(id, &log_path)?;
 
         // Failed entry before claim delete: a crash between the two
         // duplicates the item instead of losing it.
@@ -1575,7 +1583,7 @@ pub fn requeue(id_str: &str) -> Result<()> {
     let run_name = format!("jjq-run-{}", padded);
     let workspace_path = lookup_workspace_path(id);
 
-    jj::bookmark_delete(&queue::failed_bookmark(id))?;
+    remove_failed_entry(id)?;
     let _ = jj::workspace_forget(&run_name);
 
     if let Some(ref path) = workspace_path {
@@ -1655,7 +1663,7 @@ pub fn delete(id_str: &str) -> Result<()> {
         // Look up workspace path before deleting
         let workspace_path = lookup_workspace_path(id);
 
-        jj::bookmark_delete(&queue::failed_bookmark(id))?;
+        remove_failed_entry(id)?;
         prefout(&format!("deleted failed item {}", id));
 
         // Try to forget the workspace (silently ignore if not found)

@@ -191,7 +191,8 @@ View recent check output (tail the log):
 
 ```sh
 jjq tail               # last 20 lines; follows by default
-jjq tail --all         # from the beginning
+jjq tail --all         # latest check output from the beginning
+jjq tail 1 --all       # archived output for failed item 1
 jjq tail --no-follow   # dump once and exit
 ```
 
