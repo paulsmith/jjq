@@ -2,6 +2,7 @@
 // ABOUTME: Provides functions to execute jj commands and parse their output.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -9,9 +10,11 @@ use std::sync::OnceLock;
 
 /// Get a jj config value, returning None if not set.
 pub fn config_get(key: &str) -> Result<Option<String>> {
-    let output = run(&["config", "get", key])?;
+    let output = run_ignore_working_copy(&["config", "get", key])?;
     if output.status.success() {
-        Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()))
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
     } else {
         Ok(None)
     }
@@ -25,6 +28,16 @@ pub fn config_set_repo(key: &str, value: &str) -> Result<()> {
 /// Execute a jj command from the process working directory.
 pub fn run(args: &[&str]) -> Result<Output> {
     run_from(None, args)
+}
+
+/// Execute a jj command without snapshotting or updating the current working
+/// copy. Use only for repository/config reads whose arguments are independent
+/// of working-copy contents (for example, pinned commit IDs and bookmark
+/// inventories). Candidate revsets such as `@` must continue through `run`.
+pub fn run_ignore_working_copy(args: &[&str]) -> Result<Output> {
+    let mut full = vec!["--ignore-working-copy"];
+    full.extend_from_slice(args);
+    run(&full)
 }
 
 /// Execute a jj command with `dir` as its working directory. jj snapshots
@@ -62,6 +75,11 @@ pub fn run_ok(args: &[&str]) -> Result<String> {
     expect_success(args, run(args)?)
 }
 
+/// `run_ok` for reads which are provably independent of working-copy state.
+pub fn run_ok_ignore_working_copy(args: &[&str]) -> Result<String> {
+    expect_success(args, run_ignore_working_copy(args)?)
+}
+
 /// `run_ok` with `dir` as the command's working directory.
 pub fn run_ok_in(dir: &Path, args: &[&str]) -> Result<String> {
     expect_success(args, run_in(dir, args)?)
@@ -70,6 +88,12 @@ pub fn run_ok_in(dir: &Path, args: &[&str]) -> Result<String> {
 /// Execute a jj command silently, only returning error on failure.
 pub fn run_quiet(args: &[&str]) -> Result<()> {
     run_ok(args).map(|_| ())
+}
+
+/// `run_quiet` for mutations whose operands are independent of working-copy
+/// state and have already been resolved or name exact internal bookmarks.
+pub fn run_quiet_ignore_working_copy(args: &[&str]) -> Result<()> {
+    run_ok_ignore_working_copy(args).map(|_| ())
 }
 
 /// Per-invocation config override disabling jj's short-prefixes index. jj
@@ -203,7 +227,7 @@ pub fn primary_workspace_root() -> Result<PathBuf> {
 
 /// Check if a bookmark exists.
 pub fn bookmark_exists(name: &str) -> Result<bool> {
-    let output = run_ok(&[
+    let output = run_ok_ignore_working_copy(&[
         "bookmark",
         "list",
         "-r",
@@ -219,16 +243,27 @@ pub fn bookmark_create(name: &str, rev: &str) -> Result<()> {
     run_quiet(&["bookmark", "create", "-r", rev, name])
 }
 
-/// Delete a bookmark.
+/// Create an internal bookmark at an already resolved target without taking
+/// another snapshot of the user's working copy.
+pub fn bookmark_create_internal(name: &str, rev: &str) -> Result<()> {
+    run_quiet_ignore_working_copy(&["bookmark", "create", "-r", rev, name])
+}
+
+/// Delete an internal bookmark. Its target is irrelevant to the mutation.
 pub fn bookmark_delete(name: &str) -> Result<()> {
-    run_quiet(&["bookmark", "delete", name])
+    run_quiet_ignore_working_copy(&["bookmark", "delete", name])
+}
+
+/// Rename an internal bookmark without changing its target.
+pub fn bookmark_rename(old: &str, new: &str) -> Result<()> {
+    run_quiet_ignore_working_copy(&["bookmark", "rename", old, new])
 }
 
 /// Check if the jj binary supports --allow-protected on bookmark move.
 fn supports_allow_protected() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
-        let Ok(output) = run(&["bookmark", "move", "-h"]) else {
+        let Ok(output) = run_ignore_working_copy(&["bookmark", "move", "-h"]) else {
             return false;
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -244,12 +279,12 @@ pub fn bookmark_move(name: &str, from: &str, to: &str) -> Result<()> {
         args.push("--allow-protected");
     }
     args.extend_from_slice(&["--from", from, "--to", to, name]);
-    run_quiet(&args)
+    run_quiet_ignore_working_copy(&args)
 }
 
 /// List bookmarks matching a glob pattern.
 pub fn bookmark_list_glob(pattern: &str) -> Result<Vec<String>> {
-    let output = run_ok(&[
+    let output = run_ok_ignore_working_copy(&[
         "bookmark",
         "list",
         "-r",
@@ -266,7 +301,7 @@ pub fn bookmark_list_glob(pattern: &str) -> Result<Vec<String>> {
 
 /// List all local bookmark names.
 pub fn list_bookmarks() -> Result<Vec<String>> {
-    let output = run_ok(&["bookmark", "list", "-T", "name ++ \"\\n\""])?;
+    let output = run_ok_ignore_working_copy(&["bookmark", "list", "-T", "name ++ \"\\n\""])?;
     Ok(output
         .lines()
         .filter(|s| !s.is_empty())
@@ -275,60 +310,90 @@ pub fn list_bookmarks() -> Result<Vec<String>> {
 }
 
 /// Resolve a revset to a single change ID.
-///
-/// The template emits one line per revision so multiple matches (e.g. a
-/// conflicted bookmark) are detectable; without the trailing newline jj
-/// concatenates all revisions into a single line.
 pub fn resolve_revset(revset: &str) -> Result<String> {
-    let output = run(&[
-        "log", "-r", revset, "--no-graph", "-T",
-        "change_id.short() ++ \"\\n\"",
-    ])?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.lines().next().unwrap_or("").trim().to_string();
-        bail!("revset '{}' not found ({})", revset, detail);
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let change_id = stdout.trim();
-    if change_id.is_empty() {
-        bail!("revset '{}' not found", revset);
-    }
-    if change_id.contains('\n') {
-        bail!("revset '{}' resolves to multiple revisions", revset);
-    }
-    Ok(change_id.to_string())
+    let (change_id, _) = require_single_revset(revset, resolve_revset_state(revset, false)?)?;
+    Ok(change_id)
 }
 
-/// Resolve a revset to both change ID and commit ID. One line per revision;
-/// see resolve_revset for why the trailing newline is load-bearing.
+/// Resolve a revset to both change ID and commit ID.
 pub fn resolve_revset_full(revset: &str) -> Result<(String, String)> {
-    let output = run(&[
-        "log", "-r", revset, "--no-graph", "-T",
+    require_single_revset(revset, resolve_revset_state(revset, false)?)
+}
+
+/// Structured result for callers that must distinguish an absent revset from
+/// a conflicted one without treating a failed `jj log` process as absence.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevsetResolution {
+    Absent,
+    Single(String, String),
+    Multiple,
+}
+
+/// Resolve zero, one, or multiple revisions while preserving command errors.
+/// `jj log` exits successfully with empty output for a valid revset matching
+/// nothing; non-zero status instead means the command itself failed.
+pub fn resolve_pinned_revset_full_state(revset: &str) -> Result<RevsetResolution> {
+    resolve_revset_state(revset, true)
+}
+
+/// Resolve a revset once and classify its complete result. Pinned reads avoid
+/// snapshotting the caller's working copy; candidate inputs must remain
+/// working-copy-aware.
+fn resolve_revset_state(revset: &str, pinned: bool) -> Result<RevsetResolution> {
+    let args = [
+        "log",
+        "-r",
+        revset,
+        "--no-graph",
+        "-T",
         "change_id.short() ++ \" \" ++ commit_id ++ \"\\n\"",
-    ])?;
+    ];
+    let output = if pinned {
+        run_ignore_working_copy(&args)?
+    } else {
+        run(&args)?
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.lines().next().unwrap_or("").trim().to_string();
+        let detail = stderr.lines().next().unwrap_or("").trim();
         bail!("revset '{}' not found ({})", revset, detail);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.trim();
-    if line.is_empty() {
-        bail!("revset '{}' not found", revset);
+    parse_revset_full_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn require_single_revset(revset: &str, resolution: RevsetResolution) -> Result<(String, String)> {
+    match resolution {
+        RevsetResolution::Absent => bail!("revset '{}' not found", revset),
+        RevsetResolution::Single(change_id, commit_id) => Ok((change_id, commit_id)),
+        RevsetResolution::Multiple => bail!("revset '{}' resolves to multiple revisions", revset),
     }
-    if line.contains('\n') {
-        bail!("revset '{}' resolves to multiple revisions", revset);
+}
+
+fn parse_revset_full_output(output: &str) -> Result<RevsetResolution> {
+    let mut revisions = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let (change_id, commit_id) = line
+            .trim()
+            .split_once(' ')
+            .ok_or_else(|| anyhow::anyhow!("unexpected output format from jj log"))?;
+        if change_id.is_empty() || commit_id.is_empty() || commit_id.contains(' ') {
+            bail!("unexpected output format from jj log");
+        }
+        revisions.push((change_id.to_string(), commit_id.to_string()));
     }
-    let (change_id, commit_id) = line.split_once(' ')
-        .ok_or_else(|| anyhow::anyhow!("unexpected output format from jj log"))?;
-    Ok((change_id.to_string(), commit_id.to_string()))
+    Ok(match revisions.len() {
+        0 => RevsetResolution::Absent,
+        1 => {
+            let (change_id, commit_id) = revisions.pop().unwrap();
+            RevsetResolution::Single(change_id, commit_id)
+        }
+        _ => RevsetResolution::Multiple,
+    })
 }
 
 /// Get the commit ID for a revision.
 pub fn get_commit_id(revset: &str) -> Result<String> {
-    run_ok(&["log", "-r", revset, "--no-graph", "-T", "commit_id"])
-        .map(|s| s.trim().to_string())
+    run_ok(&["log", "-r", revset, "--no-graph", "-T", "commit_id"]).map(|s| s.trim().to_string())
 }
 
 /// Get the full description of a revision.
@@ -474,21 +539,77 @@ pub fn rebase_branch_onto(source: &str, destination: &str) -> Result<()> {
     run_quiet(&["rebase", "-b", source, "-d", destination])
 }
 
-/// Show file contents from a revision.
-pub fn file_show(path: &str, rev: &str) -> Result<String> {
-    run_ok(&["file", "show", path, "-r", rev])
+/// Show file contents from an exact, already-pinned commit without snapshotting
+/// the caller's working copy.
+pub fn file_show_pinned(path: &str, commit_id: &str) -> Result<String> {
+    run_ok_ignore_working_copy(&["file", "show", path, "-r", commit_id])
 }
 
-/// List paths below `path` in a revision. This is deliberately narrow so
-/// metadata readers do not need to infer filesystem state from commit text.
-pub fn file_list(path: &str, rev: &str) -> Result<Vec<String>> {
-    let output = run_ok(&["file", "list", "-r", rev, path])?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
+const FILE_SHOW_FRAME: &str = "\0JJQ-FILE\0";
+const FILE_SHOW_TEMPLATE: &str = r#""\0JJQ-FILE\0" ++ path ++ "\0""#;
+
+/// Show every file selected by `fileset` in one jj invocation.
+///
+/// `jj file show` renders its template immediately before each file's bytes,
+/// so a NUL-delimited path header gives us a narrow, machine-readable stream.
+/// jjq's metadata values are text (and JSON escapes embedded NULs); reject a
+/// raw NUL in contents rather than ambiguously treating it as framing.
+pub fn file_show_many_pinned(fileset: &str, commit_id: &str) -> Result<Vec<(String, String)>> {
+    let args = [
+        "file",
+        "show",
+        "-r",
+        commit_id,
+        "-T",
+        FILE_SHOW_TEMPLATE,
+        fileset,
+    ];
+    let output = run_ignore_working_copy(&args)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("jj {} failed: {}", args.join(" "), stderr.trim());
+    }
+    let stdout =
+        String::from_utf8(output.stdout).context("jj file show returned non-UTF-8 data")?;
+    parse_file_show_many(&stdout)
+}
+
+fn parse_file_show_many(output: &str) -> Result<Vec<(String, String)>> {
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut rest = output;
+    let mut files = Vec::new();
+    let mut seen_paths = HashSet::new();
+    while !rest.is_empty() {
+        rest = rest.strip_prefix(FILE_SHOW_FRAME).ok_or_else(|| {
+            anyhow::anyhow!("invalid bulk file-show framing: missing file header")
+        })?;
+        let path_end = rest.find('\0').ok_or_else(|| {
+            anyhow::anyhow!("invalid bulk file-show framing: unterminated file path")
+        })?;
+        let path = &rest[..path_end];
+        if path.is_empty() {
+            bail!("invalid bulk file-show framing: empty file path");
+        }
+        rest = &rest[path_end + 1..];
+
+        let content_end = rest.find(FILE_SHOW_FRAME).unwrap_or(rest.len());
+        let contents = &rest[..content_end];
+        if contents.contains('\0') {
+            bail!(
+                "invalid bulk file-show framing: NUL in contents for {}",
+                path
+            );
+        }
+        if !seen_paths.insert(path.to_string()) {
+            bail!("invalid bulk file-show framing: duplicate path {}", path);
+        }
+        files.push((path.to_string(), contents.to_string()));
+        rest = &rest[content_end..];
+    }
+    Ok(files)
 }
 
 /// Create a workspace.
@@ -502,6 +623,35 @@ pub fn workspace_add(path: &str, name: &str, parents: &[&str]) -> Result<()> {
     args.push(name);
     args.push(path);
     run_quiet(&args)
+}
+
+/// Create and edit a fresh working-copy commit with its description already
+/// set, allowing the eventual publishing command to snapshot file changes
+/// without a separate `jj describe` invocation.
+pub fn workspace_new_described(dir: &Path, parents: &[&str], description: &str) -> Result<()> {
+    let mut args = vec!["new"];
+    for parent in parents {
+        args.push("-r");
+        args.push(parent);
+    }
+    args.push("-m");
+    args.push(description);
+    run_quiet_in(dir, &args)
+}
+
+/// Whether a workspace with exactly `name` is registered in the repository.
+pub fn workspace_exists(name: &str) -> Result<bool> {
+    Ok(workspace_list()?.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|listed| listed.trim_end_matches(':') == name)
+    }))
+}
+
+/// Refresh workspace records whose operation is older than the repository's
+/// current operation.
+pub fn workspace_update_stale() -> Result<()> {
+    run_quiet(&["workspace", "update-stale"])
 }
 
 /// Forget a workspace, updating stale state first if needed.
@@ -520,5 +670,56 @@ pub fn workspace_forget(name: &str) -> Result<()> {
 
 /// List all workspaces (raw output from jj workspace list).
 pub fn workspace_list() -> Result<String> {
-    run_ok(&["workspace", "list"])
+    run_ok_ignore_working_copy(&["workspace", "list"])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_file_show_many, parse_revset_full_output, RevsetResolution};
+
+    #[test]
+    fn parses_full_revset_resolution_states() {
+        assert_eq!(
+            parse_revset_full_output("").unwrap(),
+            RevsetResolution::Absent
+        );
+        assert_eq!(
+            parse_revset_full_output("change commit\n").unwrap(),
+            RevsetResolution::Single("change".to_string(), "commit".to_string())
+        );
+        assert_eq!(
+            parse_revset_full_output("one commit1\ntwo commit2\n").unwrap(),
+            RevsetResolution::Multiple
+        );
+        assert!(parse_revset_full_output("malformed\n").is_err());
+        assert!(parse_revset_full_output("change commit extra\n").is_err());
+    }
+
+    #[test]
+    fn parses_bulk_file_show_framing() {
+        let output =
+            "\0JJQ-FILE\0config/check_command\0cargo test\n\0JJQ-FILE\0config/strategy\0rebase";
+        assert_eq!(
+            parse_file_show_many(output).unwrap(),
+            vec![
+                (
+                    "config/check_command".to_string(),
+                    "cargo test\n".to_string()
+                ),
+                ("config/strategy".to_string(), "rebase".to_string()),
+            ]
+        );
+        assert!(parse_file_show_many("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_bulk_file_show_framing() {
+        assert!(parse_file_show_many("config/key\0value").is_err());
+        assert!(parse_file_show_many("\0JJQ-FILE\0\0value").is_err());
+        assert!(parse_file_show_many("\0JJQ-FILE\0config/key").is_err());
+        assert!(parse_file_show_many("\0JJQ-FILE\0config/key\0bad\0value").is_err());
+        assert!(
+            parse_file_show_many("\0JJQ-FILE\0config/key\0one\0JJQ-FILE\0config/key\0two").is_err()
+        );
+    }
 }

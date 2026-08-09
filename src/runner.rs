@@ -255,7 +255,7 @@ fn run_check_command_with_mode(
         .with_context(|| format!("spawning check command: {}", command))?;
 
     if background_start.is_some()
-        && let Err(error) = background_spawned_test_hook()
+        && let Err(error) = background_spawned_test_hook(child.id())
     {
         let _ = child.kill();
         let _ = child.wait();
@@ -450,11 +450,11 @@ fn remove_start_gate(path: &Path) {
 }
 
 /// Deterministic test seam for the spawn-to-publication crash window.
-fn background_spawned_test_hook() -> Result<()> {
+fn background_spawned_test_hook(child_pid: u32) -> Result<()> {
     let Ok(started) = std::env::var("JJQTEST_BACKGROUND_SPAWNED") else {
         return Ok(());
     };
-    fs::write(started, "")?;
+    fs::write(started, child_pid.to_string())?;
     let Some(release) = std::env::var_os("JJQTEST_BACKGROUND_SPAWN_RELEASE") else {
         return Ok(());
     };

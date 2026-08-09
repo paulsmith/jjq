@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd -P "$(dirname "$0")/.." >/dev/null && pwd -P)"
+ram_device=""
+
+cleanup() {
+  if [[ -n "$ram_device" ]]; then
+    local device="$ram_device"
+    ram_device=""
+    hdiutil detach "$device" >/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+if [[ -n "${JJQ_E2E_TMPDIR:-}" ]]; then
+  test_tmpdir="$JJQ_E2E_TMPDIR"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+  ram_device="$(hdiutil attach -nomount ram://2097152 | awk 'NR == 1 { print $1 }')"
+  if [[ ! "$ram_device" =~ ^/dev/disk[0-9]+$ ]]; then
+    echo "unexpected RAM-disk device: $ram_device" >&2
+    exit 1
+  fi
+  volume_name="JJQTests-$$"
+  diskutil erasevolume HFS+ "$volume_name" "$ram_device" >/dev/null
+  test_tmpdir="/Volumes/$volume_name"
+else
+  echo "JJQ_E2E_TMPDIR is required outside macOS" >&2
+  exit 1
+fi
+
+if [[ ! -d "$test_tmpdir" || ! -w "$test_tmpdir" ]]; then
+  echo "test temp directory is not writable: $test_tmpdir" >&2
+  exit 1
+fi
+
+echo "Running e2e tests with TMPDIR=$test_tmpdir"
+cd "$repo_dir"
+TMPDIR="$test_tmpdir" cargo test --test e2e "$@"

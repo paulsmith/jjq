@@ -26,6 +26,14 @@ struct TestRepo {
 }
 
 impl TestRepo {
+    /// Copy a cached repository template into an isolated temporary directory.
+    fn from_template(template: &RepoTemplate) -> Self {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let path = dir.path().to_path_buf();
+        copy_dir_all(&template.path, &path).expect("failed to copy repository template");
+        TestRepo { dir, path }
+    }
+
     /// Create a new empty jj repository.
     fn new() -> Self {
         let dir = TempDir::new().expect("failed to create temp dir");
@@ -34,51 +42,6 @@ impl TestRepo {
         // Initialize jj repo
         run_jj(&path, &["git", "init", "."]);
 
-        TestRepo { dir, path }
-    }
-
-    /// Create a test repository with main branch, copied from a cached template.
-    fn with_go_project() -> Self {
-        let dir = TempDir::new().expect("failed to create temp dir");
-        let path = dir.path().to_path_buf();
-        copy_dir_all(&GO_PROJECT_TEMPLATE.path, &path)
-            .expect("failed to copy go project template");
-        TestRepo { dir, path }
-    }
-
-    /// Create a full test repo with all 4 PRs, copied from a cached template.
-    fn with_prs() -> Self {
-        let dir = TempDir::new().expect("failed to create temp dir");
-        let path = dir.path().to_path_buf();
-        copy_dir_all(&PRS_TEMPLATE.path, &path)
-            .expect("failed to copy prs template");
-        TestRepo { dir, path }
-    }
-
-    /// Create a repo with 3 non-conflicting branches (f1/f2/f3) for run --all success tests.
-    fn with_run_all_happy_scenario() -> Self {
-        let dir = TempDir::new().expect("failed to create temp dir");
-        let path = dir.path().to_path_buf();
-        copy_dir_all(&RUN_ALL_HAPPY_TEMPLATE.path, &path)
-            .expect("failed to copy run-all happy template");
-        TestRepo { dir, path }
-    }
-
-    /// Create a repo with f1/f2/f3 where f2 conflicts after f1, and f3 is clean.
-    fn with_run_all_conflict_scenario() -> Self {
-        let dir = TempDir::new().expect("failed to create temp dir");
-        let path = dir.path().to_path_buf();
-        copy_dir_all(&RUN_ALL_CONFLICT_TEMPLATE.path, &path)
-            .expect("failed to copy run-all conflict template");
-        TestRepo { dir, path }
-    }
-
-    /// Create a repo with f1 clean, f2/f3 conflicting, for partial failure exit-code tests.
-    fn with_run_all_partial_scenario() -> Self {
-        let dir = TempDir::new().expect("failed to create temp dir");
-        let path = dir.path().to_path_buf();
-        copy_dir_all(&RUN_ALL_PARTIAL_TEMPLATE.path, &path)
-            .expect("failed to copy run-all partial template");
         TestRepo { dir, path }
     }
 
@@ -271,12 +234,28 @@ impl TestRepo {
 
     /// Initialize jjq with merge strategy and default settings (check command = "true").
     fn init_jjq_merge(&self) {
-        self.jjq_success(&["init", "--trunk", "main", "--check", "true", "--strategy", "merge"]);
+        self.jjq_success(&[
+            "init",
+            "--trunk",
+            "main",
+            "--check",
+            "true",
+            "--strategy",
+            "merge",
+        ]);
     }
 
     /// Initialize jjq with merge strategy and a specific check command.
     fn init_jjq_merge_with_check(&self, check_cmd: &str) {
-        self.jjq_success(&["init", "--trunk", "main", "--check", check_cmd, "--strategy", "merge"]);
+        self.jjq_success(&[
+            "init",
+            "--trunk",
+            "main",
+            "--check",
+            check_cmd,
+            "--strategy",
+            "merge",
+        ]);
     }
 }
 
@@ -306,7 +285,10 @@ fn history_events(repo: &TestRepo, id: &str) -> Vec<serde_json::Value> {
     assert!(success, "history {} failed: {}{}", id, stdout, stderr);
     let output: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(output["version"], 1);
-    output["submissions"][0]["events"].as_array().unwrap().clone()
+    output["submissions"][0]["events"]
+        .as_array()
+        .unwrap()
+        .clone()
 }
 
 fn history_kinds(repo: &TestRepo, id: &str) -> Vec<String> {
@@ -336,11 +318,7 @@ fn wait_for_lock_held(path: &Path, timeout: std::time::Duration) {
     use fs2::FileExt;
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let file = match fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-        {
+        let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -360,6 +338,76 @@ fn wait_for_lock_held(path: &Path, timeout: std::time::Duration) {
             path.display()
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Wait until a test-hook child has exited (or is only awaiting reaping).
+fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if process_has_exited(pid) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for process {pid} to exit"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_has_exited(pid: u32) -> bool {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    read != size || info.pbi_status == libc::SZOMB
+}
+
+#[cfg(target_os = "linux")]
+fn process_has_exited(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().next())
+        == Some("Z")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_has_exited(pid: u32) -> bool {
+    (unsafe { libc::kill(pid as libc::pid_t, 0) }) != 0
+}
+
+/// Simulate expiry of PID-less active-check records after their supervisor is
+/// known to have exited, avoiding a real five-second grace-period wait.
+fn expire_pidless_active_checks(repo: &TestRepo) {
+    let expired_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .saturating_sub(5_200) as u64;
+    let active_dir = repo.path().join(".jj/jjq/active-checks");
+    for token_dir in fs::read_dir(active_dir).expect("active-check directory should exist") {
+        for record in fs::read_dir(token_dir.unwrap().path()).unwrap() {
+            let path = record.unwrap().path();
+            let mut check: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert!(
+                check["pid"].is_null(),
+                "only PID-less records may be expired"
+            );
+            check["published_at_ms"] = serde_json::json!(expired_at_ms);
+            fs::write(path, serde_json::to_vec(&check).unwrap()).unwrap();
+        }
     }
 }
 
@@ -388,9 +436,8 @@ fn normalize_history_json(output: &str) -> String {
 }
 
 fn normalize_history_text(output: &str, repo_path: &Path) -> String {
-    static RE_TIMESTAMP: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z").unwrap()
-    });
+    static RE_TIMESTAMP: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z").unwrap());
     static RE_ELAPSED: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\b\d+ms\b").unwrap());
     let output = RE_TIMESTAMP.replace_all(output, "<TIMESTAMP>");
@@ -419,6 +466,22 @@ struct RepoTemplate {
     path: PathBuf,
 }
 
+impl From<TestRepo> for RepoTemplate {
+    fn from(repo: TestRepo) -> Self {
+        Self {
+            _dir: repo.dir,
+            path: repo.path,
+        }
+    }
+}
+
+/// Derive one cached state from another without sacrificing per-test isolation.
+fn cached_template(base: &RepoTemplate, setup: impl FnOnce(&TestRepo)) -> RepoTemplate {
+    let repo = TestRepo::from_template(base);
+    setup(&repo);
+    repo.into()
+}
+
 /// Cached template: jj repo with a Go project (main branch with initial commit).
 /// All Go code is pre-formatted so no `go fmt` call is needed.
 static GO_PROJECT_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
@@ -427,11 +490,7 @@ static GO_PROJECT_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
 
     run_jj(&path, &["git", "init", "."]);
 
-    fs::write(
-        path.join("go.mod"),
-        "module example/jjdemo\n\ngo 1.24\n",
-    )
-    .unwrap();
+    fs::write(path.join("go.mod"), "module example/jjdemo\n\ngo 1.24\n").unwrap();
 
     fs::write(
         path.join("main.go"),
@@ -480,6 +539,63 @@ func TestMain(t *testing.T) {
     run_jj(&path, &["bookmark", "create", "main"]);
 
     RepoTemplate { _dir: dir, path }
+});
+
+/// Cached initialized variants used when initialization is setup rather than
+/// behavior under test. They are produced by the real jjq binary once, then
+/// copied per test so every test still gets an isolated repository.
+static INITIALIZED_GO_PROJECT_TEMPLATE: LazyLock<RepoTemplate> =
+    LazyLock::new(|| cached_template(&GO_PROJECT_TEMPLATE, TestRepo::init_jjq));
+
+static INITIALIZED_GO_PROJECT_MERGE_TEMPLATE: LazyLock<RepoTemplate> =
+    LazyLock::new(|| cached_template(&GO_PROJECT_TEMPLATE, TestRepo::init_jjq_merge));
+
+static INITIALIZED_GO_PROJECT_CHECK_FALSE_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(&GO_PROJECT_TEMPLATE, |repo| {
+        repo.init_jjq_with_check("false")
+    })
+});
+
+static INITIALIZED_GO_PROJECT_MERGE_CHECK_FALSE_TEMPLATE: LazyLock<RepoTemplate> =
+    LazyLock::new(|| {
+        cached_template(&GO_PROJECT_TEMPLATE, |repo| {
+            repo.init_jjq_merge_with_check("false")
+        })
+    });
+
+/// Add the standard feature used by tests whose subject starts after queue
+/// publication. Each strategy/check variant below performs this setup once
+/// with the real jjq binary, then tests clone the resulting isolated repo.
+fn queue_standard_feature(repo: &TestRepo) {
+    run_jj(repo.path(), &["new", "-m", "standard feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feature"]);
+    run_jj(repo.path(), &["new", "main"]);
+    repo.jjq_success(&["push", "feature"]);
+}
+
+static QUEUED_FEATURE_TEMPLATE: LazyLock<RepoTemplate> =
+    LazyLock::new(|| cached_template(&INITIALIZED_GO_PROJECT_TEMPLATE, queue_standard_feature));
+
+static QUEUED_FEATURE_MERGE_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(
+        &INITIALIZED_GO_PROJECT_MERGE_TEMPLATE,
+        queue_standard_feature,
+    )
+});
+
+static QUEUED_FEATURE_CHECK_FALSE_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(
+        &INITIALIZED_GO_PROJECT_CHECK_FALSE_TEMPLATE,
+        queue_standard_feature,
+    )
+});
+
+static QUEUED_FEATURE_MERGE_CHECK_FALSE_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(
+        &INITIALIZED_GO_PROJECT_MERGE_CHECK_FALSE_TEMPLATE,
+        queue_standard_feature,
+    )
 });
 
 /// Cached template: Go project with 4 PRs branching off main.
@@ -691,18 +807,80 @@ static RUN_ALL_PARTIAL_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
     RepoTemplate { _dir: dir, path }
 });
 
+static INITIALIZED_RUN_ALL_HAPPY_TEMPLATE: LazyLock<RepoTemplate> =
+    LazyLock::new(|| cached_template(&RUN_ALL_HAPPY_TEMPLATE, TestRepo::init_jjq));
+
+static INITIALIZED_RUN_ALL_HAPPY_MERGE_TEMPLATE: LazyLock<RepoTemplate> =
+    LazyLock::new(|| cached_template(&RUN_ALL_HAPPY_TEMPLATE, TestRepo::init_jjq_merge));
+
+static INITIALIZED_RUN_ALL_CONFLICT_MERGE_TEMPLATE: LazyLock<RepoTemplate> =
+    LazyLock::new(|| cached_template(&RUN_ALL_CONFLICT_TEMPLATE, TestRepo::init_jjq_merge));
+
+static INITIALIZED_RUN_ALL_PARTIAL_MERGE_TEMPLATE: LazyLock<RepoTemplate> =
+    LazyLock::new(|| cached_template(&RUN_ALL_PARTIAL_TEMPLATE, TestRepo::init_jjq_merge));
+
+static QUEUED_RUN_ALL_HAPPY_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(&INITIALIZED_RUN_ALL_HAPPY_TEMPLATE, |repo| {
+        repo.jjq_success(&["push", "f1"]);
+    })
+});
+
+static TWO_QUEUED_RUN_ALL_HAPPY_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(&QUEUED_RUN_ALL_HAPPY_TEMPLATE, |repo| {
+        repo.jjq_success(&["push", "f2"]);
+    })
+});
+
+static THREE_QUEUED_RUN_ALL_HAPPY_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(&TWO_QUEUED_RUN_ALL_HAPPY_TEMPLATE, |repo| {
+        repo.jjq_success(&["push", "f3"]);
+    })
+});
+
+static QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(&INITIALIZED_RUN_ALL_HAPPY_MERGE_TEMPLATE, |repo| {
+        repo.jjq_success(&["push", "f1"]);
+    })
+});
+
+static TWO_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE, |repo| {
+        repo.jjq_success(&["push", "f2"]);
+    })
+});
+
+static THREE_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(&TWO_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE, |repo| {
+        repo.jjq_success(&["push", "f3"]);
+    })
+});
+
+static THREE_QUEUED_RUN_ALL_CONFLICT_MERGE_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(&INITIALIZED_RUN_ALL_CONFLICT_MERGE_TEMPLATE, |repo| {
+        for feature in ["f1", "f2", "f3"] {
+            repo.jjq_success(&["push", feature]);
+        }
+    })
+});
+
+static THREE_QUEUED_RUN_ALL_PARTIAL_MERGE_TEMPLATE: LazyLock<RepoTemplate> = LazyLock::new(|| {
+    cached_template(&INITIALIZED_RUN_ALL_PARTIAL_MERGE_TEMPLATE, |repo| {
+        for feature in ["f1", "f2", "f3"] {
+            repo.jjq_success(&["push", feature]);
+        }
+    })
+});
+
 /// Normalize output for snapshot comparison.
 /// Replaces change IDs, commit IDs, paths, and other variable content.
 fn normalize_output(output: &str, repo_path: &Path) -> String {
     static RE_TEMP: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"/var/folders/[^\s]+|/tmp/[^\s]+|/private/var/folders/[^\s]+").unwrap()
     });
-    static RE_CHANGE_ID: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"\b[a-z]{12}\b").unwrap()
-    });
-    static RE_NOW_AT: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"\(now at [a-z]+\)").unwrap()
-    });
+    static RE_CHANGE_ID: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\b[a-z]{12}\b").unwrap());
+    static RE_NOW_AT: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\(now at [a-z]+\)").unwrap());
 
     let mut result = output.to_string();
 
@@ -714,6 +892,11 @@ fn normalize_output(output: &str, repo_path: &Path) -> String {
     }
     let repo_str = repo_path.to_string_lossy();
     result = result.replace(&*repo_str, "<REPO>");
+
+    // Normalize the configured temp root as well as the platform defaults
+    // below. This keeps snapshots portable when TMPDIR points at a RAM disk
+    // or another nonstandard test volume.
+    result = normalize_temp_paths(&result, &std::env::temp_dir());
 
     // Replace temp directory paths (various formats)
     result = RE_TEMP.replace_all(&result, "<TEMP_PATH>").to_string();
@@ -741,9 +924,123 @@ fn normalize_output(output: &str, repo_path: &Path) -> String {
     result
 }
 
+/// Normalize paths below `temp_root` in both their configured and canonical
+/// spellings. Temp roots are commonly symlinked on macOS, and commands may
+/// report either spelling. Keep surrounding punctuation out of the match so
+/// snapshot normalization cannot hide output-format changes.
+fn normalize_temp_paths(output: &str, temp_root: &Path) -> String {
+    let mut roots = vec![temp_root.to_path_buf()];
+    if let Ok(canonical) = temp_root.canonicalize()
+        && canonical != temp_root
+    {
+        roots.push(canonical);
+    }
+    roots.sort_by_key(|path| std::cmp::Reverse(path.as_os_str().len()));
+
+    let mut result = output.to_string();
+    for root in roots {
+        let root = root.to_string_lossy();
+        let pattern = format!(
+            r#"{}(?:/[^\s\"'(),;\]\}}]+)+"#,
+            regex::escape(root.trim_end_matches('/'))
+        );
+        let re = regex::Regex::new(&pattern).expect("escaped temp-root regex should compile");
+        result = re.replace_all(&result, "<TEMP_PATH>").to_string();
+    }
+    result
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[test]
+fn test_normalize_temp_paths_handles_symlinked_root_and_preserves_punctuation() {
+    let container = TempDir::new().expect("failed to create temp-root container");
+    let canonical_root = container.path().join("canonical-temp");
+    let configured_root = container.path().join("configured-temp");
+    fs::create_dir(&canonical_root).unwrap();
+    std::os::unix::fs::symlink(&canonical_root, &configured_root).unwrap();
+
+    let canonical_root = canonical_root.canonicalize().unwrap();
+    let input = format!(
+        "raw: {}, canonical: ({}), quoted: '{}'.",
+        configured_root.join(".tmpRaw/workspace").display(),
+        canonical_root.join(".tmpCanonical/run.log").display(),
+        configured_root.join(".tmpQuoted/result").display(),
+    );
+
+    assert_eq!(
+        normalize_temp_paths(&input, &configured_root),
+        "raw: <TEMP_PATH>, canonical: (<TEMP_PATH>), quoted: '<TEMP_PATH>'."
+    );
+}
+
+#[test]
+fn test_cached_queued_template_clones_are_isolated_and_relocatable() {
+    let source = &*QUEUED_FEATURE_TEMPLATE;
+    let first = TestRepo::from_template(source);
+    let second = TestRepo::from_template(source);
+
+    for clone in [&first, &second] {
+        let pointer = clone.path().join(".jj/jjq/meta-workspace/.jj/repo");
+        let target = pointer
+            .parent()
+            .unwrap()
+            .join(fs::read_to_string(&pointer).unwrap().trim())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            target,
+            clone.path().join(".jj/repo").canonicalize().unwrap(),
+            "copied metadata workspace must point into its own repository"
+        );
+    }
+
+    first.jjq_success(&["config", "check_command", "false"]);
+    run_jj(
+        first.path(),
+        &["new", "-m", "isolated second feature", "main"],
+    );
+    fs::write(first.path().join("isolated.txt"), "first clone only\n").unwrap();
+    run_jj(first.path(), &["bookmark", "create", "isolated"]);
+    first.jjq_success(&["push", "isolated"]);
+
+    assert_eq!(
+        first.jjq_success(&["config", "check_command"]).trim(),
+        "false"
+    );
+    assert_eq!(
+        second.jjq_success(&["config", "check_command"]).trim(),
+        "true"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            source
+                .path
+                .join(".jj/jjq/meta-workspace/config/check_command")
+        )
+        .unwrap()
+        .trim(),
+        "true",
+        "mutating a clone must not change the cached source template"
+    );
+
+    assert_eq!(
+        queue_bookmark_names(&first),
+        vec!["jjq/queue/000001", "jjq/queue/000002"]
+    );
+    assert_eq!(queue_bookmark_names(&second), vec!["jjq/queue/000001"]);
+    assert_eq!(
+        fs::read_to_string(source.path.join(".jj/jjq/meta-workspace/last_id"))
+            .unwrap()
+            .trim(),
+        "1",
+        "allocating an ID in a clone must not change the cached source template"
+    );
+    assert!(!second.path().join("isolated.txt").exists());
+    assert!(!source.path.join("isolated.txt").exists());
+}
 
 #[test]
 fn test_status_uninitialized() {
@@ -768,7 +1065,7 @@ fn test_init_no_trunk_bookmark() {
 
 #[test]
 fn test_config_show_all() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
     let output = repo.jjq_success(&["config"]);
     insta::assert_snapshot!(output, @r"
@@ -780,7 +1077,7 @@ fn test_config_show_all() {
 
 #[test]
 fn test_config_set_and_get() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     let set_output = repo.jjq_success(&["config", "check_command", "make test"]);
@@ -792,7 +1089,7 @@ fn test_config_set_and_get() {
 
 #[test]
 fn test_config_invalid_key() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     let output = repo.jjq_failure(&["config", "invalid_key"]);
@@ -804,7 +1101,7 @@ fn test_config_invalid_key() {
 
 #[test]
 fn test_init_sets_log_filter() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     // init should automatically configure jj to hide jjq metadata, using the
@@ -819,7 +1116,7 @@ fn test_init_sets_log_filter() {
 
 #[test]
 fn test_init_log_filter_preserves_existing() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
 
     // Set a custom revsets.log before init
     run_jj(
@@ -839,8 +1136,7 @@ fn test_init_log_filter_preserves_existing() {
 
 #[test]
 fn test_push_and_status() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // Create a branch to push
     run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
@@ -862,8 +1158,7 @@ fn test_push_and_status() {
 
 #[test]
 fn test_history_records_success_and_json() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "history feature", "main"]);
     fs::write(repo.path().join("history.txt"), "history\n").unwrap();
@@ -977,7 +1272,7 @@ fn test_history_records_success_and_json() {
 fn test_publication_orders_queued_before_claimed() {
     use fs2::FileExt;
 
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
     run_jj(repo.path(), &["new", "-m", "publication order", "main"]);
     fs::write(repo.path().join("publication-order.txt"), "ordered\n").unwrap();
@@ -1011,8 +1306,7 @@ fn test_publication_orders_queued_before_claimed() {
 
 #[test]
 fn test_history_change_lookup_keeps_requeues_and_deletions() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("false");
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_CHECK_FALSE_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "retry history", "main"]);
     fs::write(repo.path().join("retry-history.txt"), "retry\n").unwrap();
@@ -1066,7 +1360,7 @@ fn test_history_change_lookup_keeps_requeues_and_deletions() {
 
 #[test]
 fn test_history_requires_one_selector_and_initialization() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.jjq().args(["history", "1"]).assert().code(10);
 
     repo.init_jjq();
@@ -1076,8 +1370,7 @@ fn test_history_requires_one_selector_and_initialization() {
 
 #[test]
 fn test_push_conflict_detection() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // Create a branch that modifies main.go one way
     run_jj(repo.path(), &["new", "-m", "trunk advance", "main"]);
@@ -1122,8 +1415,7 @@ func main() {
 
 #[test]
 fn test_run_empty_queue() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     let output = repo.jjq_success(&["run"]);
     insta::assert_snapshot!(output, @"jjq: queue is empty");
@@ -1131,21 +1423,14 @@ fn test_run_empty_queue() {
 
 #[test]
 fn test_run_without_init() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     let output = repo.jjq_failure(&["run"]);
     insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
 }
 
 #[test]
 fn test_run_success() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_merge();
-
-    // Create and push a simple branch
-    run_jj(repo.path(), &["new", "-m", "add file", "main"]);
-    fs::write(repo.path().join("newfile.txt"), "content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "simple-branch"]);
-    repo.jjq_success(&["push", "simple-branch"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_MERGE_TEMPLATE);
 
     let output = repo.jjq_success(&["run"]);
     insta::assert_snapshot!(output, @r"
@@ -1157,8 +1442,7 @@ fn test_run_success() {
 
 #[test]
 fn test_run_check_failure() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_merge_with_check("false");
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_MERGE_CHECK_FALSE_TEMPLATE);
 
     // Create and push a branch
     run_jj(repo.path(), &["new", "-m", "will fail check", "main"]);
@@ -1186,13 +1470,7 @@ fn test_run_check_failure() {
 
 #[test]
 fn test_run_all() {
-    let repo = TestRepo::with_run_all_happy_scenario();
-    repo.init_jjq_merge();
-
-    // Push all
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
-    repo.jjq_success(&["push", "f3"]);
+    let repo = TestRepo::from_template(&THREE_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
 
     let status_before = repo.jjq_success(&["status"]);
     insta::assert_snapshot!(status_before, @r"
@@ -1225,7 +1503,7 @@ fn test_run_all() {
 
 #[test]
 fn test_run_all_jobs_runs_merge_checks_concurrently_and_lands_fifo() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&THREE_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let state = repo.path().join("parallel-state");
     let markers = state.join("markers");
     let release = state.join("release");
@@ -1234,15 +1512,15 @@ fn test_run_all_jobs_runs_merge_checks_concurrently_and_lands_fifo() {
         markers = markers.display(),
         release = release.display(),
     );
-    repo.init_jjq_merge_with_check(&command);
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
-    repo.jjq_success(&["push", "f3"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&["config", "check_command", &command]);
 
     let mut child = repo.spawn_jjq(&["run", "--all", "--jobs", "2"]);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let marker_count = fs::read_dir(&markers).map(|entries| entries.count()).unwrap_or(0);
+        let marker_count = fs::read_dir(&markers)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
         if marker_count == 2 {
             break;
         }
@@ -1254,10 +1532,18 @@ fn test_run_all_jobs_runs_merge_checks_concurrently_and_lands_fifo() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert_eq!(fs::read_dir(&markers).unwrap().count(), 2, "jobs cap exceeded before release");
+    assert_eq!(
+        fs::read_dir(&markers).unwrap().count(),
+        2,
+        "jobs cap exceeded before release"
+    );
     fs::write(&release, "").unwrap();
     let run_output = child.wait_with_output().unwrap();
-    assert!(run_output.status.success(), "parallel run failed: {:?}", run_output);
+    assert!(
+        run_output.status.success(),
+        "parallel run failed: {:?}",
+        run_output
+    );
     let output = normalize_output(
         &format!(
             "{}{}",
@@ -1269,7 +1555,10 @@ fn test_run_all_jobs_runs_merge_checks_concurrently_and_lands_fifo() {
     let first = output.find("merged 1 to main").unwrap();
     let second = output.find("merged 2 to main").unwrap();
     let third = output.find("merged 3 to main").unwrap();
-    assert!(first < second && second < third, "landing must remain FIFO: {output}");
+    assert!(
+        first < second && second < third,
+        "landing must remain FIFO: {output}"
+    );
     assert!(repo.jj_file_exists("f1.txt", "main"));
     assert!(repo.jj_file_exists("f2.txt", "main"));
     assert!(repo.jj_file_exists("f3.txt", "main"));
@@ -1283,24 +1572,41 @@ fn test_run_all_jobs_runs_merge_checks_concurrently_and_lands_fifo() {
 
 #[test]
 fn test_run_all_jobs_invalidates_dependent_check_after_early_failure() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&TWO_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let counter = repo.path().join("check-count");
     let command = format!(
         "echo run >> {0}; if [ -f f1.txt ]; then exit 1; fi",
         counter.display()
     );
-    repo.init_jjq_merge_with_check(&command);
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&["config", "check_command", &command]);
 
-    repo.jjq().args(["run", "--all", "--jobs", "2"]).assert().code(2);
+    repo.jjq()
+        .args(["run", "--all", "--jobs", "2"])
+        .assert()
+        .code(2);
     let checks = fs::read_to_string(&counter).unwrap().lines().count();
-    assert_eq!(checks, 3, "B is checked speculatively, discarded, then rechecked");
+    assert_eq!(
+        checks, 3,
+        "B is checked speculatively, discarded, then rechecked"
+    );
     assert!(repo.jj_file_exists("f2.txt", "main"));
     let status = repo.jjq_success(&["status"]);
-    assert!(status.contains("feature 1"), "only A should be failed: {status}");
-    assert!(!status.contains("feature 2"), "B should have landed: {status}");
-    assert_eq!(history_kinds(&repo, "2").iter().filter(|kind| *kind == "failed").count(), 0);
+    assert!(
+        status.contains("feature 1"),
+        "only A should be failed: {status}"
+    );
+    assert!(
+        !status.contains("feature 2"),
+        "B should have landed: {status}"
+    );
+    assert_eq!(
+        history_kinds(&repo, "2")
+            .iter()
+            .filter(|kind| *kind == "failed")
+            .count(),
+        0
+    );
     assert_eq!(
         history_kinds(&repo, "2")
             .iter()
@@ -1313,10 +1619,7 @@ fn test_run_all_jobs_invalidates_dependent_check_after_early_failure() {
 
 #[test]
 fn test_run_all_jobs_rebase_falls_back_to_serial() {
-    let repo = TestRepo::with_run_all_happy_scenario();
-    repo.init_jjq(); // default strategy is rebase
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
+    let repo = TestRepo::from_template(&TWO_QUEUED_RUN_ALL_HAPPY_TEMPLATE);
     let output = repo.jjq_success(&["run", "--all", "--jobs", "2"]);
     assert!(output.contains("--jobs is currently serial for rebase"));
     assert!(repo.jj_file_exists("f1.txt", "main"));
@@ -1325,19 +1628,23 @@ fn test_run_all_jobs_rebase_falls_back_to_serial() {
 
 #[test]
 fn test_run_all_jobs_status_reports_token_scoped_active_checks() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&TWO_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let check = gated_check_command(&sync.path().join("started"), &sync.path().join("release"));
-    repo.init_jjq_merge_with_check(&check);
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&["config", "check_command", &check]);
 
     let child = repo.spawn_jjq(&["run", "--all", "--jobs", "2"]);
-    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+    wait_for_file(
+        &sync.path().join("started"),
+        std::time::Duration::from_secs(30),
+    );
     let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
     assert!(success, "status during parallel run should succeed");
     let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let active = status["active_checks"].as_array().expect("active_checks array");
+    let active = status["active_checks"]
+        .as_array()
+        .expect("active_checks array");
     // The separate overlap test proves the scheduler actually has two live
     // workers. This check verifies the cross-process JSON projection without
     // turning a polling race into an orphaned background runner on failure.
@@ -1365,7 +1672,7 @@ fn test_run_jobs_validation() {
 
 #[test]
 fn test_parallel_run_crash_refuses_recovery_while_check_children_live() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&TWO_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let started = sync.path().join("started");
     let release = sync.path().join("release");
@@ -1376,9 +1683,8 @@ fn test_parallel_run_crash_refuses_recovery_while_check_children_live() {
         started = started.display(),
         release = release.display(),
     );
-    repo.init_jjq_merge_with_check(&check);
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&["config", "check_command", &check]);
 
     let mut parent = repo.spawn_jjq(&["run", "--all", "--jobs", "2"]);
     wait_for_file(&started, std::time::Duration::from_secs(30));
@@ -1387,19 +1693,25 @@ fn test_parallel_run_crash_refuses_recovery_while_check_children_live() {
         let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
         assert!(success);
         let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        if status["active_checks"]
-            .as_array()
-            .is_some_and(|checks| checks.len() == 2 && checks.iter().all(|check| check["pid"].is_u64()))
-        {
+        if status["active_checks"].as_array().is_some_and(|checks| {
+            checks.len() == 2 && checks.iter().all(|check| check["pid"].is_u64())
+        }) {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "worker PIDs were not published: {status}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker PIDs were not published: {status}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
     parent.kill().unwrap();
     let _ = parent.wait();
-    let run = repo.jjq().args(["run", "--all", "--jobs", "2"]).output().unwrap();
+    let run = repo
+        .jjq()
+        .args(["run", "--all", "--jobs", "2"])
+        .output()
+        .unwrap();
     assert_eq!(run.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&run.stderr).contains("interrupted runner"));
     let clean = repo.jjq().args(["clean"]).output().unwrap();
@@ -1417,7 +1729,11 @@ fn test_parallel_run_crash_refuses_recovery_while_check_children_live() {
         if output.status.success() {
             break output;
         }
-        assert!(std::time::Instant::now() < deadline, "workers did not exit: {:?}", output);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "workers did not exit: {:?}",
+            output
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     let recovered_output = format!(
@@ -1438,14 +1754,14 @@ fn test_parallel_run_crash_refuses_recovery_while_check_children_live() {
 
 #[test]
 fn test_parallel_spawn_gate_prevents_unowned_check_before_pid_publication() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let spawned = sync.path().join("spawned");
     let never_release = sync.path().join("never-release");
     let check_count = sync.path().join("check-count");
     let check = format!("echo ran >> {}", check_count.display());
-    repo.init_jjq_merge_with_check(&check);
-    repo.jjq_success(&["push", "f1"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&["config", "check_command", &check]);
 
     let mut parent = repo
         .jjq_std()
@@ -1457,20 +1773,25 @@ fn test_parallel_spawn_gate_prevents_unowned_check_before_pid_publication() {
         .spawn()
         .unwrap();
     wait_for_file(&spawned, std::time::Duration::from_secs(30));
+    let supervisor_pid: u32 = fs::read_to_string(&spawned).unwrap().parse().unwrap();
 
     let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
     assert!(success);
     let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let active = &status["active_checks"][0];
-    assert!(active["pid"].is_null(), "publication seam must precede PID: {status}");
+    assert!(
+        active["pid"].is_null(),
+        "publication seam must precede PID: {status}"
+    );
     assert!(active["process_start"].is_null());
 
     parent.kill().unwrap();
     let _ = parent.wait();
-    // PID-less records are conservative for 5s, while the supervisor has a
-    // hard 4s gate deadline. After the grace, it cannot still start the check.
-    std::thread::sleep(std::time::Duration::from_millis(5_200));
+    // Once the gate supervisor observes its dead parent and exits, simulate
+    // expiry of the conservative five-second PID-less-record grace period.
+    wait_for_process_exit(supervisor_pid, std::time::Duration::from_secs(5));
     assert!(!check_count.exists(), "unowned user check must never start");
+    expire_pidless_active_checks(&repo);
 
     let output = repo.jjq_success(&["run", "--all", "--jobs", "2"]);
     assert!(output.contains("recovered interrupted item 1"), "{output}");
@@ -1480,8 +1801,7 @@ fn test_parallel_spawn_gate_prevents_unowned_check_before_pid_publication() {
 
 #[test]
 fn test_parallel_recovery_ignores_reused_pid_with_wrong_process_start() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_merge();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_MERGE_TEMPLATE);
     let active_dir = repo.path().join(".jj/jjq/active-checks/stale-token");
     fs::create_dir_all(&active_dir).unwrap();
     fs::write(
@@ -1510,8 +1830,7 @@ fn test_parallel_recovery_ignores_reused_pid_with_wrong_process_start() {
 
 #[test]
 fn test_delete_queued() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "to delete", "main"]);
     fs::write(repo.path().join("delete.txt"), "delete me").unwrap();
@@ -1534,16 +1853,14 @@ fn test_delete_queued() {
 
 #[test]
 fn test_delete_failed() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("false");
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_CHECK_FALSE_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
     fs::write(repo.path().join("fail.txt"), "fail").unwrap();
     run_jj(repo.path(), &["bookmark", "create", "fail-branch"]);
     repo.jjq_success(&["push", "fail-branch"]);
-
-    // Run to create failed item
     repo.jjq_failure(&["run"]);
+
     let failed_log = repo.path().join(".jj/jjq/failed-logs/000001.log");
     assert!(failed_log.exists(), "failed check log should be archived");
 
@@ -1562,15 +1879,13 @@ fn test_delete_failed() {
         !failed_log.exists(),
         "delete should remove the archived log"
     );
-
     let status_after = repo.jjq_success(&["status"]);
     insta::assert_snapshot!(status_after, @"jjq: queue is empty");
 }
 
 #[test]
 fn test_delete_not_found() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     let output = repo.jjq_failure(&["delete", "999"]);
     insta::assert_snapshot!(output, @"jjq: item 999 not found in queue or failed");
@@ -1579,9 +1894,7 @@ fn test_delete_not_found() {
 
 #[test]
 fn test_sequence_id_validation() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
-    repo.jjq_success(&["push", "main"]); // Need an item to delete
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
 
     // Test invalid IDs
     let empty = repo.jjq_failure(&["delete", ""]);
@@ -1614,7 +1927,7 @@ fn test_sequence_id_validation() {
 
 #[test]
 fn test_full_workflow_with_prs() {
-    let repo = TestRepo::with_prs();
+    let repo = TestRepo::from_template(&PRS_TEMPLATE);
     // This test validates queue/conflict behavior; an expensive project build
     // check is unnecessary here.
     repo.init_jjq_merge_with_check("true");
@@ -1679,8 +1992,7 @@ fn test_full_workflow_with_prs() {
 
 #[test]
 fn test_multiple_push_same_revision() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // Push main once - should succeed. The template's working copy sits on
     // the main commit itself, so the push also parks the working copy on a
@@ -1702,8 +2014,7 @@ fn test_multiple_push_same_revision() {
 
 #[test]
 fn test_log_hint_not_shown_in_non_tty() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // Push should succeed without showing hint (non-TTY mode)
     let output = repo.jjq_success(&["push", "main"]);
@@ -1727,8 +2038,7 @@ fn test_log_hint_not_shown_in_non_tty() {
 
 #[test]
 fn test_log_hint_shown_once_when_forced() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // Remove log filter to simulate a repo initialized before auto-setup
     run_jj(repo.path(), &["config", "unset", "--repo", "revsets.log"]);
@@ -1760,12 +2070,7 @@ fn test_log_hint_shown_once_when_forced() {
 
 #[test]
 fn test_run_all_stop_on_failure_flag() {
-    let repo = TestRepo::with_run_all_conflict_scenario();
-    repo.init_jjq_merge();
-
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
-    repo.jjq_success(&["push", "f3"]);
+    let repo = TestRepo::from_template(&THREE_QUEUED_RUN_ALL_CONFLICT_MERGE_TEMPLATE);
 
     // run --all should process f1, fail on f2 (conflict), and STOP (not process f3)
     let output = repo.jjq_output(&["run", "--all", "--stop-on-failure"]);
@@ -1801,12 +2106,7 @@ fn test_run_all_stop_on_failure_flag() {
 
 #[test]
 fn test_run_all_continues_on_failure() {
-    let repo = TestRepo::with_run_all_conflict_scenario();
-    repo.init_jjq_merge();
-
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
-    repo.jjq_success(&["push", "f3"]);
+    let repo = TestRepo::from_template(&THREE_QUEUED_RUN_ALL_CONFLICT_MERGE_TEMPLATE);
 
     // run --all should process f1, fail on f2 (conflict), CONTINUE, and process f3
     let output = repo.jjq_output(&["run", "--all"]);
@@ -1834,12 +2134,7 @@ fn test_run_all_continues_on_failure() {
 
 #[test]
 fn test_run_all_partial_failure_exit_code() {
-    let repo = TestRepo::with_run_all_partial_scenario();
-    repo.init_jjq_merge();
-
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
-    repo.jjq_success(&["push", "f3"]);
+    let repo = TestRepo::from_template(&THREE_QUEUED_RUN_ALL_PARTIAL_MERGE_TEMPLATE);
 
     // Exit code should be 2 (PARTIAL) — some succeeded, some failed
     repo.jjq().args(["run", "--all"]).assert().code(2);
@@ -1847,7 +2142,7 @@ fn test_run_all_partial_failure_exit_code() {
 
 #[test]
 fn test_log_hint_skipped_when_filter_configured() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
 
     // Configure the log filter first
     run_jj(
@@ -1871,8 +2166,7 @@ fn test_log_hint_skipped_when_filter_configured() {
 
 #[test]
 fn test_push_exact_duplicate_rejected() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     repo.jjq_success(&["push", "main"]);
 
@@ -1887,8 +2181,7 @@ fn test_push_exact_duplicate_rejected() {
 
 #[test]
 fn test_push_idempotent_clears_failed() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_merge_with_check("false");
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_MERGE_CHECK_FALSE_TEMPLATE);
 
     // Create and push a branch
     run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
@@ -1932,37 +2225,36 @@ fn test_push_idempotent_clears_failed() {
 
 #[test]
 fn test_clean_no_workspaces() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     let output = repo.jjq_success(&["clean"]);
     insta::assert_snapshot!(output, @"jjq: no workspaces to clean");
 }
 
 #[test]
 fn test_clean_removes_failed_workspaces() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_merge_with_check("false");
-
-    run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
-    fs::write(repo.path().join("fail.txt"), "content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "fb"]);
-    repo.jjq_success(&["push", "fb"]);
-
-    // Run to create failed item (and preserved workspace)
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_MERGE_CHECK_FALSE_TEMPLATE);
     repo.jjq_failure(&["run"]);
+    let meta_workspace = repo.path().join(".jj/jjq/meta-workspace");
+    assert!(meta_workspace.is_dir());
 
-    // Clean should find and remove the workspace
+    // Clean removes both the failed-item workspace and the persistent
+    // metadata cache workspace.
     let output = repo.jjq_success(&["clean"]);
     assert!(
-        output.contains("removed 1 workspace"),
-        "should remove workspace: {}",
+        output.contains("removed 2 workspace"),
+        "should remove both jjq workspaces: {}",
         output
     );
+    assert!(!meta_workspace.exists());
+
+    // The next metadata write recreates its disposable workspace.
+    repo.jjq_success(&["config", "check_command", "true"]);
+    assert!(meta_workspace.is_dir());
 }
 
 #[test]
 fn test_clean_removes_legacy_filesystem_state() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     let legacy_locks = repo.path().join(".jj").join("jjq-locks");
     let legacy_log = repo.path().join(".jj").join("jjq-run.log");
@@ -2003,14 +2295,7 @@ fn test_status_json_empty() {
 
 #[test]
 fn test_status_json_with_items() {
-    let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "false"]);
-
-    // Push an item and run to create a failed item
-    run_jj(repo.path(), &["new", "-m", "will fail check", "main"]);
-    fs::write(repo.path().join("fail.txt"), "content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "fail-branch"]);
-    repo.jjq_success(&["push", "fail-branch"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_CHECK_FALSE_TEMPLATE);
     repo.jjq_failure(&["run"]);
 
     // Push a queued item
@@ -2066,8 +2351,7 @@ fn test_status_json_with_items() {
 
 #[test]
 fn test_status_single_queued() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "my queued feature", "main"]);
     fs::write(repo.path().join("feature.txt"), "content").unwrap();
@@ -2099,10 +2383,9 @@ fn test_status_single_queued() {
 
 #[test]
 fn test_status_single_failed() {
-    let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["config", "check_command", "false"]);
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_CHECK_FALSE_TEMPLATE);
 
-    run_jj(repo.path(), &["new", "-m", "will fail check", "main"]);
+    run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
     fs::write(repo.path().join("fail.txt"), "content").unwrap();
     run_jj(repo.path(), &["bookmark", "create", "fail-branch"]);
     repo.jjq_success(&["push", "fail-branch"]);
@@ -2120,7 +2403,7 @@ fn test_status_single_failed() {
         output
     );
     assert!(
-        output.contains("Description: will fail check"),
+        output.contains("Description: will fail"),
         "should show description: {}",
         output
     );
@@ -2144,8 +2427,7 @@ fn test_status_single_failed() {
 
 #[test]
 fn test_status_single_json() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "json feature", "main"]);
     fs::write(repo.path().join("feature.txt"), "content").unwrap();
@@ -2164,8 +2446,7 @@ fn test_status_single_json() {
 
 #[test]
 fn test_status_not_found() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     let output = repo.jjq_failure(&["status", "999"]);
     assert!(
@@ -2178,7 +2459,7 @@ fn test_status_not_found() {
 
 #[test]
 fn test_init_with_flags() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     let output = repo.jjq_success(&["init", "--trunk", "main", "--check", "make test"]);
     assert!(
         output.contains("Initialized jjq"),
@@ -2200,20 +2481,233 @@ fn test_init_with_flags() {
         "should show ready message: {}",
         output
     );
+
+    let metadata_descriptions = run_jj(
+        repo.path(),
+        &[
+            "log",
+            "-r",
+            "ancestors(bookmarks(exact:\"jjq/_/_\")) ~ root()",
+            "--no-graph",
+            "-T",
+            "description ++ \"\\n---\\n\"",
+        ],
+    );
+    assert_eq!(
+        metadata_descriptions.matches("\n---\n").count(),
+        2,
+        "init should create one metadata transaction after the metadata-root commit: {metadata_descriptions}"
+    );
+    for operation in [
+        "init jjq",
+        "config: set trunk_bookmark",
+        "config: set check_command",
+        "config: set strategy",
+    ] {
+        assert!(
+            metadata_descriptions.contains(operation),
+            "init transaction should record {operation:?}: {metadata_descriptions}"
+        );
+    }
 }
 
 #[test]
 fn test_init_already_initialized() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
 
     let output = repo.jjq_failure(&["init", "--trunk", "main", "--check", "true"]);
     insta::assert_snapshot!(output, @"jjq: jjq is already initialized. Use 'jjq config' to change settings.");
+    repo.jjq()
+        .args(["init", "--trunk", "main", "--check", "true"])
+        .assert()
+        .code(10);
+}
+
+#[test]
+fn test_init_invalid_strategy_leaves_repo_uninitialized() {
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    let output = repo.jjq_failure(&[
+        "init",
+        "--trunk",
+        "main",
+        "--check",
+        "true",
+        "--strategy",
+        "invalid",
+    ]);
+    assert!(output.contains("invalid strategy: invalid"), "{output}");
+    repo.jjq()
+        .args([
+            "init",
+            "--trunk",
+            "main",
+            "--check",
+            "true",
+            "--strategy",
+            "invalid",
+        ])
+        .assert()
+        .code(10);
+
+    let metadata = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(exact:\"jjq/_/_\")",
+            "-T",
+            "name",
+        ],
+    );
+    assert!(
+        metadata.trim().is_empty(),
+        "invalid init must not create partial metadata: {metadata}"
+    );
+}
+
+#[test]
+fn test_init_recovers_interrupted_metadata_root() {
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    run_jj(repo.path(), &["new", "-m", "jjq metadata root", "root()"]);
+    run_jj(repo.path(), &["bookmark", "create", "jjq/_/_"]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    repo.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
+    let config = repo.jjq_success(&["config"]);
+    assert!(config.contains("trunk_bookmark = main"), "{config}");
+    assert!(config.contains("check_command = true"), "{config}");
+    assert!(config.contains("strategy = rebase"), "{config}");
+    assert_eq!(
+        run_jj(
+            repo.path(),
+            &[
+                "log",
+                "-r",
+                "ancestors(bookmarks(exact:\"jjq/_/_\")) ~ root()",
+                "--no-graph",
+                "-T",
+                "description.first_line() ++ \"\\n\"",
+            ],
+        )
+        .lines()
+        .count(),
+        2,
+        "recovery should add only the atomic initialization transaction"
+    );
+}
+
+#[test]
+fn test_config_write_recovers_interrupted_metadata_root() {
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    run_jj(repo.path(), &["new", "-m", "jjq metadata root", "root()"]);
+    run_jj(repo.path(), &["bookmark", "create", "jjq/_/_"]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    repo.jjq_success(&["config", "check_command", "true"]);
+    assert_eq!(
+        repo.jjq_success(&["config", "check_command"]).trim(),
+        "true"
+    );
+    assert_eq!(
+        run_jj(
+            repo.path(),
+            &[
+                "file",
+                "show",
+                "last_id",
+                "-r",
+                "bookmarks(exact:\"jjq/_/_\")",
+            ],
+        )
+        .trim(),
+        "0",
+        "ordinary metadata writes should seed an interrupted bare root"
+    );
+}
+
+#[test]
+fn test_config_write_abandons_interrupted_persistent_metadata_child() {
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    repo.jjq_success(&["init", "--trunk", "main", "--check", "true"]);
+
+    let workspace = repo.path().join(".jj/jjq/meta-workspace");
+    run_jj(
+        &workspace,
+        &[
+            "new",
+            "-r",
+            "bookmarks(exact:\"jjq/_/_\")",
+            "-m",
+            "unpublished metadata operation",
+        ],
+    );
+    fs::write(workspace.join("config/check_command"), "false").unwrap();
+
+    repo.jjq_success(&["config", "strategy", "merge"]);
+
+    assert_eq!(
+        repo.jjq_success(&["config", "check_command"]).trim(),
+        "true",
+        "a later writer must not publish files left by the interrupted writer"
+    );
+    let visible_descriptions = run_jj(
+        repo.path(),
+        &[
+            "log",
+            "-r",
+            "all()",
+            "--no-graph",
+            "-T",
+            "description.first_line() ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        !visible_descriptions.contains("unpublished metadata operation"),
+        "the interrupted metadata child should be abandoned: {visible_descriptions}"
+    );
+}
+
+#[test]
+fn test_concurrent_init_has_one_complete_winner() {
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    run_jj(
+        repo.path(),
+        &["bookmark", "create", "alternate", "-r", "main"],
+    );
+    let first = repo.spawn_jjq(&["init", "--trunk", "main", "--check", "true"]);
+    let second = repo.spawn_jjq(&[
+        "init",
+        "--trunk",
+        "alternate",
+        "--check",
+        "false",
+        "--strategy",
+        "merge",
+    ]);
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    let mut codes = [first.status.code(), second.status.code()];
+    codes.sort();
+    assert_eq!(codes, [Some(0), Some(10)]);
+
+    let config = repo.jjq_success(&["config"]);
+    let first_won = config.contains("trunk_bookmark = main")
+        && config.contains("check_command = true")
+        && config.contains("strategy = rebase");
+    let second_won = config.contains("trunk_bookmark = alternate")
+        && config.contains("check_command = false")
+        && config.contains("strategy = merge");
+    assert!(
+        first_won ^ second_won,
+        "configuration must exactly match one initializer: {config}"
+    );
 }
 
 #[test]
 fn test_init_runs_doctor() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     let output = repo.jjq_success(&["init", "--trunk", "main", "--check", "make test"]);
     // Doctor output should be present
     assert!(
@@ -2230,22 +2724,21 @@ fn test_init_runs_doctor() {
 
 #[test]
 fn test_push_without_init_fails() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     let output = repo.jjq_failure(&["push", "main"]);
     insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
 }
 
 #[test]
 fn test_config_without_init_fails() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     let output = repo.jjq_failure(&["config"]);
     insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
 }
 
 #[test]
 fn test_tail_no_log_file() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     let output = repo.jjq_output(&["tail", "--no-follow"]);
     assert!(
@@ -2257,13 +2750,8 @@ fn test_tail_no_log_file() {
 
 #[test]
 fn test_tail_after_run() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("echo hello-from-check");
-
-    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
-    fs::write(repo.path().join("newfile.txt"), "content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "simple-branch"]);
-    repo.jjq_success(&["push", "simple-branch"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+    repo.jjq_success(&["config", "check_command", "echo hello-from-check"]);
     repo.jjq_success(&["run"]);
 
     let output = repo.jjq_output(&["tail", "--no-follow"]);
@@ -2276,30 +2764,41 @@ fn test_tail_after_run() {
 
 #[test]
 fn test_tail_all_flag() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("echo line1 && echo line2 && echo line3");
-
-    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
-    fs::write(repo.path().join("newfile.txt"), "content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "simple-branch"]);
-    repo.jjq_success(&["push", "simple-branch"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+    repo.jjq_success(&[
+        "config",
+        "check_command",
+        "echo line1 && echo line2 && echo line3",
+    ]);
     repo.jjq_success(&["run"]);
 
     let output = repo.jjq_output(&["tail", "--all", "--no-follow"]);
-    assert!(output.contains("line1"), "should show all output: {}", output);
-    assert!(output.contains("line2"), "should show all output: {}", output);
-    assert!(output.contains("line3"), "should show all output: {}", output);
+    assert!(
+        output.contains("line1"),
+        "should show all output: {}",
+        output
+    );
+    assert!(
+        output.contains("line2"),
+        "should show all output: {}",
+        output
+    );
+    assert!(
+        output.contains("line3"),
+        "should show all output: {}",
+        output
+    );
 }
 
 #[test]
 fn test_tail_failed_item_after_batch_continues() {
-    let repo = TestRepo::with_run_all_happy_scenario();
-    repo.init_jjq_merge_with_check(
+    let repo = TestRepo::from_template(&TWO_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&[
+        "config",
+        "check_command",
         "if [ -f f1.txt ]; then echo failed-item-marker; exit 1; else echo landed-item-marker; fi",
-    );
-
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
+    ]);
     repo.jjq().args(["run", "--all"]).assert().code(2);
 
     let latest = repo.jjq_success(&["tail", "--all", "--no-follow"]);
@@ -2329,13 +2828,12 @@ fn test_tail_failed_item_after_batch_continues() {
 
 #[test]
 fn test_run_failure_shows_output() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_merge_with_check("echo 'build failed: missing dependency' && exit 1");
-
-    run_jj(repo.path(), &["new", "-m", "will fail", "main"]);
-    fs::write(repo.path().join("file.txt"), "content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "fail-branch"]);
-    repo.jjq_success(&["push", "fail-branch"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_MERGE_TEMPLATE);
+    repo.jjq_success(&[
+        "config",
+        "check_command",
+        "echo 'build failed: missing dependency' && exit 1",
+    ]);
 
     let output = repo.jjq_failure(&["run"]);
     assert!(
@@ -2347,13 +2845,7 @@ fn test_run_failure_shows_output() {
 
 #[test]
 fn test_run_creates_log_file() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_merge();
-
-    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
-    fs::write(repo.path().join("newfile.txt"), "content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "simple-branch"]);
-    repo.jjq_success(&["push", "simple-branch"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_MERGE_TEMPLATE);
     repo.jjq_success(&["run"]);
 
     let log_path = repo.path().join(".jj").join("jjq").join("run.log");
@@ -2369,8 +2861,8 @@ fn test_run_creates_log_file() {
 
 #[test]
 fn test_log_file_truncated_between_runs() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_merge_with_check("echo run-output-marker");
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_MERGE_TEMPLATE);
+    repo.jjq_success(&["config", "check_command", "echo run-output-marker"]);
 
     let log_path = repo.path().join(".jj").join("jjq").join("run.log");
     // Seed a stale log to verify run truncates rather than appends.
@@ -2380,10 +2872,6 @@ fn test_log_file_truncated_between_runs() {
     )
     .unwrap();
 
-    run_jj(repo.path(), &["new", "-m", "feature 1", "main"]);
-    fs::write(repo.path().join("f1.txt"), "content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "f1"]);
-    repo.jjq_success(&["push", "f1"]);
     repo.jjq_success(&["run"]);
 
     let contents = fs::read_to_string(&log_path).unwrap();
@@ -2405,22 +2893,21 @@ fn test_log_file_truncated_between_runs() {
 
 #[test]
 fn test_run_rebase_success() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq(); // defaults to rebase strategy
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
 
-    // Create a simple non-conflicting change
-    run_jj(repo.path(), &["new", "-m", "add feature", "main"]);
-    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "feature"]);
-    run_jj(repo.path(), &["new", "main"]);
-
-    // Push and run
-    repo.jjq_success(&["push", "feature"]);
     let output = repo.jjq_success(&["run"]);
 
     // Verify rebase strategy was used
-    assert!(output.contains("rebase strategy"), "expected rebase strategy in output: {}", output);
-    assert!(output.contains("rebased"), "expected 'rebased' in output: {}", output);
+    assert!(
+        output.contains("rebase strategy"),
+        "expected rebase strategy in output: {}",
+        output
+    );
+    assert!(
+        output.contains("rebased"),
+        "expected 'rebased' in output: {}",
+        output
+    );
 
     // Verify trunk advanced: feature.txt should exist on main
     assert!(repo.jj_file_exists("feature.txt", "main"));
@@ -2430,28 +2917,30 @@ fn test_run_rebase_success() {
 #[test]
 fn test_run_rebase_preserves_change_id() {
     // Option E: verify the original change ID is preserved when landing
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
 
-    // Create a change and capture its change ID
-    run_jj(repo.path(), &["new", "-m", "my feature", "main"]);
-    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "feat"]);
-
-    let original_change_id = run_jj(repo.path(), &[
-        "log", "-r", "feat", "--no-graph", "-T", "change_id.short()",
-    ]).trim().to_string();
-
-    run_jj(repo.path(), &["new", "main"]);
-
-    // Push and run
-    repo.jjq_success(&["push", "feat"]);
+    let original_change_id = run_jj(
+        repo.path(),
+        &[
+            "log",
+            "-r",
+            "feature",
+            "--no-graph",
+            "-T",
+            "change_id.short()",
+        ],
+    )
+    .trim()
+    .to_string();
     repo.jjq_success(&["run"]);
 
     // The change ID on main should be the SAME as the original
-    let landed_change_id = run_jj(repo.path(), &[
-        "log", "-r", "main", "--no-graph", "-T", "change_id.short()",
-    ]).trim().to_string();
+    let landed_change_id = run_jj(
+        repo.path(),
+        &["log", "-r", "main", "--no-graph", "-T", "change_id.short()"],
+    )
+    .trim()
+    .to_string();
 
     assert_eq!(
         original_change_id, landed_change_id,
@@ -2462,8 +2951,7 @@ fn test_run_rebase_preserves_change_id() {
 
 #[test]
 fn test_run_rebase_linear_history() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // Push two non-conflicting changes
     run_jj(repo.path(), &["new", "-m", "feature A", "main"]);
@@ -2485,16 +2973,21 @@ fn test_run_rebase_linear_history() {
     assert!(repo.jj_file_exists("b.txt", "main"));
 
     // Verify linear history: main's commit should have only 1 parent
-    let parent_count = run_jj(repo.path(), &[
-        "log", "-r", "main", "--no-graph", "-T", "parents.len()",
-    ]);
-    assert_eq!(parent_count.trim(), "1", "expected linear history (1 parent), got: {}", parent_count.trim());
+    let parent_count = run_jj(
+        repo.path(),
+        &["log", "-r", "main", "--no-graph", "-T", "parents.len()"],
+    );
+    assert_eq!(
+        parent_count.trim(),
+        "1",
+        "expected linear history (1 parent), got: {}",
+        parent_count.trim()
+    );
 }
 
 #[test]
 fn test_run_rebase_preserves_description() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "my cool feature", "main"]);
     fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
@@ -2506,17 +2999,30 @@ fn test_run_rebase_preserves_description() {
 
     // Check that trunk's description contains the original message + trailers
     // Note: Option E preserves the original change ID, so no jjq-source trailer needed
-    let desc = run_jj(repo.path(), &[
-        "log", "-r", "main", "--no-graph", "-T", "description",
-    ]);
-    assert!(desc.contains("my cool feature"), "desc should contain original: {}", desc);
-    assert!(desc.contains("jjq-sequence:"), "desc should have sequence trailer: {}", desc);
-    assert!(desc.contains("jjq-strategy: rebase"), "desc should have strategy trailer: {}", desc);
+    let desc = run_jj(
+        repo.path(),
+        &["log", "-r", "main", "--no-graph", "-T", "description"],
+    );
+    assert!(
+        desc.contains("my cool feature"),
+        "desc should contain original: {}",
+        desc
+    );
+    assert!(
+        desc.contains("jjq-sequence:"),
+        "desc should have sequence trailer: {}",
+        desc
+    );
+    assert!(
+        desc.contains("jjq-strategy: rebase"),
+        "desc should have strategy trailer: {}",
+        desc
+    );
 }
 
 #[test]
 fn test_run_rebase_conflict() {
-    let repo = TestRepo::with_prs();
+    let repo = TestRepo::from_template(&PRS_TEMPLATE);
     repo.init_jjq(); // rebase strategy
 
     // PR1 and PR2 both modify main.go, should conflict after PR1 merges
@@ -2528,7 +3034,11 @@ fn test_run_rebase_conflict() {
 
     // Run second item (should fail with conflict)
     let output = repo.jjq_failure(&["run"]);
-    assert!(output.contains("conflicts"), "expected conflict: {}", output);
+    assert!(
+        output.contains("conflicts"),
+        "expected conflict: {}",
+        output
+    );
     let failed = history_events(&repo, "2")
         .into_iter()
         .find(|event| event["kind"] == "failed")
@@ -2543,18 +3053,14 @@ fn test_run_rebase_conflict() {
 
 #[test]
 fn test_run_rebase_check_failure() {
-    let repo = TestRepo::with_go_project();
-    // Use rebase strategy with "false" check command
-    repo.jjq_success(&["init", "--trunk", "main", "--check", "false"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_CHECK_FALSE_TEMPLATE);
 
-    run_jj(repo.path(), &["new", "-m", "will fail check", "main"]);
-    fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "feat"]);
-    run_jj(repo.path(), &["new", "main"]);
-
-    repo.jjq_success(&["push", "feat"]);
     let output = repo.jjq_failure(&["run"]);
-    assert!(output.contains("failed check"), "expected check failure: {}", output);
+    assert!(
+        output.contains("failed check"),
+        "expected check failure: {}",
+        output
+    );
 
     // Trunk should NOT have moved
     assert!(!repo.jj_file_exists("feature.txt", "main"));
@@ -2565,8 +3071,7 @@ fn test_run_rebase_commit_chain() {
     // Regression test: pushing an empty @ whose parent has the actual changes.
     // duplicate_onto must duplicate the full range (trunk..candidate), not just
     // the candidate's diff, to include intermediate commits.
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // Create a change, then do "jj new" so @ is empty and the parent has content.
     // This mimics: workspace with work in @-, empty @ on top.
@@ -2581,16 +3086,17 @@ fn test_run_rebase_commit_chain() {
     assert!(output.contains("rebased"), "expected rebased: {}", output);
     // The critical check: feature.txt must be on main even though the pushed
     // commit itself was empty — the intermediate commit's changes must be included.
-    assert!(repo.jj_file_exists("feature.txt", "main"),
-        "feature.txt should be on main after rebase of commit chain");
+    assert!(
+        repo.jj_file_exists("feature.txt", "main"),
+        "feature.txt should be on main after rebase of commit chain"
+    );
 }
 
 #[test]
 fn test_run_rebase_abandons_all_duplicates() {
     // Regression test: when duplicating a commit chain for rebase testing,
     // ALL duplicates must be abandoned on success, not just the tip.
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // Create a chain of 3 commits off main
     run_jj(repo.path(), &["new", "-m", "first", "main"]);
@@ -2606,26 +3112,54 @@ fn test_run_rebase_abandons_all_duplicates() {
     repo.jjq_success(&["run"]);
 
     // Count commits with each description — should be exactly 1 of each
-    let log = run_jj(repo.path(), &["log", "--no-graph", "-T", "description.first_line() ++ \"\\n\""]);
+    let log = run_jj(
+        repo.path(),
+        &[
+            "log",
+            "--no-graph",
+            "-T",
+            "description.first_line() ++ \"\\n\"",
+        ],
+    );
     let first_count = log.lines().filter(|l| *l == "first").count();
     let second_count = log.lines().filter(|l| *l == "second").count();
     let third_count = log.lines().filter(|l| *l == "third").count();
 
-    assert_eq!(first_count, 1, "should have exactly 1 'first' commit, found {}", first_count);
-    assert_eq!(second_count, 1, "should have exactly 1 'second' commit, found {}", second_count);
-    assert_eq!(third_count, 1, "should have exactly 1 'third' commit, found {}", third_count);
+    assert_eq!(
+        first_count, 1,
+        "should have exactly 1 'first' commit, found {}",
+        first_count
+    );
+    assert_eq!(
+        second_count, 1,
+        "should have exactly 1 'second' commit, found {}",
+        second_count
+    );
+    assert_eq!(
+        third_count, 1,
+        "should have exactly 1 'third' commit, found {}",
+        third_count
+    );
 
     // Verify all files are on main
-    assert!(repo.jj_file_exists("a.txt", "main"), "a.txt should be on main");
-    assert!(repo.jj_file_exists("b.txt", "main"), "b.txt should be on main");
-    assert!(repo.jj_file_exists("c.txt", "main"), "c.txt should be on main");
+    assert!(
+        repo.jj_file_exists("a.txt", "main"),
+        "a.txt should be on main"
+    );
+    assert!(
+        repo.jj_file_exists("b.txt", "main"),
+        "b.txt should be on main"
+    );
+    assert!(
+        repo.jj_file_exists("c.txt", "main"),
+        "c.txt should be on main"
+    );
 }
 
 #[test]
 fn test_run_skips_empty_commit_rebase() {
     // When a queued commit's changes are already on trunk, run should skip it.
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // Create a feature branch
     run_jj(repo.path(), &["new", "-m", "add feature", "main"]);
@@ -2644,19 +3178,30 @@ fn test_run_skips_empty_commit_rebase() {
     repo.jjq_success(&["push", "feat"]);
     let output = repo.jjq_success(&["run"]);
 
-    assert!(output.contains("empty"), "expected 'empty' in output: {}", output);
-    assert!(output.contains("skipping"), "expected 'skipping' in output: {}", output);
+    assert!(
+        output.contains("empty"),
+        "expected 'empty' in output: {}",
+        output
+    );
+    assert!(
+        output.contains("skipping"),
+        "expected 'skipping' in output: {}",
+        output
+    );
 
     // Queue should now be empty
     let status = repo.jjq_success(&["status"]);
-    assert!(status.contains("queue is empty"), "queue should be empty: {}", status);
+    assert!(
+        status.contains("queue is empty"),
+        "queue should be empty: {}",
+        status
+    );
 }
 
 #[test]
 fn test_run_skips_empty_commit_merge() {
     // Same scenario with merge strategy.
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_merge();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_MERGE_TEMPLATE);
 
     // Create a feature branch
     run_jj(repo.path(), &["new", "-m", "add feature", "main"]);
@@ -2675,15 +3220,22 @@ fn test_run_skips_empty_commit_merge() {
     repo.jjq_success(&["push", "feat"]);
     let output = repo.jjq_success(&["run"]);
 
-    assert!(output.contains("empty"), "expected 'empty' in output: {}", output);
-    assert!(output.contains("skipping"), "expected 'skipping' in output: {}", output);
+    assert!(
+        output.contains("empty"),
+        "expected 'empty' in output: {}",
+        output
+    );
+    assert!(
+        output.contains("skipping"),
+        "expected 'skipping' in output: {}",
+        output
+    );
 }
 
 #[test]
 fn test_run_all_counts_skipped_empty() {
     // Batch mode should report skipped items separately.
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // Create first feature (will be empty — changes already on trunk)
     run_jj(repo.path(), &["new", "-m", "feature one", "main"]);
@@ -2707,8 +3259,15 @@ fn test_run_all_counts_skipped_empty() {
     repo.jjq_success(&["push", "feat2"]);
     let output = repo.jjq_success(&["run", "--all"]);
 
-    assert!(output.contains("skipped (empty)"), "expected skipped count in output: {}", output);
-    assert!(repo.jj_file_exists("f2.txt", "main"), "f2.txt should be on main");
+    assert!(
+        output.contains("skipped (empty)"),
+        "expected skipped count in output: {}",
+        output
+    );
+    assert!(
+        repo.jj_file_exists("f2.txt", "main"),
+        "f2.txt should be on main"
+    );
     assert!(history_kinds(&repo, "1").contains(&"skipped_empty".to_string()));
 }
 
@@ -2719,25 +3278,18 @@ fn test_run_all_counts_skipped_empty() {
 fn test_requeue_basic() {
     // Set up: push a feature with a failing check, then requeue after
     // switching to a passing check command.
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("false");
-
-    // Create a non-conflicting feature
-    run_jj(repo.path(), &["new", "-m", "add feature", "main"]);
-    fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "feat"]);
-    run_jj(repo.path(), &["new", "main"]);
-
-    repo.jjq_success(&["push", "feat"]);
-
-    // Run — fails because check command is "false"
-    repo.jjq_output(&["run"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_CHECK_FALSE_TEMPLATE);
+    repo.jjq_failure(&["run"]);
     let failed_log = repo.path().join(".jj/jjq/failed-logs/000001.log");
     assert!(failed_log.exists(), "failed check log should be archived");
 
     // Verify item 1 is in failed state
     let status = repo.jjq_success(&["status"]);
-    assert!(status.contains("Failed"), "expected failed item: {}", status);
+    assert!(
+        status.contains("Failed"),
+        "expected failed item: {}",
+        status
+    );
 
     // Switch check command to "true" (simulating the user fixing the issue)
     repo.jjq_success(&["config", "check_command", "true"]);
@@ -2758,37 +3310,48 @@ fn test_requeue_basic() {
 
     // Status should show the item back in queue, no failed items
     let status = repo.jjq_success(&["status"]);
-    assert!(status.contains("Queued"), "expected queued item: {}", status);
-    assert!(!status.contains("Failed"), "failed list should be empty: {}", status);
+    assert!(
+        status.contains("Queued"),
+        "expected queued item: {}",
+        status
+    );
+    assert!(
+        !status.contains("Failed"),
+        "failed list should be empty: {}",
+        status
+    );
 
     // Run the requeued item — should succeed now
     let run_output = repo.jjq_success(&["run"]);
-    assert!(run_output.contains("merged") || run_output.contains("rebased"),
-        "expected successful merge: {}", run_output);
+    assert!(
+        run_output.contains("merged") || run_output.contains("rebased"),
+        "expected successful merge: {}",
+        run_output
+    );
 }
 
 #[test]
 fn test_concurrent_requeue_same_failed_item_creates_one_retry() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("false");
-
-    run_jj(repo.path(), &["new", "-m", "race retry", "main"]);
-    fs::write(repo.path().join("race-retry.txt"), "retry\n").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "race-retry"]);
-    run_jj(repo.path(), &["new", "main"]);
-    repo.jjq_success(&["push", "race-retry"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_CHECK_FALSE_TEMPLATE);
     repo.jjq_failure(&["run"]);
 
     let first = spawn_requeue(&repo, repo.path(), "1");
     let second = spawn_requeue(&repo, repo.path(), "1");
-    let first = first.wait_with_output().expect("failed to wait for first requeue");
-    let second = second.wait_with_output().expect("failed to wait for second requeue");
+    let first = first
+        .wait_with_output()
+        .expect("failed to wait for first requeue");
+    let second = second
+        .wait_with_output()
+        .expect("failed to wait for second requeue");
     let outcomes = [first, second];
     assert_eq!(
         outcomes.iter().filter(|out| out.status.success()).count(),
         1,
         "exactly one requeue may create a replacement: {:?}",
-        outcomes.iter().map(|out| out.status.code()).collect::<Vec<_>>()
+        outcomes
+            .iter()
+            .map(|out| out.status.code())
+            .collect::<Vec<_>>()
     );
     assert!(
         outcomes
@@ -2796,7 +3359,10 @@ fn test_concurrent_requeue_same_failed_item_creates_one_retry() {
             .filter(|out| !out.status.success())
             .all(|out| out.status.code() == Some(10)),
         "losing requeue should fail with usage: {:?}",
-        outcomes.iter().map(|out| out.status.code()).collect::<Vec<_>>()
+        outcomes
+            .iter()
+            .map(|out| out.status.code())
+            .collect::<Vec<_>>()
     );
     assert_eq!(queue_bookmark_names(&repo), vec!["jjq/queue/000002"]);
     assert_eq!(meta_last_id(&repo), "2");
@@ -2810,8 +3376,7 @@ fn test_concurrent_requeue_same_failed_item_creates_one_retry() {
 
 #[test]
 fn test_push_and_requeue_race_leaves_one_valid_submission() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("false");
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_CHECK_FALSE_TEMPLATE);
     run_jj(repo.path(), &["new", "-m", "push retry race", "main"]);
     fs::write(repo.path().join("push-retry-race.txt"), "retry\n").unwrap();
     run_jj(repo.path(), &["bookmark", "create", "push-retry-race"]);
@@ -2822,7 +3387,9 @@ fn test_push_and_requeue_race_leaves_one_valid_submission() {
     let push = spawn_push(&repo, repo.path(), "push-retry-race");
     let requeue = spawn_requeue(&repo, repo.path(), "1");
     let push = push.wait_with_output().expect("failed to wait for push");
-    let requeue = requeue.wait_with_output().expect("failed to wait for requeue");
+    let requeue = requeue
+        .wait_with_output()
+        .expect("failed to wait for requeue");
     assert_eq!(
         [push, requeue]
             .iter()
@@ -2837,19 +3404,17 @@ fn test_push_and_requeue_race_leaves_one_valid_submission() {
 
 #[test]
 fn test_delete_and_requeue_race_never_resurrects_deleted_failed_item() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("false");
-    run_jj(repo.path(), &["new", "-m", "delete retry race", "main"]);
-    fs::write(repo.path().join("delete-retry-race.txt"), "retry\n").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "delete-retry-race"]);
-    run_jj(repo.path(), &["new", "main"]);
-    repo.jjq_success(&["push", "delete-retry-race"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_CHECK_FALSE_TEMPLATE);
     repo.jjq_failure(&["run"]);
 
     let delete = spawn_delete(&repo, repo.path(), "1");
     let requeue = spawn_requeue(&repo, repo.path(), "1");
-    let delete = delete.wait_with_output().expect("failed to wait for delete");
-    let requeue = requeue.wait_with_output().expect("failed to wait for requeue");
+    let delete = delete
+        .wait_with_output()
+        .expect("failed to wait for delete");
+    let requeue = requeue
+        .wait_with_output()
+        .expect("failed to wait for requeue");
     let delete_succeeded = delete.status.success();
     assert_eq!(
         [&delete, &requeue]
@@ -2873,27 +3438,14 @@ fn test_delete_and_requeue_race_never_resurrects_deleted_failed_item() {
 
 #[test]
 fn test_requeue_finishes_interrupted_create_before_delete() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_with_check("false");
-
-    run_jj(repo.path(), &["new", "-m", "interrupted retry", "main"]);
-    fs::write(repo.path().join("interrupted-retry.txt"), "retry\n").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "retry"]);
-    run_jj(repo.path(), &["new", "main"]);
-    repo.jjq_success(&["push", "retry"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_CHECK_FALSE_TEMPLATE);
     repo.jjq_failure(&["run"]);
 
     // This is precisely the durable overlap a crash can leave: the new queue
     // bookmark was created, while the old failed bookmark remains.
     run_jj(
         repo.path(),
-        &[
-            "bookmark",
-            "create",
-            "-r",
-            "retry",
-            "jjq/queue/000002",
-        ],
+        &["bookmark", "create", "-r", "feature", "jjq/queue/000002"],
     );
     repo.jjq_success(&["requeue", "1"]);
 
@@ -2922,8 +3474,7 @@ fn test_requeue_finishes_interrupted_create_before_delete() {
 
 #[test]
 fn test_requeue_not_found() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     let output = repo.jjq_failure(&["requeue", "999"]);
     insta::assert_snapshot!(output, @"jjq: failed item 999 not found");
@@ -2932,16 +3483,7 @@ fn test_requeue_not_found() {
 
 #[test]
 fn test_requeue_already_queued() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
-
-    // Create and push a feature
-    run_jj(repo.path(), &["new", "-m", "feature", "main"]);
-    fs::write(repo.path().join("new.txt"), "hello\n").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "feat"]);
-    run_jj(repo.path(), &["new", "main"]);
-
-    repo.jjq_success(&["push", "feat"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
 
     // Try requeuing ID 1 which is queued, not failed
     let output = repo.jjq_failure(&["requeue", "1"]);
@@ -2951,7 +3493,7 @@ fn test_requeue_already_queued() {
 #[test]
 fn test_requeue_still_conflicts() {
     // Set up a failed item but don't fix the conflict before requeuing
-    let repo = TestRepo::with_prs();
+    let repo = TestRepo::from_template(&PRS_TEMPLATE);
     repo.init_jjq_merge_with_check("true");
 
     repo.jjq_success(&["push", "pr1"]);
@@ -2963,17 +3505,16 @@ fn test_requeue_still_conflicts() {
 
     // Try requeuing without resolving conflicts — should fail
     let output = repo.jjq_failure(&["requeue", "2"]);
-    assert!(output.contains("conflicts"), "expected conflict error: {}", output);
+    assert!(
+        output.contains("conflicts"),
+        "expected conflict error: {}",
+        output
+    );
 }
 
 #[test]
 fn test_status_shows_recently_landed_merge() {
-    let repo = TestRepo::with_run_all_happy_scenario();
-    repo.init_jjq_merge();
-
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
-    repo.jjq_success(&["push", "f3"]);
+    let repo = TestRepo::from_template(&THREE_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
 
     // Run all items
     repo.jjq_success(&["run", "--all"]);
@@ -2990,12 +3531,7 @@ fn test_status_shows_recently_landed_merge() {
 
 #[test]
 fn test_status_shows_recently_landed_rebase() {
-    let repo = TestRepo::with_run_all_happy_scenario();
-    repo.init_jjq();
-
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
-    repo.jjq_success(&["push", "f3"]);
+    let repo = TestRepo::from_template(&THREE_QUEUED_RUN_ALL_HAPPY_TEMPLATE);
 
     // Run all items
     repo.jjq_success(&["run", "--all"]);
@@ -3016,14 +3552,20 @@ fn add_workspace(repo: &TestRepo, container: &TempDir, name: &str) -> PathBuf {
     let ws_path = container.path().join(name);
     run_jj(
         repo.path(),
-        &["workspace", "add", "--name", name, ws_path.to_str().unwrap()],
+        &[
+            "workspace",
+            "add",
+            "--name",
+            name,
+            ws_path.to_str().unwrap(),
+        ],
     );
     ws_path
 }
 
 #[test]
 fn test_push_from_secondary_workspace_uses_shared_locks() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     // Create a branch to push
@@ -3083,7 +3625,7 @@ fn test_push_from_secondary_workspace_uses_shared_locks() {
 fn test_push_from_secondary_workspace_respects_meta_lock() {
     use fs2::FileExt;
 
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     // Create a branch to push
@@ -3190,8 +3732,7 @@ fn commit_id_of(repo: &TestRepo, revset: &str) -> String {
 /// change so post-landing edits stay off the landed commit.
 #[test]
 fn test_rebase_landing_wc_commit_post_edit_does_not_move_trunk() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq(); // rebase strategy
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     let container = TempDir::new().expect("failed to create workspace container");
     let ws = add_workspace_at(&repo, &container, "agent2", "main");
@@ -3228,8 +3769,7 @@ fn test_rebase_landing_wc_commit_post_edit_does_not_move_trunk() {
 /// auto-rebases the merge commit above it and the trunk bookmark follows.
 #[test]
 fn test_merge_landing_wc_commit_post_edit_does_not_move_trunk() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq_merge();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_MERGE_TEMPLATE);
 
     let container = TempDir::new().expect("failed to create workspace container");
     let ws = add_workspace_at(&repo, &container, "agent2", "main");
@@ -3261,8 +3801,7 @@ fn test_merge_landing_wc_commit_post_edit_does_not_move_trunk() {
 /// child (like `jj commit` does), leaving the queued commit as pushed.
 #[test]
 fn test_push_moves_working_copy_off_queued_commit() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "feature", "main"]);
     fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
@@ -3282,7 +3821,14 @@ fn test_push_moves_working_copy_off_queued_commit() {
     );
     let wc_parent = run_jj(
         repo.path(),
-        &["log", "-r", "@", "--no-graph", "-T", "parents.map(|c| c.commit_id()).join(\"\")"],
+        &[
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            "parents.map(|c| c.commit_id()).join(\"\")",
+        ],
     )
     .trim()
     .to_string();
@@ -3301,8 +3847,7 @@ fn test_push_moves_working_copy_off_queued_commit() {
 /// copy alone.
 #[test]
 fn test_push_leaves_working_copy_when_not_wc_commit() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "feature", "main"]);
     fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
@@ -3324,8 +3869,7 @@ fn test_push_leaves_working_copy_when_not_wc_commit() {
 /// working copy off it, same as push.
 #[test]
 fn test_requeue_moves_working_copy_off_requeued_commit() {
-    let repo = TestRepo::with_go_project();
-    repo.jjq_success(&["init", "--trunk", "main", "--check", "false"]);
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_CHECK_FALSE_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "fixme", "main"]);
     fs::write(repo.path().join("feature.txt"), "broken\n").unwrap();
@@ -3364,8 +3908,7 @@ fn test_requeue_moves_working_copy_off_requeued_commit() {
 /// runner warns that edits in that workspace will drag trunk.
 #[test]
 fn test_run_warns_when_landing_another_workspaces_wc_commit() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     let container = TempDir::new().expect("failed to create workspace container");
     let ws = add_workspace_at(&repo, &container, "agent2", "main");
@@ -3463,7 +4006,11 @@ fn assert_no_failed_bookmarks(repo: &TestRepo) {
             "name ++ \"\\n\"",
         ],
     );
-    assert!(failed.trim().is_empty(), "stale failed bookmarks: {}", failed);
+    assert!(
+        failed.trim().is_empty(),
+        "stale failed bookmarks: {}",
+        failed
+    );
 }
 
 /// Assert no bookmark in the repo is conflicted (racing metadata writers
@@ -3489,7 +4036,13 @@ fn assert_no_conflicted_bookmarks(repo: &TestRepo) {
 fn meta_last_id(repo: &TestRepo) -> String {
     run_jj(
         repo.path(),
-        &["file", "show", "last_id", "-r", "bookmarks(exact:\"jjq/_/_\")"],
+        &[
+            "file",
+            "show",
+            "last_id",
+            "-r",
+            "bookmarks(exact:\"jjq/_/_\")",
+        ],
     )
     .trim()
     .to_string()
@@ -3502,7 +4055,7 @@ fn meta_last_id(repo: &TestRepo) -> String {
 /// is deterministic; no sleeps needed.
 #[test]
 fn test_concurrent_pushes_from_two_workspaces() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     // Two distinct changes to push.
@@ -3521,8 +4074,12 @@ fn test_concurrent_pushes_from_two_workspaces() {
     let child_a = spawn_push(&repo, &ws_a, "fa");
     let child_b = spawn_push(&repo, &ws_b, "fb");
 
-    let out_a = child_a.wait_with_output().expect("failed to wait for push a");
-    let out_b = child_b.wait_with_output().expect("failed to wait for push b");
+    let out_a = child_a
+        .wait_with_output()
+        .expect("failed to wait for push a");
+    let out_b = child_b
+        .wait_with_output()
+        .expect("failed to wait for push b");
     for (name, out) in [("fa", &out_a), ("fb", &out_b)] {
         assert!(
             out.status.success(),
@@ -3565,7 +4122,7 @@ fn stress_concurrent_push_storm() {
     const PUSHES_PER_WORKSPACE: usize = 2;
     const N: usize = WORKSPACES * PUSHES_PER_WORKSPACE;
 
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     for i in 0..N {
@@ -3574,7 +4131,10 @@ fn stress_concurrent_push_storm() {
             &["new", "-m", &format!("storm feature {}", i), "main"],
         );
         fs::write(repo.path().join(format!("storm-{}.txt", i)), "content").unwrap();
-        run_jj(repo.path(), &["bookmark", "create", &format!("storm-{}", i)]);
+        run_jj(
+            repo.path(),
+            &["bookmark", "create", &format!("storm-{}", i)],
+        );
     }
     run_jj(repo.path(), &["new", "main"]);
 
@@ -3624,13 +4184,7 @@ fn stress_concurrent_push_storm() {
 fn repo_with_queued_item_and_held_run_lock() -> (TestRepo, fs::File) {
     use fs2::FileExt;
 
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
-
-    run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
-    fs::write(repo.path().join("feature.txt"), "feature content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "feature"]);
-    repo.jjq_success(&["push", "feature"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
 
     let lock_dir = repo.path().join(".jj").join("jjq").join("locks");
     fs::create_dir_all(&lock_dir).unwrap();
@@ -3711,7 +4265,7 @@ fn test_run_exits_when_run_lock_held() {
 
 #[test]
 fn test_run_all_missing_check_command_fails_fast() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     // Initialize metadata without a check command: setting any config key
     // auto-creates the metadata branch, and only init enforces --check.
     repo.jjq_success(&["config", "trunk_bookmark", "main"]);
@@ -3746,7 +4300,7 @@ fn test_run_all_missing_check_command_fails_fast() {
 fn test_push_times_out_when_meta_lock_held() {
     use fs2::FileExt;
 
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     run_jj(repo.path(), &["new", "-m", "test feature", "main"]);
@@ -3808,11 +4362,25 @@ fn test_push_times_out_when_meta_lock_held() {
 fn conflict_meta_bookmark(repo: &TestRepo, side_a: &str, side_b: &str) {
     let op = run_jj(
         repo.path(),
-        &["op", "log", "-n1", "--no-graph", "-T", "id.short() ++ \"\\n\""],
+        &[
+            "op",
+            "log",
+            "-n1",
+            "--no-graph",
+            "-T",
+            "id.short() ++ \"\\n\"",
+        ],
     );
     run_jj(
         repo.path(),
-        &["bookmark", "set", "jjq/_/_", "-r", side_a, "--allow-backwards"],
+        &[
+            "bookmark",
+            "set",
+            "jjq/_/_",
+            "-r",
+            side_a,
+            "--allow-backwards",
+        ],
     );
     run_jj(
         repo.path(),
@@ -3833,12 +4401,18 @@ fn conflict_meta_bookmark(repo: &TestRepo, side_a: &str, side_b: &str) {
 
 #[test]
 fn test_conflicted_metadata_bookmark_reports_cleanly() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
-    let side_a = run_jj(repo.path(), &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
+    let side_a = run_jj(
+        repo.path(),
+        &["log", "-r", "main", "--no-graph", "-T", "commit_id"],
+    );
     run_jj(repo.path(), &["new", "-m", "divergent side", "main"]);
-    let side_b = run_jj(repo.path(), &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    let side_b = run_jj(
+        repo.path(),
+        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+    );
     conflict_meta_bookmark(&repo, side_a.trim(), side_b.trim());
 
     // Reads must fail with a short, actionable message — not a wall of raw
@@ -3861,6 +4435,15 @@ fn test_conflicted_metadata_bookmark_reports_cleanly() {
         config_out
     );
 
+    // Writes use the same structured resolution and must reject both sides
+    // rather than choosing one or treating the conflict as first use.
+    let write_out = repo.jjq_failure(&["config", "check_command", "false"]);
+    assert!(
+        write_out.contains("run 'jjq doctor'"),
+        "config write should point at doctor: {}",
+        write_out
+    );
+
     // Doctor must run to completion and diagnose, not crash.
     let doctor_out = repo.jjq_failure(&["doctor"]);
     assert!(
@@ -3877,7 +4460,7 @@ fn test_conflicted_metadata_bookmark_reports_cleanly() {
 
 #[test]
 fn test_doctor_fix_repairs_conflicted_metadata_bookmark() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     // A real post-push metadata commit carries last_id=1; it must win.
@@ -3887,7 +4470,14 @@ fn test_doctor_fix_repairs_conflicted_metadata_bookmark() {
     repo.jjq_success(&["push", "feature"]);
     let winner = run_jj(
         repo.path(),
-        &["log", "-r", "bookmarks(exact:\"jjq/_/_\")", "--no-graph", "-T", "commit_id"],
+        &[
+            "log",
+            "-r",
+            "bookmarks(exact:\"jjq/_/_\")",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
     )
     .trim()
     .to_string();
@@ -3896,9 +4486,12 @@ fn test_doctor_fix_repairs_conflicted_metadata_bookmark() {
     // sequence counter, as a racing writer's losing side would be.
     run_jj(repo.path(), &["new", "-m", "losing meta side", "root()"]);
     fs::write(repo.path().join("last_id"), "0").unwrap();
-    let loser = run_jj(repo.path(), &["log", "-r", "@", "--no-graph", "-T", "commit_id"])
-        .trim()
-        .to_string();
+    let loser = run_jj(
+        repo.path(),
+        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+    )
+    .trim()
+    .to_string();
     run_jj(repo.path(), &["new", "main"]);
 
     // One more metadata write so the bookmark's pre-conflict target differs
@@ -3935,7 +4528,14 @@ fn test_doctor_fix_repairs_conflicted_metadata_bookmark() {
     // The side with the highest last_id was kept, so no IDs are reused.
     let resolved = run_jj(
         repo.path(),
-        &["log", "-r", "bookmarks(exact:\"jjq/_/_\")", "--no-graph", "-T", "commit_id ++ \"\\n\""],
+        &[
+            "log",
+            "-r",
+            "bookmarks(exact:\"jjq/_/_\")",
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
     );
     assert_eq!(
         resolved.trim(),
@@ -3944,14 +4544,31 @@ fn test_doctor_fix_repairs_conflicted_metadata_bookmark() {
     );
     let last_id = run_jj(
         repo.path(),
-        &["file", "show", "last_id", "-r", "bookmarks(exact:\"jjq/_/_\")"],
+        &[
+            "file",
+            "show",
+            "last_id",
+            "-r",
+            "bookmarks(exact:\"jjq/_/_\")",
+        ],
     );
-    assert_eq!(last_id.trim(), "1", "sequence counter should keep the highest value");
+    assert_eq!(
+        last_id.trim(),
+        "1",
+        "sequence counter should keep the highest value"
+    );
 
     // The losing side was abandoned.
     let visible = run_jj(
         repo.path(),
-        &["log", "-r", "all()", "--no-graph", "-T", "commit_id ++ \"\\n\""],
+        &[
+            "log",
+            "-r",
+            "all()",
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
     );
     assert!(
         !visible.contains(&loser),
@@ -3962,14 +4579,20 @@ fn test_doctor_fix_repairs_conflicted_metadata_bookmark() {
 
 #[test]
 fn test_doctor_fix_refuses_without_readable_last_id() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     // Conflict sides pointing at ordinary project commits: no side carries a
     // sequence counter, so there is nothing safe for --fix to pick.
-    let side_a = run_jj(repo.path(), &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
+    let side_a = run_jj(
+        repo.path(),
+        &["log", "-r", "main", "--no-graph", "-T", "commit_id"],
+    );
     run_jj(repo.path(), &["new", "-m", "divergent side", "main"]);
-    let side_b = run_jj(repo.path(), &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+    let side_b = run_jj(
+        repo.path(),
+        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+    );
     conflict_meta_bookmark(&repo, side_a.trim(), side_b.trim());
 
     let out = repo.jjq_failure(&["doctor", "--fix"]);
@@ -3987,10 +4610,22 @@ fn test_doctor_fix_refuses_without_readable_last_id() {
     // The bookmark is untouched: still conflicted with both sides.
     let sides = run_jj(
         repo.path(),
-        &["log", "-r", "bookmarks(exact:\"jjq/_/_\")", "--no-graph", "-T", "commit_id ++ \"\\n\""],
+        &[
+            "log",
+            "-r",
+            "bookmarks(exact:\"jjq/_/_\")",
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
     );
     let sides: Vec<&str> = sides.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(sides.len(), 2, "bookmark should remain conflicted: {:?}", sides);
+    assert_eq!(
+        sides.len(),
+        2,
+        "bookmark should remain conflicted: {:?}",
+        sides
+    );
     assert!(
         sides.contains(&side_a.trim()) && sides.contains(&side_b.trim()),
         "both sides should survive a refused repair: {:?}",
@@ -4022,9 +4657,7 @@ fn wait_for_file(path: &Path, timeout: std::time::Duration) {
 
 #[test]
 fn test_cancel_queued_item_is_immediate_and_idempotent() {
-    let repo = TestRepo::with_run_all_happy_scenario();
-    repo.init_jjq_merge();
-    repo.jjq_success(&["push", "f1"]);
+    let repo = TestRepo::from_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
 
     let first = repo.jjq_success(&["cancel", "1"]);
     assert!(first.contains("canceled queued item 1"), "{first}");
@@ -4043,13 +4676,17 @@ fn test_cancel_queued_item_is_immediate_and_idempotent() {
 
 #[test]
 fn test_queued_cancel_crash_cannot_later_land() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let recorded = sync.path().join("recorded");
     let never_release = sync.path().join("never-release");
     let check_ran = sync.path().join("check-ran");
-    repo.init_jjq_merge_with_check(&format!("touch {}", check_ran.display()));
-    repo.jjq_success(&["push", "f1"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&[
+        "config",
+        "check_command",
+        &format!("touch {}", check_ran.display()),
+    ]);
     let mut cancel = repo
         .jjq_std()
         .args(["cancel", "1"])
@@ -4068,12 +4705,15 @@ fn test_queued_cancel_crash_cannot_later_land() {
     let history = repo.jjq_success(&["history", "1", "--json"]);
     assert_eq!(history.matches("\"kind\": \"canceled\"").count(), 1);
     assert!(!history.contains("\"kind\": \"claimed\""), "{history}");
-    assert!(!history.contains("\"kind\": \"check_started\""), "{history}");
+    assert!(
+        !history.contains("\"kind\": \"check_started\""),
+        "{history}"
+    );
 }
 
 #[test]
 fn test_cancel_running_check_escalates_and_reports_status() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let started = sync.path().join("started");
     let descendant = sync.path().join("descendant");
@@ -4083,7 +4723,13 @@ fn test_cancel_running_check_escalates_and_reports_status() {
         started.display(),
     );
     repo.jjq_success(&[
-        "init", "--trunk", "main", "--check", &check, "--strategy", "merge",
+        "init",
+        "--trunk",
+        "main",
+        "--check",
+        &check,
+        "--strategy",
+        "merge",
     ]);
     run_jj(repo.path(), &["new", "-m", "cancel me", "main"]);
     fs::write(repo.path().join("cancel.txt"), "cancel\n").unwrap();
@@ -4132,12 +4778,26 @@ fn test_cancel_running_check_escalates_and_reports_status() {
     let (stdout, _, _) = repo.jjq_raw_output(&["status", "--json"]);
     let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(status["active_checks"][0]["phase"], "cancelling");
-    let output = child.wait_with_output().expect("failed to wait for canceled run");
-    assert!(output.status.success(), "stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for canceled run");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!repo.jj_file_exists("cancel.txt", "main"));
-    let descendant_pid: u32 = fs::read_to_string(&descendant).unwrap().trim().parse().unwrap();
+    let descendant_pid: u32 = fs::read_to_string(&descendant)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     let descendant_alive = unsafe { libc::kill(descendant_pid as libc::pid_t, 0) } == 0;
-    assert!(!descendant_alive, "descendant process {descendant_pid} survived cancellation");
+    assert!(
+        !descendant_alive,
+        "descendant process {descendant_pid} survived cancellation"
+    );
     assert!(!repo.path().join(".jj/jjq/cancellations/000001").exists());
     let history = repo.jjq_success(&["history", "1", "--json"]);
     assert!(history.contains("cancel_requested"), "{history}");
@@ -4146,7 +4806,7 @@ fn test_cancel_running_check_escalates_and_reports_status() {
 
 #[test]
 fn test_cancel_completed_speculation_invalidates_later_work() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&TWO_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let a_started = sync.path().join("a-started");
     let a_release = sync.path().join("a-release");
@@ -4157,9 +4817,8 @@ fn test_cancel_completed_speculation_invalidates_later_work() {
         release = a_release.display(),
         b = b_done.display(),
     );
-    repo.init_jjq_merge_with_check(&check);
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&["config", "check_command", &check]);
     let child = repo.spawn_jjq(&["run", "--all", "--jobs", "2"]);
     wait_for_file(&a_started, std::time::Duration::from_secs(30));
     wait_for_file(&b_done, std::time::Duration::from_secs(30));
@@ -4167,7 +4826,12 @@ fn test_cancel_completed_speculation_invalidates_later_work() {
     repo.jjq_success(&["cancel", "2"]);
     fs::write(&a_release, "").unwrap();
     let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(repo.jj_file_exists("f1.txt", "main"));
     assert!(!repo.jj_file_exists("f2.txt", "main"));
     let history = repo.jjq_success(&["history", "2", "--json"]);
@@ -4176,13 +4840,17 @@ fn test_cancel_completed_speculation_invalidates_later_work() {
 
 #[test]
 fn test_cancel_wins_after_claim_before_active_check_publication() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let claimed = sync.path().join("claimed");
     let release = sync.path().join("release");
     let check_ran = sync.path().join("check-ran");
-    repo.init_jjq_merge_with_check(&format!("touch {}", check_ran.display()));
-    repo.jjq_success(&["push", "f1"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&[
+        "config",
+        "check_command",
+        &format!("touch {}", check_ran.display()),
+    ]);
     let child = repo
         .jjq_std()
         .args(["run"])
@@ -4197,15 +4865,16 @@ fn test_cancel_wins_after_claim_before_active_check_publication() {
     fs::write(&release, "").unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    assert!(!check_ran.exists(), "accepted pre-start cancellation ran user check code");
+    assert!(
+        !check_ran.exists(),
+        "accepted pre-start cancellation ran user check code"
+    );
     assert!(!repo.jj_file_exists("f1.txt", "main"));
 }
 
 #[test]
 fn test_landing_cas_wins_over_late_cancel() {
-    let repo = TestRepo::with_run_all_happy_scenario();
-    repo.init_jjq_merge();
-    repo.jjq_success(&["push", "f1"]);
+    let repo = TestRepo::from_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let cas = sync.path().join("cas");
     let release = sync.path().join("release");
@@ -4227,7 +4896,10 @@ fn test_landing_cas_wins_over_late_cancel() {
         .spawn()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(150));
-    assert!(cancel.try_wait().unwrap().is_none(), "cancel must wait for terminal publication choice");
+    assert!(
+        cancel.try_wait().unwrap().is_none(),
+        "cancel must wait for terminal publication choice"
+    );
     fs::write(&release, "").unwrap();
     assert!(runner.wait_with_output().unwrap().status.success());
     assert_eq!(cancel.wait_with_output().unwrap().status.code(), Some(10));
@@ -4239,16 +4911,17 @@ fn test_landing_cas_wins_over_late_cancel() {
 
 #[test]
 fn test_cancel_marker_survives_runner_crash_and_recovery_terminalizes() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let started = sync.path().join("started");
     let count = sync.path().join("count");
     let check = format!(
         "echo run >> {count}; touch {started}; while :; do sleep 1; done",
-        count = count.display(), started = started.display()
+        count = count.display(),
+        started = started.display()
     );
-    repo.init_jjq_merge_with_check(&check);
-    repo.jjq_success(&["push", "f1"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&["config", "check_command", &check]);
     let mut runner = repo.spawn_jjq(&["run"]);
     wait_for_file(&started, std::time::Duration::from_secs(30));
     repo.jjq_success(&["cancel", "1"]);
@@ -4260,7 +4933,10 @@ fn test_cancel_marker_survives_runner_crash_and_recovery_terminalizes() {
         if output.status.success() {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "orphan check did not exit: {output:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "orphan check did not exit: {output:?}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
@@ -4272,16 +4948,20 @@ fn test_cancel_marker_survives_runner_crash_and_recovery_terminalizes() {
 
 #[test]
 fn test_marker_only_running_cancel_synthesizes_intent_history() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let check_started = sync.path().join("check-started");
     let marker_written = sync.path().join("marker-written");
     let never_release = sync.path().join("never-release");
-    repo.init_jjq_merge_with_check(&format!(
-        "touch {}; while :; do sleep 1; done",
-        check_started.display()
-    ));
-    repo.jjq_success(&["push", "f1"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&[
+        "config",
+        "check_command",
+        &format!(
+            "touch {}; while :; do sleep 1; done",
+            check_started.display()
+        ),
+    ]);
     let runner = repo.spawn_jjq(&["run"]);
     wait_for_file(&check_started, std::time::Duration::from_secs(30));
     let mut cancel = repo
@@ -4303,37 +4983,47 @@ fn test_marker_only_running_cancel_synthesizes_intent_history() {
 
 #[test]
 fn test_cancel_is_not_failure_or_stop_on_failure() {
-    let repo = TestRepo::with_run_all_happy_scenario();
+    let repo = TestRepo::from_template(&TWO_QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
     let started = sync.path().join("started");
     let check = format!(
         "if [ -f f1.txt ]; then touch {}; while :; do sleep 1; done; fi; true",
         started.display()
     );
-    repo.init_jjq_merge_with_check(&check);
-    repo.jjq_success(&["push", "f1"]);
-    repo.jjq_success(&["push", "f2"]);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&["config", "check_command", &check]);
     let child = repo.spawn_jjq(&["run", "--all", "--stop-on-failure"]);
     wait_for_file(&started, std::time::Duration::from_secs(30));
     repo.jjq_success(&["cancel", "1"]);
     let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!repo.jj_file_exists("f1.txt", "main"));
     assert!(repo.jj_file_exists("f2.txt", "main"));
 }
 
 #[test]
 fn test_user_check_exit_77_is_failure_not_cancellation() {
-    let repo = TestRepo::with_run_all_happy_scenario();
-    repo.init_jjq_merge_with_check("exit 77");
-    repo.jjq_success(&["push", "f1"]);
+    let repo = TestRepo::from_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&["config", "check_command", "exit 77"]);
 
     let output = repo
         .jjq()
         .args(["run", "--all"])
         .output()
         .expect("failed to run batch");
-    assert_eq!(output.status.code(), Some(2), "stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
     assert!(success);
@@ -4346,9 +5036,9 @@ fn test_user_check_exit_77_is_failure_not_cancellation() {
 
 #[test]
 fn test_serial_run_noninteractive_keeps_heartbeat_feedback() {
-    let repo = TestRepo::with_run_all_happy_scenario();
-    repo.init_jjq_merge_with_check("sleep 0.3");
-    repo.jjq_success(&["push", "f1"]);
+    let repo = TestRepo::from_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
+    // Queue publication is cached; this test varies only check behavior.
+    repo.jjq_success(&["config", "check_command", "sleep 0.3"]);
     let output = repo
         .jjq_std()
         .args(["run"])
@@ -4367,7 +5057,7 @@ fn test_serial_run_noninteractive_keeps_heartbeat_feedback() {
 /// returning (repo, sync_dir); the gate files are `started`/`release` inside
 /// sync_dir.
 fn repo_with_gated_check_for_strategy(strategy: &str) -> (TestRepo, TempDir) {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     let sync = TempDir::new().expect("failed to create sync dir");
     let check = gated_check_command(&sync.path().join("started"), &sync.path().join("release"));
     repo.jjq_success(&[
@@ -4404,7 +5094,10 @@ fn test_validation_receipt_requeues_when_trunk_moves_for_each_strategy() {
         let (repo, sync) = repo_with_gated_check_for_strategy(strategy);
 
         let child = repo.spawn_jjq(&["run"]);
-        wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+        wait_for_file(
+            &sync.path().join("started"),
+            std::time::Duration::from_secs(30),
+        );
         advance_trunk(&repo);
         fs::write(sync.path().join("release"), "").unwrap();
 
@@ -4479,7 +5172,10 @@ fn test_validation_receipt_requeues_when_check_command_changes() {
     let (repo, sync) = repo_with_gated_check();
 
     let child = repo.spawn_jjq(&["run", "--all"]);
-    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+    wait_for_file(
+        &sync.path().join("started"),
+        std::time::Duration::from_secs(30),
+    );
     repo.jjq_success(&["config", "check_command", "true"]);
     fs::write(sync.path().join("release"), "").unwrap();
 
@@ -4491,7 +5187,8 @@ fn test_validation_receipt_requeues_when_check_command_changes() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("stopped after a stale validation receipt"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("stopped after a stale validation receipt"),
         "batch mode must stop instead of repeatedly checking with stale config: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -4505,7 +5202,7 @@ fn test_validation_receipt_requeues_when_check_command_changes() {
 
 #[test]
 fn test_receipt_holds_metadata_lock_from_validation_through_landing() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
     run_jj(repo.path(), &["new", "-m", "receipt lock", "main"]);
     fs::write(repo.path().join("receipt-lock.txt"), "locked\n").unwrap();
@@ -4535,12 +5232,17 @@ fn test_receipt_holds_metadata_lock_from_validation_through_landing() {
         .expect("failed to spawn config writer");
     std::thread::sleep(std::time::Duration::from_millis(150));
     assert!(
-        config.try_wait().expect("failed to poll config writer").is_none(),
+        config
+            .try_wait()
+            .expect("failed to poll config writer")
+            .is_none(),
         "config writer must remain blocked until the validated receipt lands"
     );
 
     fs::write(&release, "").unwrap();
-    let output = runner.wait_with_output().expect("failed to wait for runner");
+    let output = runner
+        .wait_with_output()
+        .expect("failed to wait for runner");
     assert!(
         output.status.success(),
         "receipt-protected landing should succeed: stdout={} stderr={}",
@@ -4563,7 +5265,10 @@ fn test_validation_receipt_never_lands_a_retargeted_claim() {
     let (repo, sync) = repo_with_gated_check();
 
     let child = repo.spawn_jjq(&["run"]);
-    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+    wait_for_file(
+        &sync.path().join("started"),
+        std::time::Duration::from_secs(30),
+    );
 
     run_jj(repo.path(), &["new", "-m", "replacement", "main"]);
     fs::write(repo.path().join("replacement.txt"), "replacement\n").unwrap();
@@ -4604,7 +5309,10 @@ fn test_delete_during_run_refused() {
     let (repo, sync) = repo_with_gated_check();
 
     let child = repo.spawn_jjq(&["run"]);
-    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+    wait_for_file(
+        &sync.path().join("started"),
+        std::time::Duration::from_secs(30),
+    );
 
     // The runner has claimed the item and is inside the check; deleting it
     // now would be silently overridden by the landing, so delete must refuse.
@@ -4645,8 +5353,7 @@ fn test_delete_during_run_refused() {
 
 #[test]
 fn test_delete_stale_running_claim() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "interrupted feature", "main"]);
     fs::write(repo.path().join("feature.txt"), "content").unwrap();
@@ -4686,13 +5393,7 @@ fn test_delete_stale_running_claim() {
 
 #[test]
 fn test_run_recovers_stale_claim() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
-
-    run_jj(repo.path(), &["new", "-m", "interrupted feature", "main"]);
-    fs::write(repo.path().join("feature.txt"), "content").unwrap();
-    run_jj(repo.path(), &["bookmark", "create", "feature"]);
-    repo.jjq_success(&["push", "feature"]);
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
 
     // Simulate a runner that crashed mid-check: the queue bookmark became
     // jjq/running/000001, the jjq-run-000001 workspace stayed registered,
@@ -4755,7 +5456,7 @@ fn test_run_recovers_stale_claim() {
 
 #[test]
 fn test_doctor_reports_legacy_filesystem_state_without_fixing() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     let legacy_locks = repo.path().join(".jj").join("jjq-locks");
@@ -4781,7 +5482,10 @@ fn test_doctor_reports_legacy_filesystem_state_without_fixing() {
         legacy_locks.exists(),
         "doctor --fix should not remove legacy lock directory"
     );
-    assert!(legacy_log.exists(), "doctor --fix should not remove legacy log");
+    assert!(
+        legacy_log.exists(),
+        "doctor --fix should not remove legacy log"
+    );
 }
 
 #[test]
@@ -4789,7 +5493,10 @@ fn test_clean_refused_during_run() {
     let (repo, sync) = repo_with_gated_check();
 
     let child = repo.spawn_jjq(&["run"]);
-    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+    wait_for_file(
+        &sync.path().join("started"),
+        std::time::Duration::from_secs(30),
+    );
 
     // The runner's workspace is live; clean must refuse rather than destroy
     // it out from under the check process.
@@ -4825,8 +5532,7 @@ fn test_clean_refused_during_run() {
 
 #[test]
 fn test_clean_spares_user_jjq_prefixed_workspace() {
-    let repo = TestRepo::with_go_project();
-    repo.init_jjq();
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     // A user workspace whose name merely starts with "jjq" must survive.
     let user_ws = TempDir::new().unwrap();
@@ -4896,11 +5602,43 @@ fn test_clean_spares_user_jjq_prefixed_workspace() {
 }
 
 #[test]
+fn test_reserved_metadata_workspace_name_collision_preserves_user_workspace() {
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    let container = TempDir::new().expect("failed to create workspace container");
+    let user_workspace = add_workspace(&repo, &container, "jjq-meta");
+    fs::write(user_workspace.join("user-work.txt"), "preserve me\n").unwrap();
+
+    for args in [vec!["clean"], vec!["config", "check_command", "true"]] {
+        let output = repo.jjq_failure(&args);
+        assert!(
+            output.contains("workspace name 'jjq-meta' is already used by a user workspace"),
+            "collision should fail actionably: {output}"
+        );
+        assert_eq!(
+            fs::canonicalize(
+                run_jj(repo.path(), &["workspace", "root", "--name", "jjq-meta"]).trim()
+            )
+            .unwrap(),
+            fs::canonicalize(&user_workspace).unwrap(),
+            "jjq must preserve the colliding workspace registration"
+        );
+        assert_eq!(
+            fs::read_to_string(user_workspace.join("user-work.txt")).unwrap(),
+            "preserve me\n",
+            "jjq must preserve the colliding workspace contents"
+        );
+    }
+}
+
+#[test]
 fn test_status_shows_running_item_during_run() {
     let (repo, sync) = repo_with_gated_check();
 
     let child = repo.spawn_jjq(&["run"]);
-    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+    wait_for_file(
+        &sync.path().join("started"),
+        std::time::Duration::from_secs(30),
+    );
 
     let (stdout, _stderr, success) = repo.jjq_raw_output(&["status", "--json"]);
     assert!(success, "status --json should succeed during a run");
@@ -4936,7 +5674,7 @@ fn test_status_shows_running_item_during_run() {
 
 #[test]
 fn test_doctor_warns_on_bare_symbol_log_filter() {
-    let repo = TestRepo::with_go_project();
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     repo.init_jjq();
 
     // Old jjq versions wrote the filter as a bare bookmark symbol, which

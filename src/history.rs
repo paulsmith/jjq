@@ -3,7 +3,9 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config;
@@ -90,23 +92,58 @@ pub fn record_many(events: &[Event]) -> Result<()> {
     if events.is_empty() {
         return Ok(());
     }
-    let events = events.to_vec();
-    meta::with_meta_workspace(|workspace| {
-        for event in &events {
-            let dir = workspace
-                .join("history")
-                .join(queue::format_seq_id(event.sequence_id));
-            fs::create_dir_all(&dir)?;
-            let ordinal = next_ordinal(&dir)?;
-            let json = serde_json::to_vec_pretty(event)?;
-            fs::write(dir.join(format!("{:06}.json", ordinal)), json)?;
-        }
-        Ok(format!("history: recorded {} event(s)", events.len()))
-    })
+    let description = format!("history: recorded {} event(s)", events.len());
+    meta::with_described_meta_workspace(&description, |workspace| write_events(workspace, events))
 }
 
 pub fn record(event: Event) -> Result<()> {
     record_many(&[event])
+}
+
+/// Atomically persist a claimed event and the deterministic recovery metadata
+/// for the workspace that will materialize that claim. The caller can publish
+/// this under publication.lock before `jj workspace add`: a crash then leaves
+/// enough durable information for clean/recovery without a second metadata
+/// transaction or a window where the claim has history but no workspace path.
+pub fn record_claim_with_workspace(
+    event: Event,
+    workspace_path: &str,
+    workspace_name: &str,
+) -> Result<()> {
+    if event.kind != kind::CLAIMED {
+        bail!("workspace metadata can only be attached to a claimed event");
+    }
+    let description =
+        claim_workspace_description(event.sequence_id, workspace_path, workspace_name);
+    meta::with_described_meta_workspace(&description, |workspace| {
+        write_events(workspace, std::slice::from_ref(&event))?;
+        let dir = workspace.join("workspace");
+        fs::create_dir_all(&dir)?;
+        let id = queue::format_seq_id(event.sequence_id);
+        fs::write(dir.join(&id), workspace_path)?;
+        fs::write(dir.join(format!("{}.name", id)), workspace_name)?;
+        Ok(())
+    })
+}
+
+fn claim_workspace_description(id: u32, workspace_path: &str, workspace_name: &str) -> String {
+    format!(
+        "history: recorded 1 event(s)\nSequence-Id: {}\nWorkspace: {}\nWorkspace-Name: {}",
+        id, workspace_path, workspace_name
+    )
+}
+
+fn write_events(workspace: &Path, events: &[Event]) -> Result<()> {
+    for event in events {
+        let dir = workspace
+            .join("history")
+            .join(queue::format_seq_id(event.sequence_id));
+        fs::create_dir_all(&dir)?;
+        let ordinal = next_ordinal(&dir)?;
+        let json = serde_json::to_vec_pretty(event)?;
+        fs::write(dir.join(format!("{:06}.json", ordinal)), json)?;
+    }
+    Ok(())
 }
 
 /// Read all events for a submission using exactly one pinned metadata
@@ -117,26 +154,14 @@ pub fn read(id: u32) -> Result<Vec<Event>> {
         return Ok(vec![]);
     };
     let prefix = format!("history/{}", queue::format_seq_id(id));
-    let mut paths = snapshot.files(&prefix)?;
-    paths.sort();
-    let mut events = Vec::with_capacity(paths.len());
-    for path in paths {
+    let mut files = snapshot.files_contents(&prefix)?;
+    files.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut events = Vec::with_capacity(files.len());
+    for (path, contents) in files {
         if !path.ends_with(".json") {
             continue;
         }
-        let contents = snapshot.file(&path)?.ok_or_else(|| {
-            anyhow::anyhow!("history file {} disappeared from metadata snapshot", path)
-        })?;
-        let event: Event = serde_json::from_str(&contents)
-            .with_context(|| format!("invalid jjq history event {}", path))?;
-        if event.version != SCHEMA_VERSION {
-            bail!(
-                "unsupported jjq history event version {} in {}",
-                event.version,
-                path
-            );
-        }
-        events.push(event);
+        events.push(decode_event(&path, &contents, Some(&path))?);
     }
     Ok(events)
 }
@@ -146,54 +171,58 @@ pub fn read_by_change(change_id: &str) -> Result<Vec<(u32, Vec<Event>)>> {
     let Some(snapshot) = config::snapshot()? else {
         return Ok(vec![]);
     };
-    let mut submissions = Vec::new();
-    for path in snapshot.files("history")? {
-        let Some(id) = path
+    let mut files = snapshot.files_contents("history")?;
+    files.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut submissions: BTreeMap<u32, Vec<Event>> = BTreeMap::new();
+    for (path, contents) in files {
+        let Some(id_part) = path
             .strip_prefix("history/")
             .and_then(|p| p.split('/').next())
-            .and_then(|p| p.parse::<u32>().ok())
         else {
             continue;
         };
-        if submissions
-            .iter()
-            .any(|(seen, _): &(u32, Vec<Event>)| *seen == id)
-        {
+        let Ok(id) = id_part.parse::<u32>() else {
+            continue;
+        };
+        // The old per-submission reader reconstructed this canonical prefix
+        // from the parsed ID, so non-canonical lookalike directories did not
+        // contribute events. Preserve that behavior in the bulk scan.
+        if id_part != queue::format_seq_id(id) {
             continue;
         }
-        let events = read_from_snapshot(&snapshot, id)?;
-        if events
-            .iter()
-            .any(|event| event.candidate_change_id.as_deref() == Some(change_id))
-        {
-            submissions.push((id, events));
+        if !path.ends_with(".json") {
+            continue;
         }
+        submissions
+            .entry(id)
+            .or_default()
+            .push(decode_event(&path, &contents, None)?);
     }
-    submissions.sort_by_key(|(id, _)| *id);
+    let submissions: Vec<_> = submissions
+        .into_iter()
+        .filter(|(_, events)| {
+            events
+                .iter()
+                .any(|event| event.candidate_change_id.as_deref() == Some(change_id))
+        })
+        .collect();
     Ok(submissions)
 }
 
-fn read_from_snapshot(snapshot: &config::Snapshot, id: u32) -> Result<Vec<Event>> {
-    let prefix = format!("history/{}", queue::format_seq_id(id));
-    let mut paths = snapshot.files(&prefix)?;
-    paths.sort();
-    let events: Vec<Event> = paths
-        .into_iter()
-        .filter(|path| path.ends_with(".json"))
-        .map(|path| {
-            let contents = snapshot.file(&path)?.ok_or_else(|| {
-                anyhow::anyhow!("history file {} disappeared from metadata snapshot", path)
-            })?;
-            serde_json::from_str(&contents)
-                .with_context(|| format!("invalid jjq history event {}", path))
-        })
-        .collect::<Result<_>>()?;
-    for event in &events {
-        if event.version != SCHEMA_VERSION {
-            bail!("unsupported jjq history event version {}", event.version);
+fn decode_event(path: &str, contents: &str, version_path: Option<&str>) -> Result<Event> {
+    let event: Event = serde_json::from_str(contents)
+        .with_context(|| format!("invalid jjq history event {}", path))?;
+    if event.version != SCHEMA_VERSION {
+        if let Some(version_path) = version_path {
+            bail!(
+                "unsupported jjq history event version {} in {}",
+                event.version,
+                version_path
+            );
         }
+        bail!("unsupported jjq history event version {}", event.version);
     }
-    Ok(events)
+    Ok(event)
 }
 
 fn next_ordinal(dir: &std::path::Path) -> Result<u32> {
@@ -244,4 +273,44 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = mp + if mp < 10 { 3 } else { -9 };
     (year + if month <= 2 { 1 } else { 0 }, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Event, claim_workspace_description, decode_event};
+
+    #[test]
+    fn combined_claim_description_preserves_operation_log_fields() {
+        assert_eq!(
+            claim_workspace_description(7, "/tmp/jjq.abc", "jjq-run-000007-token"),
+            "history: recorded 1 event(s)\nSequence-Id: 7\nWorkspace: /tmp/jjq.abc\nWorkspace-Name: jjq-run-000007-token"
+        );
+    }
+
+    #[test]
+    fn decode_event_rejects_unknown_schema_versions_with_its_path() {
+        let mut event = Event::new(7, "queued");
+        event.version = 2;
+        let error = decode_event(
+            "history/000007/000001.json",
+            &serde_json::to_string(&event).unwrap(),
+            Some("history/000007/000001.json"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported jjq history event version 2 in history/000007/000001.json"
+        );
+
+        let error = decode_event(
+            "history/000007/000001.json",
+            &serde_json::to_string(&event).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported jjq history event version 2"
+        );
+    }
 }
