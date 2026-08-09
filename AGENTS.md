@@ -43,6 +43,8 @@ jjq stores all state in the jj repository itself:
    - `run` - Ensures only one queue runner at a time; also held by `clean` for its whole cleanup
    - `meta` - Serializes all writes to the `jjq/_/_` metadata branch (sequence ID allocation, config, workspace records); reads take no lock
    - `check` - Held shared by each `jjq check` for its workspace's lifetime; `clean` probes it exclusively to refuse while a check is active
+   - `mutation` - Blocking lock for full `push`, `requeue`, and `delete` mutations; serializes queue-state changes across those commands
+   - `publication` - Couples producer queue-bookmark publication to its queued history event and runner claims to their claimed history event
 
 3. **Filesystem layout** - `.jj/jjq/` is the home for jjq filesystem state under the shared repository `.jj` directory
    - `locks/` - `flock(2)` lock files shared by all workspaces for the repo
@@ -60,11 +62,13 @@ jjq stores all state in the jj repository itself:
 |---------|----------|
 | `init [--trunk <bookmark>] [--check <cmd>] [--strategy <strategy>]` | Initialize jjq, set trunk, check command, and strategy |
 | `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID; pushing the current workspace's @ moves the working copy to a new empty child) |
-| `run [--all] [--stop-on-failure]` | Process next queue item, or all items in batch; failure output shows concrete jj commands with actual change IDs |
+| `run [--all] [--stop-on-failure] [--jobs N]` | Process next queue item, or all items in batch; merge batches may check up to N predicted states concurrently and still land FIFO |
 | `check [--rev <revset>] [-v]` | Run check command against a revision (default @); -v shows workspace/env details |
 | `status [id] [--json] [--resolve]` | Show running/queued items, recent failures (with conflicting file paths), and recently landed items; JSON output has `runner_active` (bool) plus `running`/`queue`/`failed`/`landed` arrays |
 | `requeue <id>` | Re-push a failed item back onto the queue (with pre-flight conflict check); refuses an item being processed; recovers a stale claim back to the queue |
 | `delete <id>` | Remove item from queue/failed; refuses an item being processed by an active runner (removes stale claims when the run lock is free) |
+| `cancel <id>` | Immediately remove queued work or cooperatively stop a running check; idempotent after cancellation |
+| `history [<id> | --change <change-id>] [--json]` | Show durable submission lifecycle events, including cancellation intent/outcome |
 | `config [key] [value]` | Get/set configuration |
 | `clean` | Remove all jjq-generated workspaces; refuses while a run or check is active |
 | `doctor [--fix]` | Validate config, conflicted jjq bookmarks, sequence counter, locks, stale claims, and workspace preconditions; `--fix` repairs a conflicted metadata bookmark (keeps the side with the highest `last_id`) |
@@ -92,6 +96,7 @@ jjq stores all state in the jj repository itself:
 - **Requeue** - Re-pushes a failed item back onto the queue, running a pre-flight conflict check first; a shortcut for fixing and re-pushing manually
 - **Landing strategy** - How the candidate is landed on trunk: `rebase` (default) or `merge`
 - **Working-copy move-off** - `push`/`requeue` of the invoking workspace's working-copy commit parks the working copy on a new empty child (like `jj commit`), so later snapshots don't amend the queued commit — once landed, trunk would follow those rewrites and absorb unchecked edits (both strategies). `run` warns when a landed change is still another workspace's live working copy
+- **Cooperative cancellation** - An ID-scoped durable marker records accepted intent. The owning runner terminates the token-scoped process group and records `canceled`; cancellation and every terminal outcome serialize on `publication.lock`, so a landing that already won its final CAS remains landed.
 
 ### Concurrency
 
@@ -101,12 +106,14 @@ jjq stores all state in the jj repository itself:
 - `meta` lock serializes all metadata-branch writes (sequence IDs, config, workspace records); writers wait up to 15s (`JJQ_META_LOCK_TIMEOUT_MS`) before exiting `LOCK_HELD`
 - Metadata reads take no lock: each group of reads pins the `jjq/_/_` bookmark to a single commit and reads every value in the group from that commit
 - `check` lock is held shared by `jjq check`; `clean` holds `run` and probes `check` exclusively so it never destroys a live run or check workspace
-- Lock order is run → meta (run_one records workspace metadata while holding the run lock) and run → check (clean); no code path acquires `run` while holding `meta` or `check`
+- `mutation.lock` serializes `push`, `requeue`, `delete`, and `cancel`. `publication.lock` couples queue/history publication, claims, cancellation intent, and every terminal bookmark/history choice.
+- Lock order is mutation → publication → meta for producers and run → publication → meta for claims. Mutation paths may acquire `run` only before `publication`; no run path acquires `mutation`. Run → check remains for `clean`, and no code path acquires `run` while holding `meta` or `check`.
 
 ### Batch Mode (`run --all`)
 
 When running in batch mode, jjq processes items in sequence:
 - Failed items are recorded and processing continues unless `--stop-on-failure` is set
+- Canceled items are not failures and do not trigger `--stop-on-failure` or `PARTIAL`
 - Summary reports merged and failed counts
 - Exits 0 if all items merged or queue was empty; exits 2 (`PARTIAL`) if any items failed
 - Exits 1 up front — even with an empty queue — when another runner is active or `check_command` is not configured

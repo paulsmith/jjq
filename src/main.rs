@@ -4,6 +4,7 @@
 mod commands;
 mod config;
 mod exit_codes;
+mod history;
 mod jj;
 mod lock;
 mod meta;
@@ -50,6 +51,9 @@ enum Commands {
         /// Stop processing on first failure (only with --all)
         #[arg(long)]
         stop_on_failure: bool,
+        /// Maximum concurrent speculative checks (requires --all)
+        #[arg(long, default_value_t = 1, requires = "all", value_parser = parse_jobs)]
+        jobs: usize,
     },
     /// Run check command against a revision without queue processing
     Check {
@@ -81,6 +85,22 @@ enum Commands {
         /// Sequence ID of the item
         id: String,
     },
+    /// Cooperatively cancel a queued or running item
+    Cancel {
+        /// Sequence ID of the item
+        id: String,
+    },
+    /// Display durable lifecycle history for a queue submission
+    History {
+        /// Sequence ID of a submission
+        id: Option<String>,
+        /// Find every submission for a candidate change ID
+        #[arg(long, conflicts_with = "id")]
+        change: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove jjq workspaces
     Clean,
     /// Validate configuration and environment
@@ -109,6 +129,16 @@ enum Commands {
     },
     /// Print quickstart guide for LLM agents
     Quickstart,
+}
+
+fn parse_jobs(input: &str) -> Result<usize, String> {
+    let jobs: usize = input
+        .parse()
+        .map_err(|_| "jobs must be a positive integer".to_string())?;
+    if jobs == 0 {
+        return Err("jobs must be at least 1".to_string());
+    }
+    Ok(jobs)
 }
 
 fn main() {
@@ -149,13 +179,18 @@ fn run() -> Result<()> {
         Commands::Run {
             all,
             stop_on_failure,
-        } => commands::run(all, stop_on_failure),
+            jobs,
+        } => commands::run(all, stop_on_failure, jobs),
         Commands::Check { rev, verbose } => commands::check(&rev, verbose),
         Commands::Status { id, json, resolve } => {
             commands::status(id.as_deref(), json, resolve.as_deref())
         }
         Commands::Requeue { id } => commands::requeue(&id),
         Commands::Delete { id } => commands::delete(&id),
+        Commands::Cancel { id } => commands::cancel(&id),
+        Commands::History { id, change, json } => {
+            commands::history(id.as_deref(), change.as_deref(), json)
+        }
         Commands::Clean => commands::clean(),
         Commands::Doctor { fix } => commands::doctor(fix),
         Commands::Config { key, value } => commands::config(key.as_deref(), value.as_deref()),

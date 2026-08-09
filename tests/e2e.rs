@@ -300,6 +300,104 @@ fn run_jj(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+/// Read the stable JSON envelope without asserting wall-clock event times.
+fn history_events(repo: &TestRepo, id: &str) -> Vec<serde_json::Value> {
+    let (stdout, stderr, success) = repo.jjq_raw_output(&["history", id, "--json"]);
+    assert!(success, "history {} failed: {}{}", id, stdout, stderr);
+    let output: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(output["version"], 1);
+    output["submissions"][0]["events"].as_array().unwrap().clone()
+}
+
+fn history_kinds(repo: &TestRepo, id: &str) -> Vec<String> {
+    history_events(repo, id)
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn assert_landed_history_matches_main(repo: &TestRepo, id: &str) {
+    let landed = history_events(repo, id)
+        .into_iter()
+        .find(|event| event["kind"] == "landed")
+        .expect("successful run should have a landed history event");
+    let main_commit_id = run_jj(
+        repo.path(),
+        &["log", "-r", "main", "--no-graph", "-T", "commit_id"],
+    );
+    assert_eq!(
+        landed["result_commit_id"].as_str(),
+        Some(main_commit_id.trim()),
+        "landed history must name main's final post-description commit"
+    );
+}
+
+fn wait_for_lock_held(path: &Path, timeout: std::time::Duration) {
+    use fs2::FileExt;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            Err(error) => panic!("cannot inspect {}: {}", path.display(), error),
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                file.unlock().unwrap();
+            }
+            Err(_) => return,
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {} to be held",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn normalize_history_json(output: &str) -> String {
+    let mut output: serde_json::Value = serde_json::from_str(output).unwrap();
+    for submission in output["submissions"].as_array_mut().unwrap() {
+        for event in submission["events"].as_array_mut().unwrap() {
+            let event = event.as_object_mut().unwrap();
+            for key in ["candidate_change_id", "result_change_id"] {
+                if event.contains_key(key) {
+                    event.insert(key.to_string(), serde_json::json!("<CHANGE_ID>"));
+                }
+            }
+            for key in ["candidate_commit_id", "trunk_commit_id", "result_commit_id"] {
+                if event.contains_key(key) {
+                    event.insert(key.to_string(), serde_json::json!("<COMMIT_ID>"));
+                }
+            }
+            event.insert("timestamp".to_string(), serde_json::json!("<TIMESTAMP>"));
+            if event.contains_key("elapsed_ms") {
+                event.insert("elapsed_ms".to_string(), serde_json::json!("<ELAPSED_MS>"));
+            }
+        }
+    }
+    format!("{}\n", serde_json::to_string_pretty(&output).unwrap())
+}
+
+fn normalize_history_text(output: &str, repo_path: &Path) -> String {
+    static RE_TIMESTAMP: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z").unwrap()
+    });
+    static RE_ELAPSED: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\b\d+ms\b").unwrap());
+    let output = RE_TIMESTAMP.replace_all(output, "<TIMESTAMP>");
+    let output = RE_ELAPSED.replace_all(&output, "<ELAPSED>");
+    normalize_output(&output, repo_path)
+}
+
 /// Recursively copy a directory tree.
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(src)? {
@@ -763,6 +861,220 @@ fn test_push_and_status() {
 }
 
 #[test]
+fn test_history_records_success_and_json() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+
+    run_jj(repo.path(), &["new", "-m", "history feature", "main"]);
+    fs::write(repo.path().join("history.txt"), "history\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "history-feature"]);
+    let change_id = run_jj(
+        repo.path(),
+        &[
+            "log",
+            "-r",
+            "history-feature",
+            "--no-graph",
+            "-T",
+            "change_id.short()",
+        ],
+    )
+    .trim()
+    .to_string();
+
+    repo.jjq_success(&["push", "history-feature"]);
+    repo.jjq_success(&["run"]);
+
+    let (stdout, _stderr, success) = repo.jjq_raw_output(&["history", "1", "--json"]);
+    assert!(success, "history JSON should succeed: {}", stdout);
+    let output: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(output["version"], 1);
+    assert_eq!(output["submissions"][0]["sequence_id"], 1);
+    assert_eq!(
+        output["submissions"][0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["queued", "claimed", "check_started", "landed"]
+    );
+    assert_eq!(
+        output["submissions"][0]["events"][0]["candidate_change_id"],
+        change_id
+    );
+    for event in output["submissions"][0]["events"].as_array().unwrap() {
+        let timestamp = event["timestamp"].as_str().unwrap();
+        assert_eq!(timestamp.len(), 20);
+        assert!(timestamp.ends_with('Z'), "UTC timestamp: {}", timestamp);
+    }
+    insta::assert_snapshot!(normalize_history_json(&stdout), @r###"
+    {
+      "submissions": [
+        {
+          "events": [
+            {
+              "candidate_change_id": "<CHANGE_ID>",
+              "candidate_commit_id": "<COMMIT_ID>",
+              "kind": "queued",
+              "sequence_id": 1,
+              "timestamp": "<TIMESTAMP>",
+              "trunk_commit_id": "<COMMIT_ID>",
+              "version": 1
+            },
+            {
+              "candidate_change_id": "<CHANGE_ID>",
+              "candidate_commit_id": "<COMMIT_ID>",
+              "kind": "claimed",
+              "sequence_id": 1,
+              "strategy": "rebase",
+              "timestamp": "<TIMESTAMP>",
+              "trunk_commit_id": "<COMMIT_ID>",
+              "version": 1
+            },
+            {
+              "candidate_change_id": "<CHANGE_ID>",
+              "candidate_commit_id": "<COMMIT_ID>",
+              "kind": "check_started",
+              "sequence_id": 1,
+              "strategy": "rebase",
+              "timestamp": "<TIMESTAMP>",
+              "trunk_commit_id": "<COMMIT_ID>",
+              "version": 1
+            },
+            {
+              "candidate_change_id": "<CHANGE_ID>",
+              "candidate_commit_id": "<COMMIT_ID>",
+              "elapsed_ms": "<ELAPSED_MS>",
+              "kind": "landed",
+              "result_change_id": "<CHANGE_ID>",
+              "result_commit_id": "<COMMIT_ID>",
+              "sequence_id": 1,
+              "strategy": "rebase",
+              "timestamp": "<TIMESTAMP>",
+              "trunk_commit_id": "<COMMIT_ID>",
+              "version": 1
+            }
+          ],
+          "sequence_id": 1
+        }
+      ],
+      "version": 1
+    }
+    "###);
+
+    let text = repo.jjq_success(&["history", "1"]);
+    insta::assert_snapshot!(normalize_history_text(&text, repo.path()), @r###"
+    History for item 1
+      <TIMESTAMP> queued (candidate <CHANGE_ID>)
+      <TIMESTAMP> claimed (candidate <CHANGE_ID>)
+      <TIMESTAMP> check_started (candidate <CHANGE_ID>)
+      <TIMESTAMP> landed (candidate <CHANGE_ID>; result <CHANGE_ID>; <ELAPSED>)
+    "###);
+}
+
+#[test]
+fn test_publication_orders_queued_before_claimed() {
+    use fs2::FileExt;
+
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+    run_jj(repo.path(), &["new", "-m", "publication order", "main"]);
+    fs::write(repo.path().join("publication-order.txt"), "ordered\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "publication-order"]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    // Stop the producer after it takes publication but before it can create
+    // the queue bookmark. The runner then holds run and waits on publication.
+    let lock_dir = repo.path().join(".jj/jjq/locks");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let meta_lock = fs::File::create(lock_dir.join("meta.lock")).unwrap();
+    meta_lock.lock_exclusive().unwrap();
+    let push = spawn_push(&repo, repo.path(), "publication-order");
+    wait_for_lock_held(
+        &lock_dir.join("publication.lock"),
+        std::time::Duration::from_secs(10),
+    );
+    let run = repo.spawn_jjq(&["run"]);
+
+    meta_lock.unlock().unwrap();
+    let push = push.wait_with_output().expect("failed to wait for push");
+    let run = run.wait_with_output().expect("failed to wait for run");
+    assert!(push.status.success(), "push failed: {:?}", push.status);
+    assert!(run.status.success(), "run failed: {:?}", run.status);
+    assert_eq!(
+        &history_kinds(&repo, "1")[..2],
+        ["queued", "claimed"],
+        "publication lock must preserve lifecycle order"
+    );
+}
+
+#[test]
+fn test_history_change_lookup_keeps_requeues_and_deletions() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_with_check("false");
+
+    run_jj(repo.path(), &["new", "-m", "retry history", "main"]);
+    fs::write(repo.path().join("retry-history.txt"), "retry\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "retry-history"]);
+    let change_id = run_jj(
+        repo.path(),
+        &[
+            "log",
+            "-r",
+            "retry-history",
+            "--no-graph",
+            "-T",
+            "change_id.short()",
+        ],
+    )
+    .trim()
+    .to_string();
+    run_jj(repo.path(), &["new", "main"]);
+
+    repo.jjq_success(&["push", "retry-history"]);
+    repo.jjq_failure(&["run"]);
+    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.jjq_success(&["requeue", "1"]);
+    repo.jjq_success(&["delete", "2"]);
+
+    let (stdout, _stderr, success) =
+        repo.jjq_raw_output(&["history", "--change", change_id.as_str(), "--json"]);
+    assert!(success, "history --change should succeed: {}", stdout);
+    let output: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let submissions = output["submissions"].as_array().unwrap();
+    assert_eq!(submissions.len(), 2);
+    assert_eq!(submissions[0]["sequence_id"], 1);
+    assert_eq!(submissions[1]["sequence_id"], 2);
+    let first_kinds = submissions[0]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(first_kinds.contains(&"failed"));
+    assert!(first_kinds.contains(&"requeued"));
+    let second_kinds = submissions[1]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(second_kinds.contains(&"queued"));
+    assert!(second_kinds.contains(&"deleted"));
+}
+
+#[test]
+fn test_history_requires_one_selector_and_initialization() {
+    let repo = TestRepo::with_go_project();
+    repo.jjq().args(["history", "1"]).assert().code(10);
+
+    repo.init_jjq();
+    repo.jjq().args(["history"]).assert().code(10);
+    repo.jjq().args(["history", "999"]).assert().code(10);
+}
+
+#[test]
 fn test_push_conflict_detection() {
     let repo = TestRepo::with_go_project();
     repo.init_jjq();
@@ -840,6 +1152,7 @@ fn test_run_success() {
     jjq: processing queue item 1 (merge strategy)
     jjq: merged 1 to main (now at <CHANGE_ID>)
     ");
+    assert_landed_history_matches_main(&repo, "1");
 }
 
 #[test]
@@ -911,6 +1224,291 @@ fn test_run_all() {
 }
 
 #[test]
+fn test_run_all_jobs_runs_merge_checks_concurrently_and_lands_fifo() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let state = repo.path().join("parallel-state");
+    let markers = state.join("markers");
+    let release = state.join("release");
+    let command = format!(
+        "mkdir -p {markers}; touch {markers}/$(basename \"$PWD\"); while [ ! -f {release} ]; do sleep 0.05; done",
+        markers = markers.display(),
+        release = release.display(),
+    );
+    repo.init_jjq_merge_with_check(&command);
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+    repo.jjq_success(&["push", "f3"]);
+
+    let mut child = repo.spawn_jjq(&["run", "--all", "--jobs", "2"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let marker_count = fs::read_dir(&markers).map(|entries| entries.count()).unwrap_or(0);
+        if marker_count == 2 {
+            break;
+        }
+        if marker_count > 2 || std::time::Instant::now() >= deadline {
+            let _ = fs::write(&release, "");
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("expected exactly two concurrent workers, observed {marker_count}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(fs::read_dir(&markers).unwrap().count(), 2, "jobs cap exceeded before release");
+    fs::write(&release, "").unwrap();
+    let run_output = child.wait_with_output().unwrap();
+    assert!(run_output.status.success(), "parallel run failed: {:?}", run_output);
+    let output = normalize_output(
+        &format!(
+            "{}{}",
+            String::from_utf8_lossy(&run_output.stdout),
+            String::from_utf8_lossy(&run_output.stderr)
+        ),
+        repo.path(),
+    );
+    let first = output.find("merged 1 to main").unwrap();
+    let second = output.find("merged 2 to main").unwrap();
+    let third = output.find("merged 3 to main").unwrap();
+    assert!(first < second && second < third, "landing must remain FIFO: {output}");
+    assert!(repo.jj_file_exists("f1.txt", "main"));
+    assert!(repo.jj_file_exists("f2.txt", "main"));
+    assert!(repo.jj_file_exists("f3.txt", "main"));
+    let run_logs = repo.path().join(".jj/jjq/run-logs");
+    assert!(
+        !run_logs.exists() || fs::read_dir(&run_logs).unwrap().next().is_none(),
+        "completed attempt logs should not accumulate under {}",
+        run_logs.display()
+    );
+}
+
+#[test]
+fn test_run_all_jobs_invalidates_dependent_check_after_early_failure() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let counter = repo.path().join("check-count");
+    let command = format!(
+        "echo run >> {0}; if [ -f f1.txt ]; then exit 1; fi",
+        counter.display()
+    );
+    repo.init_jjq_merge_with_check(&command);
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+
+    repo.jjq().args(["run", "--all", "--jobs", "2"]).assert().code(2);
+    let checks = fs::read_to_string(&counter).unwrap().lines().count();
+    assert_eq!(checks, 3, "B is checked speculatively, discarded, then rechecked");
+    assert!(repo.jj_file_exists("f2.txt", "main"));
+    let status = repo.jjq_success(&["status"]);
+    assert!(status.contains("feature 1"), "only A should be failed: {status}");
+    assert!(!status.contains("feature 2"), "B should have landed: {status}");
+    assert_eq!(history_kinds(&repo, "2").iter().filter(|kind| *kind == "failed").count(), 0);
+    assert_eq!(
+        history_kinds(&repo, "2")
+            .iter()
+            .filter(|kind| *kind == "check_started")
+            .count(),
+        2,
+        "B must receive a fresh check_started event after invalidation"
+    );
+}
+
+#[test]
+fn test_run_all_jobs_rebase_falls_back_to_serial() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    repo.init_jjq(); // default strategy is rebase
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+    let output = repo.jjq_success(&["run", "--all", "--jobs", "2"]);
+    assert!(output.contains("--jobs is currently serial for rebase"));
+    assert!(repo.jj_file_exists("f1.txt", "main"));
+    assert!(repo.jj_file_exists("f2.txt", "main"));
+}
+
+#[test]
+fn test_run_all_jobs_status_reports_token_scoped_active_checks() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let sync = TempDir::new().unwrap();
+    let check = gated_check_command(&sync.path().join("started"), &sync.path().join("release"));
+    repo.init_jjq_merge_with_check(&check);
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+
+    let child = repo.spawn_jjq(&["run", "--all", "--jobs", "2"]);
+    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+    let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
+    assert!(success, "status during parallel run should succeed");
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let active = status["active_checks"].as_array().expect("active_checks array");
+    // The separate overlap test proves the scheduler actually has two live
+    // workers. This check verifies the cross-process JSON projection without
+    // turning a polling race into an orphaned background runner on failure.
+    assert!(!active.is_empty(), "active checks: {status}");
+    let check = &active[0];
+    assert!(check["run_token"].as_str().is_some());
+    assert!(check["workspace_path"].as_str().is_some());
+    assert_eq!(check["phase"], "checking");
+
+    fs::write(sync.path().join("release"), "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "parallel run: {:?}", output);
+}
+
+#[test]
+fn test_run_jobs_validation() {
+    let repo = TestRepo::new();
+    let (_, stderr, success) = repo.jjq_raw_output(&["run", "--all", "--jobs", "0"]);
+    assert!(!success);
+    assert!(stderr.contains("jobs must be at least 1"), "{stderr}");
+    let (_, stderr, success) = repo.jjq_raw_output(&["run", "--jobs", "2"]);
+    assert!(!success);
+    assert!(stderr.contains("--all"), "{stderr}");
+}
+
+#[test]
+fn test_parallel_run_crash_refuses_recovery_while_check_children_live() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let sync = TempDir::new().unwrap();
+    let started = sync.path().join("started");
+    let release = sync.path().join("release");
+    let count = sync.path().join("count");
+    let check = format!(
+        "echo run >> {count}; touch {started}; for i in $(seq 1 300); do [ -f {release} ] && exit 0; sleep 0.1; done; exit 1",
+        count = count.display(),
+        started = started.display(),
+        release = release.display(),
+    );
+    repo.init_jjq_merge_with_check(&check);
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+
+    let mut parent = repo.spawn_jjq(&["run", "--all", "--jobs", "2"]);
+    wait_for_file(&started, std::time::Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
+        assert!(success);
+        let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        if status["active_checks"]
+            .as_array()
+            .is_some_and(|checks| checks.len() == 2 && checks.iter().all(|check| check["pid"].is_u64()))
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "worker PIDs were not published: {status}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    parent.kill().unwrap();
+    let _ = parent.wait();
+    let run = repo.jjq().args(["run", "--all", "--jobs", "2"]).output().unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("interrupted runner"));
+    let clean = repo.jjq().args(["clean"]).output().unwrap();
+    assert_eq!(clean.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&clean.stderr).contains("interrupted runner"));
+
+    fs::write(&release, "").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let recovered = loop {
+        let output = repo
+            .jjq()
+            .args(["run", "--all", "--jobs", "2"])
+            .output()
+            .unwrap();
+        if output.status.success() {
+            break output;
+        }
+        assert!(std::time::Instant::now() < deadline, "workers did not exit: {:?}", output);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let recovered_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&recovered.stdout),
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(recovered_output.contains("recovered interrupted item 1"));
+    assert!(recovered_output.contains("recovered interrupted item 2"));
+    let check_count = fs::read_to_string(&count).unwrap().lines().count();
+    assert!(
+        (2..=4).contains(&check_count),
+        "recovery must check both items once; interrupted checks may or may not have entered user code: {check_count}"
+    );
+    assert!(repo.jj_file_exists("f1.txt", "main"));
+    assert!(repo.jj_file_exists("f2.txt", "main"));
+}
+
+#[test]
+fn test_parallel_spawn_gate_prevents_unowned_check_before_pid_publication() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let sync = TempDir::new().unwrap();
+    let spawned = sync.path().join("spawned");
+    let never_release = sync.path().join("never-release");
+    let check_count = sync.path().join("check-count");
+    let check = format!("echo ran >> {}", check_count.display());
+    repo.init_jjq_merge_with_check(&check);
+    repo.jjq_success(&["push", "f1"]);
+
+    let mut parent = repo
+        .jjq_std()
+        .args(["run", "--all", "--jobs", "2"])
+        .env("JJQTEST_BACKGROUND_SPAWNED", &spawned)
+        .env("JJQTEST_BACKGROUND_SPAWN_RELEASE", &never_release)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&spawned, std::time::Duration::from_secs(30));
+
+    let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
+    assert!(success);
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let active = &status["active_checks"][0];
+    assert!(active["pid"].is_null(), "publication seam must precede PID: {status}");
+    assert!(active["process_start"].is_null());
+
+    parent.kill().unwrap();
+    let _ = parent.wait();
+    // PID-less records are conservative for 5s, while the supervisor has a
+    // hard 4s gate deadline. After the grace, it cannot still start the check.
+    std::thread::sleep(std::time::Duration::from_millis(5_200));
+    assert!(!check_count.exists(), "unowned user check must never start");
+
+    let output = repo.jjq_success(&["run", "--all", "--jobs", "2"]);
+    assert!(output.contains("recovered interrupted item 1"), "{output}");
+    assert_eq!(fs::read_to_string(&check_count).unwrap().lines().count(), 1);
+    assert!(repo.jj_file_exists("f1.txt", "main"));
+}
+
+#[test]
+fn test_parallel_recovery_ignores_reused_pid_with_wrong_process_start() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_merge();
+    let active_dir = repo.path().join(".jj/jjq/active-checks/stale-token");
+    fs::create_dir_all(&active_dir).unwrap();
+    fs::write(
+        active_dir.join("000001.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "id": 1,
+            "run_token": "stale-token",
+            "predicted_base": "dead-base",
+            "speculative": false,
+            "workspace_path": "/tmp/dead-jjq-workspace",
+            "log_path": "/tmp/dead-jjq-log",
+            "phase": "checking",
+            "process_start": "definitely-not-this-process-start",
+            "pid": std::process::id(),
+            "published_at_ms": 0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // kill(pid, 0) succeeds for this test process, but its kernel start time
+    // differs from the stale record, so PID reuse must not block an empty run.
+    repo.jjq_success(&["run", "--all", "--jobs", "2"]);
+    assert!(!active_dir.exists());
+}
+
+#[test]
 fn test_delete_queued() {
     let repo = TestRepo::with_go_project();
     repo.init_jjq();
@@ -928,6 +1526,7 @@ fn test_delete_queued() {
 
     let delete_output = repo.jjq_success(&["delete", "1"]);
     insta::assert_snapshot!(delete_output, @"jjq: deleted queued item 1");
+    assert!(history_kinds(&repo, "1").contains(&"deleted".to_string()));
 
     let status_after = repo.jjq_success(&["status"]);
     insta::assert_snapshot!(status_after, @"jjq: queue is empty");
@@ -1324,6 +1923,10 @@ fn test_push_idempotent_clears_failed() {
     assert!(
         !failed_log.exists(),
         "idempotent push should remove the archived log"
+    );
+    assert!(
+        history_kinds(&repo, "1").contains(&"replaced".to_string()),
+        "re-push should retain the replacement audit event"
     );
 }
 
@@ -1821,6 +2424,7 @@ fn test_run_rebase_success() {
 
     // Verify trunk advanced: feature.txt should exist on main
     assert!(repo.jj_file_exists("feature.txt", "main"));
+    assert_landed_history_matches_main(&repo, "1");
 }
 
 #[test]
@@ -1925,6 +2529,16 @@ fn test_run_rebase_conflict() {
     // Run second item (should fail with conflict)
     let output = repo.jjq_failure(&["run"]);
     assert!(output.contains("conflicts"), "expected conflict: {}", output);
+    let failed = history_events(&repo, "2")
+        .into_iter()
+        .find(|event| event["kind"] == "failed")
+        .unwrap();
+    assert_eq!(failed["failure_reason"], "conflicts");
+    assert!(
+        failed["conflict_paths"].as_array().unwrap().len() > 0,
+        "conflict history should retain paths: {}",
+        failed
+    );
 }
 
 #[test]
@@ -2095,6 +2709,7 @@ fn test_run_all_counts_skipped_empty() {
 
     assert!(output.contains("skipped (empty)"), "expected skipped count in output: {}", output);
     assert!(repo.jj_file_exists("f2.txt", "main"), "f2.txt should be on main");
+    assert!(history_kinds(&repo, "1").contains(&"skipped_empty".to_string()));
 }
 
 // ============================================================================
@@ -2134,6 +2749,12 @@ fn test_requeue_basic() {
         !failed_log.exists(),
         "requeue should remove the archived log"
     );
+    let old = history_events(&repo, "1");
+    assert_eq!(old.last().unwrap()["kind"], "requeued");
+    assert_eq!(old.last().unwrap()["related_sequence_id"], 2);
+    let retry = history_events(&repo, "2");
+    assert_eq!(retry[0]["kind"], "queued");
+    assert_eq!(retry[0]["related_sequence_id"], 1);
 
     // Status should show the item back in queue, no failed items
     let status = repo.jjq_success(&["status"]);
@@ -2144,6 +2765,159 @@ fn test_requeue_basic() {
     let run_output = repo.jjq_success(&["run"]);
     assert!(run_output.contains("merged") || run_output.contains("rebased"),
         "expected successful merge: {}", run_output);
+}
+
+#[test]
+fn test_concurrent_requeue_same_failed_item_creates_one_retry() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_with_check("false");
+
+    run_jj(repo.path(), &["new", "-m", "race retry", "main"]);
+    fs::write(repo.path().join("race-retry.txt"), "retry\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "race-retry"]);
+    run_jj(repo.path(), &["new", "main"]);
+    repo.jjq_success(&["push", "race-retry"]);
+    repo.jjq_failure(&["run"]);
+
+    let first = spawn_requeue(&repo, repo.path(), "1");
+    let second = spawn_requeue(&repo, repo.path(), "1");
+    let first = first.wait_with_output().expect("failed to wait for first requeue");
+    let second = second.wait_with_output().expect("failed to wait for second requeue");
+    let outcomes = [first, second];
+    assert_eq!(
+        outcomes.iter().filter(|out| out.status.success()).count(),
+        1,
+        "exactly one requeue may create a replacement: {:?}",
+        outcomes.iter().map(|out| out.status.code()).collect::<Vec<_>>()
+    );
+    assert!(
+        outcomes
+            .iter()
+            .filter(|out| !out.status.success())
+            .all(|out| out.status.code() == Some(10)),
+        "losing requeue should fail with usage: {:?}",
+        outcomes.iter().map(|out| out.status.code()).collect::<Vec<_>>()
+    );
+    assert_eq!(queue_bookmark_names(&repo), vec!["jjq/queue/000002"]);
+    assert_eq!(meta_last_id(&repo), "2");
+    let old = history_events(&repo, "1");
+    assert_eq!(old.last().unwrap()["kind"], "requeued");
+    assert_eq!(old.last().unwrap()["related_sequence_id"], 2);
+    let retry = history_events(&repo, "2");
+    assert_eq!(retry[0]["kind"], "queued");
+    assert_eq!(retry[0]["related_sequence_id"], 1);
+}
+
+#[test]
+fn test_push_and_requeue_race_leaves_one_valid_submission() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_with_check("false");
+    run_jj(repo.path(), &["new", "-m", "push retry race", "main"]);
+    fs::write(repo.path().join("push-retry-race.txt"), "retry\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "push-retry-race"]);
+    run_jj(repo.path(), &["new", "main"]);
+    repo.jjq_success(&["push", "push-retry-race"]);
+    repo.jjq_failure(&["run"]);
+
+    let push = spawn_push(&repo, repo.path(), "push-retry-race");
+    let requeue = spawn_requeue(&repo, repo.path(), "1");
+    let push = push.wait_with_output().expect("failed to wait for push");
+    let requeue = requeue.wait_with_output().expect("failed to wait for requeue");
+    assert_eq!(
+        [push, requeue]
+            .iter()
+            .filter(|out| out.status.success())
+            .count(),
+        1,
+        "one serialized mutation should create the retry"
+    );
+    assert_eq!(queue_bookmark_names(&repo), vec!["jjq/queue/000002"]);
+    assert_no_failed_bookmarks(&repo);
+}
+
+#[test]
+fn test_delete_and_requeue_race_never_resurrects_deleted_failed_item() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_with_check("false");
+    run_jj(repo.path(), &["new", "-m", "delete retry race", "main"]);
+    fs::write(repo.path().join("delete-retry-race.txt"), "retry\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "delete-retry-race"]);
+    run_jj(repo.path(), &["new", "main"]);
+    repo.jjq_success(&["push", "delete-retry-race"]);
+    repo.jjq_failure(&["run"]);
+
+    let delete = spawn_delete(&repo, repo.path(), "1");
+    let requeue = spawn_requeue(&repo, repo.path(), "1");
+    let delete = delete.wait_with_output().expect("failed to wait for delete");
+    let requeue = requeue.wait_with_output().expect("failed to wait for requeue");
+    let delete_succeeded = delete.status.success();
+    assert_eq!(
+        [&delete, &requeue]
+            .iter()
+            .filter(|out| out.status.success())
+            .count(),
+        1,
+        "one serialized mutation should win"
+    );
+    assert_no_failed_bookmarks(&repo);
+    let queue = queue_bookmark_names(&repo);
+    assert!(queue.is_empty() || queue == vec!["jjq/queue/000002"]);
+    if delete_succeeded {
+        assert!(
+            queue.is_empty(),
+            "a delete that won first must not be resurrected: {:?}",
+            queue
+        );
+    }
+}
+
+#[test]
+fn test_requeue_finishes_interrupted_create_before_delete() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq_with_check("false");
+
+    run_jj(repo.path(), &["new", "-m", "interrupted retry", "main"]);
+    fs::write(repo.path().join("interrupted-retry.txt"), "retry\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "retry"]);
+    run_jj(repo.path(), &["new", "main"]);
+    repo.jjq_success(&["push", "retry"]);
+    repo.jjq_failure(&["run"]);
+
+    // This is precisely the durable overlap a crash can leave: the new queue
+    // bookmark was created, while the old failed bookmark remains.
+    run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "create",
+            "-r",
+            "retry",
+            "jjq/queue/000002",
+        ],
+    );
+    repo.jjq_success(&["requeue", "1"]);
+
+    assert!(
+        !run_jj(
+            repo.path(),
+            &[
+                "bookmark",
+                "list",
+                "-r",
+                "bookmarks(exact:\"jjq/failed/000001\")",
+                "-T",
+                "name",
+            ],
+        )
+        .contains("jjq/failed/000001"),
+        "recovery should finish removal of the old failed bookmark"
+    );
+    let old = history_events(&repo, "1");
+    assert_eq!(old.last().unwrap()["kind"], "requeued");
+    assert_eq!(old.last().unwrap()["related_sequence_id"], 2);
+    let new = history_events(&repo, "2");
+    assert_eq!(new[0]["kind"], "queued");
+    assert_eq!(new[0]["related_sequence_id"], 1);
 }
 
 #[test]
@@ -2634,6 +3408,25 @@ fn spawn_push(repo: &TestRepo, dir: &Path, revset: &str) -> process::Child {
     cmd.spawn().expect("failed to spawn jjq push")
 }
 
+fn spawn_requeue(repo: &TestRepo, dir: &Path, id: &str) -> process::Child {
+    let mut cmd = repo.jjq_std();
+    cmd.current_dir(dir)
+        .env("JJQ_META_LOCK_TIMEOUT_MS", "60000")
+        .args(["requeue", id])
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped());
+    cmd.spawn().expect("failed to spawn jjq requeue")
+}
+
+fn spawn_delete(repo: &TestRepo, dir: &Path, id: &str) -> process::Child {
+    let mut cmd = repo.jjq_std();
+    cmd.current_dir(dir)
+        .args(["delete", id])
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped());
+    cmd.spawn().expect("failed to spawn jjq delete")
+}
+
 /// Queue bookmark names in the repo, sorted. `jj bookmark list -r` returns
 /// every bookmark on the matched commits (including the user's own), hence
 /// the name filter.
@@ -2656,6 +3449,21 @@ fn queue_bookmark_names(repo: &TestRepo) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+fn assert_no_failed_bookmarks(repo: &TestRepo) {
+    let failed = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/failed/??????\")",
+            "-T",
+            "name ++ \"\\n\"",
+        ],
+    );
+    assert!(failed.trim().is_empty(), "stale failed bookmarks: {}", failed);
 }
 
 /// Assert no bookmark in the repo is conflicted (racing metadata writers
@@ -2737,6 +3545,8 @@ fn test_concurrent_pushes_from_two_workspaces() {
         "2",
         "sequence counter should equal the number of pushes"
     );
+    assert_eq!(history_kinds(&repo, "1"), vec!["queued"]);
+    assert_eq!(history_kinds(&repo, "2"), vec!["queued"]);
 }
 
 /// Push storm: six distinct changes pushed from three workspaces
@@ -3210,14 +4020,365 @@ fn wait_for_file(path: &Path, timeout: std::time::Duration) {
     }
 }
 
+#[test]
+fn test_cancel_queued_item_is_immediate_and_idempotent() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    repo.init_jjq_merge();
+    repo.jjq_success(&["push", "f1"]);
+
+    let first = repo.jjq_success(&["cancel", "1"]);
+    assert!(first.contains("canceled queued item 1"), "{first}");
+    let second = repo.jjq_success(&["cancel", "1"]);
+    assert!(second.contains("already canceled"), "{second}");
+
+    let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
+    assert!(success);
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["queue"].as_array().unwrap().len(), 0);
+    assert_eq!(status["running"].as_array().unwrap().len(), 0);
+    let history = repo.jjq_success(&["history", "1", "--json"]);
+    assert!(history.contains("cancel_requested"), "{history}");
+    assert!(history.contains("canceled"), "{history}");
+}
+
+#[test]
+fn test_queued_cancel_crash_cannot_later_land() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let sync = TempDir::new().unwrap();
+    let recorded = sync.path().join("recorded");
+    let never_release = sync.path().join("never-release");
+    let check_ran = sync.path().join("check-ran");
+    repo.init_jjq_merge_with_check(&format!("touch {}", check_ran.display()));
+    repo.jjq_success(&["push", "f1"]);
+    let mut cancel = repo
+        .jjq_std()
+        .args(["cancel", "1"])
+        .env("JJQTEST_QUEUED_CANCEL_RECORDED", &recorded)
+        .env("JJQTEST_QUEUED_CANCEL_RELEASE", &never_release)
+        .spawn()
+        .unwrap();
+    wait_for_file(&recorded, std::time::Duration::from_secs(30));
+    cancel.kill().unwrap();
+    let _ = cancel.wait();
+
+    repo.jjq_success(&["run"]);
+    assert!(!check_ran.exists());
+    assert!(!repo.jj_file_exists("f1.txt", "main"));
+    assert!(!repo.path().join(".jj/jjq/cancellations/000001").exists());
+    let history = repo.jjq_success(&["history", "1", "--json"]);
+    assert_eq!(history.matches("\"kind\": \"canceled\"").count(), 1);
+    assert!(!history.contains("\"kind\": \"claimed\""), "{history}");
+    assert!(!history.contains("\"kind\": \"check_started\""), "{history}");
+}
+
+#[test]
+fn test_cancel_running_check_escalates_and_reports_status() {
+    let repo = TestRepo::with_go_project();
+    let sync = TempDir::new().unwrap();
+    let started = sync.path().join("started");
+    let descendant = sync.path().join("descendant");
+    let check = format!(
+        "trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & echo $! > {}; touch {}; wait",
+        descendant.display(),
+        started.display(),
+    );
+    repo.jjq_success(&[
+        "init", "--trunk", "main", "--check", &check, "--strategy", "merge",
+    ]);
+    run_jj(repo.path(), &["new", "-m", "cancel me", "main"]);
+    fs::write(repo.path().join("cancel.txt"), "cancel\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "cancel-me"]);
+    repo.jjq_success(&["push", "cancel-me"]);
+
+    let child = repo.spawn_jjq(&["run"]);
+    wait_for_file(&started, std::time::Duration::from_secs(30));
+    let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
+    assert!(success);
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let check_status = &status["active_checks"][0];
+    let mut keys = check_status
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "elapsed_ms",
+            "id",
+            "log_path",
+            "phase",
+            "pid",
+            "predicted_base",
+            "process_start",
+            "run_token",
+            "speculative",
+            "workspace_path",
+        ]
+    );
+    assert_eq!(check_status["phase"], "checking");
+    assert!(check_status["elapsed_ms"].is_u64());
+    let first_elapsed = check_status["elapsed_ms"].as_u64().unwrap();
+    assert!(check_status["predicted_base"].is_string());
+    assert_eq!(check_status["speculative"], false);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let (later_stdout, _, _) = repo.jjq_raw_output(&["status", "--json"]);
+    let later: serde_json::Value = serde_json::from_str(&later_stdout).unwrap();
+    assert!(later["active_checks"][0]["elapsed_ms"].as_u64().unwrap() >= first_elapsed);
+
+    repo.jjq_success(&["cancel", "1"]);
+    let (stdout, _, _) = repo.jjq_raw_output(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["active_checks"][0]["phase"], "cancelling");
+    let output = child.wait_with_output().expect("failed to wait for canceled run");
+    assert!(output.status.success(), "stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(!repo.jj_file_exists("cancel.txt", "main"));
+    let descendant_pid: u32 = fs::read_to_string(&descendant).unwrap().trim().parse().unwrap();
+    let descendant_alive = unsafe { libc::kill(descendant_pid as libc::pid_t, 0) } == 0;
+    assert!(!descendant_alive, "descendant process {descendant_pid} survived cancellation");
+    assert!(!repo.path().join(".jj/jjq/cancellations/000001").exists());
+    let history = repo.jjq_success(&["history", "1", "--json"]);
+    assert!(history.contains("cancel_requested"), "{history}");
+    assert!(history.contains("canceled"), "{history}");
+}
+
+#[test]
+fn test_cancel_completed_speculation_invalidates_later_work() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let sync = TempDir::new().unwrap();
+    let a_started = sync.path().join("a-started");
+    let a_release = sync.path().join("a-release");
+    let b_done = sync.path().join("b-done");
+    let check = format!(
+        "if [ -f f2.txt ]; then touch {b}; exit 0; fi; touch {a}; while [ ! -f {release} ]; do sleep 0.05; done",
+        a = a_started.display(),
+        release = a_release.display(),
+        b = b_done.display(),
+    );
+    repo.init_jjq_merge_with_check(&check);
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+    let child = repo.spawn_jjq(&["run", "--all", "--jobs", "2"]);
+    wait_for_file(&a_started, std::time::Duration::from_secs(30));
+    wait_for_file(&b_done, std::time::Duration::from_secs(30));
+
+    repo.jjq_success(&["cancel", "2"]);
+    fs::write(&a_release, "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(repo.jj_file_exists("f1.txt", "main"));
+    assert!(!repo.jj_file_exists("f2.txt", "main"));
+    let history = repo.jjq_success(&["history", "2", "--json"]);
+    assert!(history.contains("canceled"), "{history}");
+}
+
+#[test]
+fn test_cancel_wins_after_claim_before_active_check_publication() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let sync = TempDir::new().unwrap();
+    let claimed = sync.path().join("claimed");
+    let release = sync.path().join("release");
+    let check_ran = sync.path().join("check-ran");
+    repo.init_jjq_merge_with_check(&format!("touch {}", check_ran.display()));
+    repo.jjq_success(&["push", "f1"]);
+    let child = repo
+        .jjq_std()
+        .args(["run"])
+        .env("JJQTEST_CLAIM_PUBLISHED", &claimed)
+        .env("JJQTEST_CLAIM_RELEASE", &release)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&claimed, std::time::Duration::from_secs(30));
+    repo.jjq_success(&["cancel", "1"]);
+    fs::write(&release, "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(!check_ran.exists(), "accepted pre-start cancellation ran user check code");
+    assert!(!repo.jj_file_exists("f1.txt", "main"));
+}
+
+#[test]
+fn test_landing_cas_wins_over_late_cancel() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    repo.init_jjq_merge();
+    repo.jjq_success(&["push", "f1"]);
+    let sync = TempDir::new().unwrap();
+    let cas = sync.path().join("cas");
+    let release = sync.path().join("release");
+    let runner = repo
+        .jjq_std()
+        .args(["run"])
+        .env("JJQTEST_LANDING_CAS", &cas)
+        .env("JJQTEST_LANDING_CAS_RELEASE", &release)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&cas, std::time::Duration::from_secs(30));
+    let mut cancel = repo
+        .jjq_std()
+        .args(["cancel", "1"])
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(cancel.try_wait().unwrap().is_none(), "cancel must wait for terminal publication choice");
+    fs::write(&release, "").unwrap();
+    assert!(runner.wait_with_output().unwrap().status.success());
+    assert_eq!(cancel.wait_with_output().unwrap().status.code(), Some(10));
+    assert!(repo.jj_file_exists("f1.txt", "main"));
+    let history = repo.jjq_success(&["history", "1", "--json"]);
+    assert!(history.contains("landed"));
+    assert!(!history.contains("cancel_requested"));
+}
+
+#[test]
+fn test_cancel_marker_survives_runner_crash_and_recovery_terminalizes() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let sync = TempDir::new().unwrap();
+    let started = sync.path().join("started");
+    let count = sync.path().join("count");
+    let check = format!(
+        "echo run >> {count}; touch {started}; while :; do sleep 1; done",
+        count = count.display(), started = started.display()
+    );
+    repo.init_jjq_merge_with_check(&check);
+    repo.jjq_success(&["push", "f1"]);
+    let mut runner = repo.spawn_jjq(&["run"]);
+    wait_for_file(&started, std::time::Duration::from_secs(30));
+    repo.jjq_success(&["cancel", "1"]);
+    runner.kill().unwrap();
+    let _ = runner.wait();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let output = repo.jjq().args(["run"]).output().unwrap();
+        if output.status.success() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "orphan check did not exit: {output:?}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
+    assert!(!repo.jj_file_exists("f1.txt", "main"));
+    assert!(!repo.path().join(".jj/jjq/cancellations/000001").exists());
+    let history = repo.jjq_success(&["history", "1", "--json"]);
+    assert!(history.contains("canceled"));
+}
+
+#[test]
+fn test_marker_only_running_cancel_synthesizes_intent_history() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let sync = TempDir::new().unwrap();
+    let check_started = sync.path().join("check-started");
+    let marker_written = sync.path().join("marker-written");
+    let never_release = sync.path().join("never-release");
+    repo.init_jjq_merge_with_check(&format!(
+        "touch {}; while :; do sleep 1; done",
+        check_started.display()
+    ));
+    repo.jjq_success(&["push", "f1"]);
+    let runner = repo.spawn_jjq(&["run"]);
+    wait_for_file(&check_started, std::time::Duration::from_secs(30));
+    let mut cancel = repo
+        .jjq_std()
+        .args(["cancel", "1"])
+        .env("JJQTEST_RUNNING_CANCEL_MARKED", &marker_written)
+        .env("JJQTEST_RUNNING_CANCEL_RELEASE", &never_release)
+        .spawn()
+        .unwrap();
+    wait_for_file(&marker_written, std::time::Duration::from_secs(30));
+    cancel.kill().unwrap();
+    let _ = cancel.wait();
+    assert!(runner.wait_with_output().unwrap().status.success());
+
+    let history = repo.jjq_success(&["history", "1", "--json"]);
+    assert_eq!(history.matches("\"kind\": \"cancel_requested\"").count(), 1);
+    assert_eq!(history.matches("\"kind\": \"canceled\"").count(), 1);
+}
+
+#[test]
+fn test_cancel_is_not_failure_or_stop_on_failure() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    let sync = TempDir::new().unwrap();
+    let started = sync.path().join("started");
+    let check = format!(
+        "if [ -f f1.txt ]; then touch {}; while :; do sleep 1; done; fi; true",
+        started.display()
+    );
+    repo.init_jjq_merge_with_check(&check);
+    repo.jjq_success(&["push", "f1"]);
+    repo.jjq_success(&["push", "f2"]);
+    let child = repo.spawn_jjq(&["run", "--all", "--stop-on-failure"]);
+    wait_for_file(&started, std::time::Duration::from_secs(30));
+    repo.jjq_success(&["cancel", "1"]);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(!repo.jj_file_exists("f1.txt", "main"));
+    assert!(repo.jj_file_exists("f2.txt", "main"));
+}
+
+#[test]
+fn test_user_check_exit_77_is_failure_not_cancellation() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    repo.init_jjq_merge_with_check("exit 77");
+    repo.jjq_success(&["push", "f1"]);
+
+    let output = repo
+        .jjq()
+        .args(["run", "--all"])
+        .output()
+        .expect("failed to run batch");
+    assert_eq!(output.status.code(), Some(2), "stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+
+    let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
+    assert!(success);
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["failed"].as_array().unwrap().len(), 1);
+    let history = repo.jjq_success(&["history", "1", "--json"]);
+    assert!(history.contains("\"kind\": \"failed\""), "{history}");
+    assert!(!history.contains("\"kind\": \"canceled\""), "{history}");
+}
+
+#[test]
+fn test_serial_run_noninteractive_keeps_heartbeat_feedback() {
+    let repo = TestRepo::with_run_all_happy_scenario();
+    repo.init_jjq_merge_with_check("sleep 0.3");
+    repo.jjq_success(&["push", "f1"]);
+    let output = repo
+        .jjq_std()
+        .args(["run"])
+        .env("JJQTEST_HEARTBEAT_MS", "50")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("jjq: still running..."),
+        "serial non-interactive run lost heartbeat feedback: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Set up a repo with one pushed item whose check blocks on the gate files,
 /// returning (repo, sync_dir); the gate files are `started`/`release` inside
 /// sync_dir.
-fn repo_with_gated_check() -> (TestRepo, TempDir) {
+fn repo_with_gated_check_for_strategy(strategy: &str) -> (TestRepo, TempDir) {
     let repo = TestRepo::with_go_project();
     let sync = TempDir::new().expect("failed to create sync dir");
     let check = gated_check_command(&sync.path().join("started"), &sync.path().join("release"));
-    repo.init_jjq_with_check(&check);
+    repo.jjq_success(&[
+        "init",
+        "--trunk",
+        "main",
+        "--check",
+        &check,
+        "--strategy",
+        strategy,
+    ]);
 
     run_jj(repo.path(), &["new", "-m", "slow feature", "main"]);
     fs::write(repo.path().join("slow.txt"), "content").unwrap();
@@ -3225,6 +4386,217 @@ fn repo_with_gated_check() -> (TestRepo, TempDir) {
     repo.jjq_success(&["push", "slow"]);
 
     (repo, sync)
+}
+
+fn repo_with_gated_check() -> (TestRepo, TempDir) {
+    repo_with_gated_check_for_strategy("rebase")
+}
+
+fn advance_trunk(repo: &TestRepo) {
+    run_jj(repo.path(), &["new", "-m", "advance trunk", "main"]);
+    fs::write(repo.path().join("trunk-advance.txt"), "advance\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "move", "main"]);
+}
+
+#[test]
+fn test_validation_receipt_requeues_when_trunk_moves_for_each_strategy() {
+    for strategy in ["rebase", "merge"] {
+        let (repo, sync) = repo_with_gated_check_for_strategy(strategy);
+
+        let child = repo.spawn_jjq(&["run"]);
+        wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+        advance_trunk(&repo);
+        fs::write(sync.path().join("release"), "").unwrap();
+
+        let output = child.wait_with_output().expect("failed to wait for run");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{} receipt should be rejected after trunk moves; stdout: {} stderr: {}",
+            strategy,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("validation receipt") && stderr.contains("trunk moved"),
+            "{} should explain receipt rejection: {}",
+            strategy,
+            stderr
+        );
+        assert!(
+            repo.jj_file_exists("trunk-advance.txt", "main"),
+            "the independent trunk move must survive"
+        );
+        assert!(
+            !repo.jj_file_exists("slow.txt", "main"),
+            "the stale checked result must not land"
+        );
+        assert!(
+            run_jj(
+                repo.path(),
+                &[
+                    "bookmark",
+                    "list",
+                    "-r",
+                    "bookmarks(exact:\"jjq/queue/000001\")",
+                    "-T",
+                    "name",
+                ],
+            )
+            .contains("jjq/queue/000001"),
+            "stale receipt should restore the original queue item"
+        );
+        assert!(
+            !run_jj(
+                repo.path(),
+                &[
+                    "bookmark",
+                    "list",
+                    "-r",
+                    "bookmarks(exact:\"jjq/running/000001\")",
+                    "-T",
+                    "name",
+                ],
+            )
+            .contains("jjq/running/000001"),
+            "rejected receipt must not strand a running claim"
+        );
+
+        // The released gate makes the retried check quick. It must create a
+        // fresh receipt against the advanced trunk before it lands.
+        repo.jjq_success(&["run"]);
+        assert!(
+            repo.jj_file_exists("slow.txt", "main"),
+            "{} retry should land after a fresh check",
+            strategy
+        );
+    }
+}
+
+#[test]
+fn test_validation_receipt_requeues_when_check_command_changes() {
+    let (repo, sync) = repo_with_gated_check();
+
+    let child = repo.spawn_jjq(&["run", "--all"]);
+    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+    repo.jjq_success(&["config", "check_command", "true"]);
+    fs::write(sync.path().join("release"), "").unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait for run");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("check_command changed"),
+        "changed validation policy should reject the old receipt: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("stopped after a stale validation receipt"),
+        "batch mode must stop instead of repeatedly checking with stale config: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!repo.jj_file_exists("slow.txt", "main"));
+
+    // Its original claim was returned to the FIFO queue and can be checked
+    // with the newly configured command.
+    repo.jjq_success(&["run"]);
+    assert!(repo.jj_file_exists("slow.txt", "main"));
+}
+
+#[test]
+fn test_receipt_holds_metadata_lock_from_validation_through_landing() {
+    let repo = TestRepo::with_go_project();
+    repo.init_jjq();
+    run_jj(repo.path(), &["new", "-m", "receipt lock", "main"]);
+    fs::write(repo.path().join("receipt-lock.txt"), "locked\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "receipt-lock"]);
+    repo.jjq_success(&["push", "receipt-lock"]);
+
+    let sync = TempDir::new().expect("failed to create sync dir");
+    let started = sync.path().join("validated");
+    let release = sync.path().join("release");
+    let runner = repo
+        .jjq_std()
+        .args(["run"])
+        .env("JJQTEST_RECEIPT_VALIDATED", &started)
+        .env("JJQTEST_RECEIPT_VALIDATION_RELEASE", &release)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn runner");
+    wait_for_file(&started, std::time::Duration::from_secs(30));
+
+    let mut config = repo
+        .jjq_std()
+        .args(["config", "check_command", "false"])
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn config writer");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(
+        config.try_wait().expect("failed to poll config writer").is_none(),
+        "config writer must remain blocked until the validated receipt lands"
+    );
+
+    fs::write(&release, "").unwrap();
+    let output = runner.wait_with_output().expect("failed to wait for runner");
+    assert!(
+        output.status.success(),
+        "receipt-protected landing should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(repo.jj_file_exists("receipt-lock.txt", "main"));
+    assert!(
+        config
+            .wait_with_output()
+            .expect("failed to wait for config writer")
+            .status
+            .success(),
+        "config writer should complete after landing releases meta"
+    );
+}
+
+#[test]
+fn test_validation_receipt_never_lands_a_retargeted_claim() {
+    let (repo, sync) = repo_with_gated_check();
+
+    let child = repo.spawn_jjq(&["run"]);
+    wait_for_file(&sync.path().join("started"), std::time::Duration::from_secs(30));
+
+    run_jj(repo.path(), &["new", "-m", "replacement", "main"]);
+    fs::write(repo.path().join("replacement.txt"), "replacement\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "replacement"]);
+    run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "set",
+            "--allow-backwards",
+            "-r",
+            "replacement",
+            "jjq/running/000001",
+        ],
+    );
+    fs::write(sync.path().join("release"), "").unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait for run");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("claim changed or was removed, discarding result"),
+        "retargeted claim must be discarded rather than landed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!repo.jj_file_exists("slow.txt", "main"));
+    assert!(!repo.jj_file_exists("replacement.txt", "main"));
+
+    // The next runner treats the externally changed claim as stale, recovers
+    // it, and checks it from scratch before landing it.
+    repo.jjq_success(&["run"]);
+    assert!(repo.jj_file_exists("replacement.txt", "main"));
+    assert!(!repo.jj_file_exists("slow.txt", "main"));
 }
 
 #[test]
@@ -3361,6 +4733,7 @@ fn test_run_recovers_stale_claim() {
         repo.jj_file_exists("feature.txt", "main"),
         "recovered item should land on main"
     );
+    assert!(history_kinds(&repo, "1").contains(&"recovered".to_string()));
 
     let bookmarks = run_jj(
         repo.path(),
@@ -3486,6 +4859,26 @@ fn test_clean_spares_user_jjq_prefixed_workspace() {
     assert!(
         output.contains("jjq-run-000042"),
         "stale runner workspace should be cleaned: {}",
+        output
+    );
+
+    // Tokenized speculative workspaces use the same sequence prefix and must
+    // be recognized by clean rather than treated as an arbitrary jjq name.
+    let tokenized_ws = TempDir::new().unwrap();
+    run_jj(
+        repo.path(),
+        &[
+            "workspace",
+            "add",
+            "--name",
+            "jjq-run-000043-test-token",
+            tokenized_ws.path().to_str().unwrap(),
+        ],
+    );
+    let output = repo.jjq_success(&["clean"]);
+    assert!(
+        output.contains("jjq-run-000043-test-token (orphaned)"),
+        "tokenized runner workspace should be cleaned: {}",
         output
     );
 

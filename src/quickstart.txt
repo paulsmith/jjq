@@ -14,9 +14,13 @@ CORE COMMANDS
   jjq push REVSET     Queue a revision for merging
   jjq run             Process the next queue item
   jjq run --all       Process all queue items
+  jjq run --all --jobs N  Check up to N merge candidates concurrently
   jjq status          Show queue, recent failures, and recently landed items
+  jjq history ID      Show a submission's durable lifecycle history
+  jjq history --change CHANGE_ID  Find all submissions for a change
   jjq check [--rev R] Pre-flight: test a revision without queuing it
   jjq requeue ID      Re-push a failed item back onto the queue
+  jjq cancel ID       Cancel queued or running work cooperatively
   jjq tail            View check command output (follows by default)
 
 AS AN AGENT
@@ -43,11 +47,20 @@ THINGS TO KNOW
   - Pushing your working-copy commit (@) moves the working copy to a new
     empty child, so edits after the push don't amend the queued commit
   - Queue is processed FIFO; each item gets a temporary workspace
+  - A passing queue check creates a short-lived validation receipt; jjq
+    rechecks its candidate, trunk, strategy, and check command before landing
+  - If trunk or check configuration changes during a run, jjq requeues the
+    unchanged item for a fresh check instead of landing stale work
+  - `--jobs` defaults to 1; merge lookahead rechecks dependents after an
+    earlier failure or tree change, while rebase currently remains serial
   - Re-pushing the same change ID replaces its queue/failed entry
   - Concurrent pushes are safe: they serialize on a metadata lock, so a
     push may wait briefly; it exits 3 only after a 15s timeout
   - The item being processed shows under "Running:" in status; it cannot
     be deleted or requeued while a runner is active
+  - Cancel removes queued work immediately. Running checks stop as a process
+    group; cancellation is not a failure and a landing CAS that already won
+    remains landed
   - Use 'jjq check @' to test before pushing — catches conflicts early
   - Status shows recently landed items and conflicting file paths for failures
   - Failure output shows concrete jj commands with your actual change IDs

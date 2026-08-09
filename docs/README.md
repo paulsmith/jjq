@@ -95,8 +95,14 @@ latest trunk after a successful merge.
 
 ### Running the queue
 
-A jjq queue run is started by the user via the CLI. One queue item is processed
-at a time. Future versions of jjq may support batching or continuous running.
+A jjq queue run is started by the user via the CLI. `jjq run --all --jobs N`
+can check up to `N` merge-strategy candidates concurrently while still landing
+only in FIFO order. `N` defaults to 1, preserving sequential behavior. A
+failed or tree-mutating predecessor invalidates dependent predictions; they are
+checked again from the real trunk. File overlap is never used as proof of
+independence. Rebase currently stays serial for `--jobs > 1`, because its
+disposable duplicate cannot safely provide the exact commit-bound predicted
+base of the original candidate.
 
 A queue run begins by determining the current lowest-numbered queue item. Since
 queue items are numbered with the sequence ID which is monotonically-increasing,
@@ -112,10 +118,31 @@ Before processing an item, the runner claims it by renaming its bookmark from
 visible (`jjq status` shows a "Running" section) and protects it: `jjq delete`,
 `jjq requeue`, and a `jjq push` of the same revision refuse to touch a running
 item while the run lock is held. Immediately before landing, the runner
-verifies the claim still exists and discards its result if the item was removed
-out-of-band. If a runner crashes, its claim remains; the next run (or a
-`jjq delete`/`jjq requeue` issued while the run lock is free) recovers the
-orphaned claim back to its queue position under the same sequence ID.
+validates the successful check's in-memory receipt: the claim still names the
+same full candidate commit, trunk has not moved, the checked workspace revision
+is unchanged, the landing strategy still matches, and the exact check command
+is still configured. A stale receipt returns its unchanged claim to the same
+queue position for a fresh check; a removed or retargeted claim is never
+landed. If a runner crashes, its claim remains; the next run (or a `jjq
+delete`/`jjq requeue` issued while the run lock is free) recovers the orphaned
+claim back to its queue position under the same sequence ID.
+`jjq cancel ID` removes queued work immediately or publishes a cooperative
+intent for a running item. Running checks terminate as one process group (TERM,
+then KILL after a grace period). Cancellation is not failure and does not make
+`run --all` partial or trigger `--stop-on-failure`. The cancellation marker is
+durable across crashes and is removed after the `canceled` history event and
+claim cleanup. A runner that already won the final trunk compare-and-swap may
+land; `publication.lock` serializes that choice with accepting cancellation.
+During any active queued check, `status --json` also exposes compatible
+`active_checks` records (item ID, predicted base, run token, child PID,
+process-start identity, workspace/log paths, `checking`/`cancelling` phase,
+elapsed milliseconds, and whether the check is speculative). A background check waits
+behind a token-specific start gate until its PID record is published; if the
+parent dies first, it exits without running the configured command. They are
+ephemeral `.jj/jjq/` state. If the
+scheduler crashes but a recorded check child is still alive, new runs and
+`clean` refuse to disturb it. Once every child exits, the next run removes the
+dead attempt state, recovers the claims, and checks them from scratch.
 
 ### Concurrency
 
@@ -134,13 +161,27 @@ time. The `run` lock uses `.jj/jjq/locks/run.lock`. A runner may take the
 meta lock while holding the run lock, never the reverse, so the two locks
 cannot deadlock.
 
+Queue-state mutations (`jjq push`, `jjq requeue`, `jjq delete`, and `jjq cancel`) take the
+blocking `.jj/jjq/locks/mutation.lock` for their whole transition. This
+serializes those commands so they cannot interleave queue/failed bookmark
+updates; unrelated readers and queue runners remain unblocked. A mutation may
+take the `run` lock for stale-claim handling and the `meta` lock for sequence
+allocation and history. Producers additionally take
+`.jj/jjq/locks/publication.lock` while publishing a queue bookmark and its
+`queued` history event. Cancellation intent and every runner terminal choice
+use that same lock, so cancel-versus-land/fail/empty outcomes have one durable
+winner. The queue runner also uses it while claiming an item and recording
+`claimed`, so history cannot begin at `claimed`.
+
 `jjq clean` holds the run lock for its whole cleanup, so it refuses to run
 while a queue runner is active rather than destroying the runner's live
 workspace. Each `jjq check` holds a shared `check` lock
 (`.jj/jjq/locks/check.lock`) for its workspace's lifetime; concurrent checks
 coexist, and clean probes the lock exclusively, refusing while any check is
-active. The lock order is run → meta and run → check; no code path acquires
-the run lock while holding either of the others.
+active. Producer lock order is mutation → publication → meta; runner claims
+use run → publication → meta. Mutation paths acquire run only before
+publication, and no run path acquires mutation. Run → check remains for
+clean; no code path acquires run while holding meta or check.
 
 ### Filesystem layout
 
@@ -175,6 +216,13 @@ that combines the trunk and the candidate revision.
 The check can be any command that can be executed by a POSIX shell. Its exit
 code, zero (success) or non-zero (failure), is determinative of the success of
 the check.
+
+A successful queue check is not itself permission to move trunk. It produces
+an in-memory validation receipt bound to the sequence ID, candidate change and
+full commit IDs, trunk commit, checked workspace commit, strategy, and exact
+check-command fingerprint. Landing consumes that receipt only after rechecking
+those facts. This keeps single-worker behavior unchanged while making the
+check/land boundary explicit for later speculative scheduling.
 
 ### Workspaces
 
@@ -270,6 +318,13 @@ updates during a run). Failed queue-item checks are archived by sequence ID;
 The jjq command `delete` takes an ID argument and removes the item from the
 queue, or for a failed item, its bookmark. If the failed workspace directory is
 found, it is removed as well.
+
+### Canceling queued and running items
+
+`jjq cancel <id>` is distinct from delete: it records durable intent and a
+terminal `canceled` history event. It is safe to repeat. Queued items disappear
+immediately; running checks show `cancelling` until their owning worker has
+terminated and reaped the process group.
 
 ### Cleaning up
 

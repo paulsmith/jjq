@@ -25,6 +25,27 @@ pub fn failed_log_path(id: u32) -> Result<PathBuf> {
     crate::paths::failed_log(id)
 }
 
+/// Per-attempt log for a speculative batch check. Concurrent checks must not
+/// share `run.log`, which is deliberately truncated by each check runner.
+pub fn attempt_log(run_token: &str, id: u32) -> Result<PathBuf> {
+    Ok(crate::paths::jjq_dir()?
+        .join("run-logs")
+        .join(run_token)
+        .join(format!("{:06}.log", id)))
+}
+
+/// Make one completed attempt the log shown by the existing `jjq tail`.
+pub fn publish_attempt_log(source: &Path) -> Result<()> {
+    let destination = log_path()?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating run log directory {}", parent.display()))?;
+    }
+    fs::copy(source, &destination)
+        .with_context(|| format!("publishing check log {}", source.display()))?;
+    Ok(())
+}
+
 /// Copy a completed run log into the failed-item archive.
 pub fn archive_failed(id: u32, source: &Path) -> Result<()> {
     let destination = failed_log_path(id)?;

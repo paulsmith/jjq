@@ -6,11 +6,14 @@ NNAAMMEE
 SSYYNNOOPPSSIISS
        jjjjqq iinniitt [----ttrruunnkk _b_o_o_k_m_a_r_k] [----cchheecckk _c_o_m_m_a_n_d] [----ssttrraatteeggyy _s_t_r_a_t_e_g_y]
        jjjjqq ppuusshh _r_e_v_s_e_t
-       jjjjqq rruunn [----aallll] [----ssttoopp--oonn--ffaaiilluurree]
+       jjjjqq rruunn [----aallll] [----ssttoopp--oonn--ffaaiilluurree] [----jjoobbss _N]
        jjjjqq cchheecckk [----rreevv _r_e_v_s_e_t] [--vv]
        jjjjqq ssttaattuuss [_i_d] [----jjssoonn] [----rreessoollvvee _c_h_a_n_g_e___i_d]
+       jjjjqq hhiissttoorryy [_i_d] [----jjssoonn]
+       jjjjqq hhiissttoorryy ----cchhaannggee _c_h_a_n_g_e___i_d [----jjssoonn]
        jjjjqq rreeqquueeuuee _i_d
        jjjjqq ddeelleettee _i_d
+       jjjjqq ccaanncceell _i_d
        jjjjqq cclleeaann
        jjjjqq ddooccttoorr [----ffiixx]
        jjjjqq ccoonnffiigg [_k_e_y [_v_a_l_u_e]]
@@ -68,14 +71,21 @@ CCOOMMMMAANNDDSS
               jjq push feat-xyz@      # queue a workspace's working copy
               jjq push abc123         # queue by change ID
 
-   rruunn [----aallll] [----ssttoopp--oonn--ffaaiilluurree]
+   rruunn [----aallll] [----ssttoopp--oonn--ffaaiilluurree] [----jjoobbss _N]
        Process the next queued item.  Claims the item by renaming its bookmark
        from jjjjqq//qquueeuuee//_N_N_N_N_N_N to jjjjqq//rruunnnniinngg//_N_N_N_N_N_N,, creates a temporary jj
        workspace to test the candidate against trunk, then runs the configured
-       check command inside it.  While claimed, the item shows under "Running"
-       in jjjjqq ssttaattuuss and cannot be deleted or requeued.  A claim left behind
-       by a crashed runner is recovered back to its queue position on the next
-       run.
+       check command inside it.  Success produces an in-memory validation
+       receipt bound to the sequence ID, candidate change and commit IDs,
+       trunk commit, checked workspace commit, strategy, and exact check
+       command.  Immediately before moving trunk, jjq verifies all of those
+       facts still match.  If the receipt is stale (for example, trunk or
+       configuration changed), its unchanged claim returns to the same queue
+       position for a fresh check.  An out-of-band removed or retargeted claim
+       is discarded rather than landed.  While claimed, the item shows under
+       "Running" in jjjjqq ssttaattuuss and cannot be deleted or requeued.  A claim
+       left behind by a crashed runner is recovered back to its queue position
+       on the next run.
 
        On success, the trunk bookmark advances and the temporary workspace is
        cleaned up.  If the landed change is still some workspace's
@@ -87,17 +97,42 @@ CCOOMMMMAANNDDSS
        On failure (conflicts or check command failure), the item moves to the
        failed list.  The temporary workspace is preserved for debugging.
 
-       If the trunk bookmark moves during processing (e.g., another runner
-       advanced it), the run aborts and instructs the user to retry.
+       If the trunk bookmark or check configuration moves during processing
+       (e.g., another runner advanced trunk), the receipt is rejected and the
+       item is requeued for a fresh check.
 
        With ----aallll, processes items in a loop until the queue is empty.
        Failures are recorded and processing continues unless ----ssttoopp--oonn--ffaaiilluurree
        is set. Reports the count of successes and failures.
 
+       ----jjoobbss sets a maximum number of concurrent speculative checks. It
+       defaults to 1 and is valid only with ----aallll.  For merge strategy, jjq
+       checks a bounded FIFO chain of predicted trunk states, but lands only
+       in FIFO order after an exact receipt base matches trunk. A failed or
+       tree-mutating predecessor invalidates later predictions and they are
+       rechecked from the real trunk. Rebase and ----ssttoopp--oonn--ffaaiilluurree currently
+       run serially: rebase's disposable duplicate cannot safely supply an
+       exact commit-bound predicted base for the original candidate.
+
        Returns 0 if all processed items succeeded (or the queue was empty).
        Returns 2 if any items failed. Returns 1 if another queue runner is
        active, the check command is not configured, a conflict is detected, or
        trunk moved during processing.
+
+   ccaanncceell _i_d
+       Cancel a queued or running submission. Queued work is removed
+       immediately.  For a running item, jjq durably records intent and the
+       owning runner terminates the check's process group with TERM,
+       escalating to KILL after one second.  Cancellation is idempotent and is
+       not a failure: it does not produce PPAARRTTIIAALL or trigger
+       ----ssttoopp--oonn--ffaaiilluurree.
+
+       Cancellation is not rollback. The runner serializes accepted intent
+       with all terminal outcomes. If the final trunk compare-and-swap already
+       won, landing wins and a later cancel reports that the item is no longer
+       cancellable.  Accepted intent survives a runner crash and recovery
+       completes the canceled history event and cleanup without requeuing or
+       rerunning the item.
 
    cchheecckk [----rreevv _r_e_v_s_e_t] [--vv]
        Run the configured check command against a revision in a temporary
@@ -123,15 +158,36 @@ CCOOMMMMAANNDDSS
        has claimed under "Running".
 
        With ----jjssoonn, outputs structured JSON with a rruunnnneerr__aaccttiivvee boolean plus
-       rruunnnniinngg, qquueeuuee, ffaaiilleedd, and llaannddeedd arrays.  Queue items include
-       cchhaannggee__iidd, ccoommmmiitt__iidd, and ddeessccrriippttiioonn.  Failed items include
-       ccaannddiiddaattee__cchhaannggee__iidd, ccaannddiiddaattee__ccoommmmiitt__iidd, ddeessccrriippttiioonn (original
-       candidate message), ttrruunnkk__ccoommmmiitt__iidd, wwoorrkkssppaaccee__ppaatthh, and
-       ffaaiilluurree__rreeaassoonn.
+       rruunnnniinngg, qquueeuuee, ffaaiilleedd, and llaannddeedd arrays.  During any active queued
+       check it additionally includes compatible aaccttiivvee__cchheecckkss records with
+       the item ID, predicted base, run token, child PID, process start
+       identity, workspace/log paths, elapsed milliseconds, whether it is
+       speculative, and a cchheecckkiinngg or ccaanncceelllliinngg phase. A background check
+       waits behind a token-specific start gate until its PID record is
+       published; if the parent dies first, it exits without running the
+       configured command. If a scheduler crashes while one of those children
+       remains alive, new runs and cclleeaann refuse until it exits. The next run
+       then removes the dead attempt state and recovers the claims for fresh
+       checks.  Queue items include cchhaannggee__iidd, ccoommmmiitt__iidd, and ddeessccrriippttiioonn.
+       Failed items include ccaannddiiddaattee__cchhaannggee__iidd, ccaannddiiddaattee__ccoommmmiitt__iidd,
+       ddeessccrriippttiioonn (original candidate message), ttrruunnkk__ccoommmmiitt__iidd,
+       wwoorrkkssppaaccee__ppaatthh, and ffaaiilluurree__rreeaassoonn.
 
        With a positional _i_d, displays a single item's detail view (from either
        queue or failed).  With ----rreessoollvvee, looks up an item by its candidate
        change ID.  _i_d and ----rreessoollvvee are mutually exclusive.
+
+   hhiissttoorryy [[iidd]] [[----jjssoonn]] || ----cchhaannggee cchhaannggee__iidd [[----jjssoonn]]
+       Display the durable lifecycle history for a queue submission. Exactly
+       one sequence ID or ----cchhaannggee selector is required. Change-ID lookup
+       returns every matching submission, preserving separate retries and
+       sequence IDs.
+
+       The text view is chronological. With ----jjssoonn ,, outputs a versioned JSON
+       envelope with each submission's immutable lifecycle events, including
+       available candidate, trunk, result, failure, and timing facts. History
+       remains available after the corresponding queue or failed bookmark is
+       deleted.
 
    rreeqquueeuuee _i_d
        Re-push a failed item back onto the queue under a new sequence ID.

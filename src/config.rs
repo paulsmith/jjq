@@ -90,6 +90,15 @@ impl Snapshot {
         }
     }
 
+    /// List files under a path in this exact metadata generation.
+    pub fn files(&self, path: &str) -> Result<Vec<String>> {
+        match jj::file_list(path, &self.commit_id) {
+            Ok(paths) => Ok(paths),
+            Err(e) if e.to_string().contains("No such path") => Ok(vec![]),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Read a config key from the pinned metadata commit.
     pub fn get(&self, key: &str) -> Result<Option<String>> {
         Ok(self

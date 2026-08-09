@@ -18,6 +18,8 @@ jjq \- local merge queue for jj
 .B jjq run
 .RB [ \-\-all ]
 .RB [ \-\-stop-on-failure ]
+.RB [ \-\-jobs
+.IR N ]
 .br
 .B jjq check
 .RB [ \-\-rev
@@ -30,10 +32,22 @@ jjq \- local merge queue for jj
 .RB [ \-\-resolve
 .IR change_id ]
 .br
+.B jjq history
+.RI [ id ]
+.RB [ \-\-json ]
+.br
+.B jjq history
+.B \-\-change
+.I change_id
+.RB [ \-\-json ]
+.br
 .B jjq requeue
 .I id
 .br
 .B jjq delete
+.I id
+.br
+.B jjq cancel
 .I id
 .br
 .B jjq clean
@@ -125,7 +139,7 @@ jjq push feat\-xyz@      # queue a workspace's working copy
 jjq push abc123         # queue by change ID
 .fi
 .RE
-.SS run \fR[\fB\-\-all\fR] [\fB\-\-stop-on-failure\fR]
+.SS run \fR[\fB\-\-all\fR] [\fB\-\-stop-on-failure\fR] [\fB\-\-jobs \fIN\fR]
 Process the next queued item.
 Claims the item by renaming its bookmark from
 .BI jjq/queue/ NNNNNN
@@ -133,6 +147,13 @@ to
 .BI jjq/running/ NNNNNN ,
 creates a temporary jj workspace to test the candidate against trunk,
 then runs the configured check command inside it.
+Success produces an in-memory validation receipt bound to the sequence ID,
+candidate change and commit IDs, trunk commit, checked workspace commit,
+strategy, and exact check command.
+Immediately before moving trunk, jjq verifies all of those facts still match.
+If the receipt is stale (for example, trunk or configuration changed), its
+unchanged claim returns to the same queue position for a fresh check.
+An out-of-band removed or retargeted claim is discarded rather than landed.
 While claimed, the item shows under \(lqRunning\(rq in
 .B jjq status
 and cannot be deleted or requeued.
@@ -153,8 +174,9 @@ On failure (conflicts or check command failure), the item moves to the
 failed list.
 The temporary workspace is preserved for debugging.
 .PP
-If the trunk bookmark moves during processing (e.g., another runner
-advanced it), the run aborts and instructs the user to retry.
+If the trunk bookmark or check configuration moves during processing (e.g.,
+another runner advanced trunk), the receipt is rejected and the item is
+requeued for a fresh check.
 .PP
 With
 .BR \-\-all ,
@@ -163,10 +185,36 @@ processing continues unless
 .B \-\-stop-on-failure
 is set. Reports the count of successes and failures.
 .PP
+.B \-\-jobs
+sets a maximum number of concurrent speculative checks. It defaults to 1 and
+is valid only with
+.BR \-\-all .
+For merge strategy, jjq checks a bounded FIFO chain of
+predicted trunk states, but lands only in FIFO order after an exact receipt
+base matches trunk. A failed or tree-mutating predecessor invalidates later
+predictions and they are rechecked from the real trunk. Rebase and
+.B \-\-stop-on-failure
+currently run serially: rebase's disposable duplicate cannot safely supply an
+exact commit-bound predicted base for the original candidate.
+.PP
 Returns 0 if all processed items succeeded (or the queue was empty). Returns 2
 if any items failed. Returns 1 if another queue runner is active, the check
 command is not configured, a conflict is detected, or trunk moved during
 processing.
+.SS cancel \fIid\fR
+Cancel a queued or running submission. Queued work is removed immediately.
+For a running item, jjq durably records intent and the owning runner terminates
+the check's process group with TERM, escalating to KILL after one second.
+Cancellation is idempotent and is not a failure: it does not produce
+.B PARTIAL
+or trigger
+.BR \-\-stop-on-failure .
+.PP
+Cancellation is not rollback. The runner serializes accepted intent with all
+terminal outcomes. If the final trunk compare-and-swap already won, landing
+wins and a later cancel reports that the item is no longer cancellable.
+Accepted intent survives a runner crash and recovery completes the canceled
+history event and cleanup without requeuing or rerunning the item.
 .SS check \fR[\fB\-\-rev \fIrevset\fR] [\fB\-v\fR]
 Run the configured check command against a revision in a temporary
 workspace without any queue processing.
@@ -204,8 +252,24 @@ boolean plus
 .BR queue ,
 .BR failed ,
 and
-.B landed
+.BR landed
 arrays.
+During any active queued check it additionally includes compatible
+.B active_checks
+records with the item ID, predicted base, run token, child PID, process
+start identity, workspace/log paths, elapsed milliseconds, whether it is
+speculative, and a
+.B checking
+or
+.B cancelling
+phase. A background check waits behind a
+token-specific start gate until its PID record is published; if the parent
+dies first, it exits without running the configured command. If a scheduler
+crashes while one of those children remains
+alive, new runs and
+.B clean
+refuse until it exits. The next run then removes the dead attempt state and
+recovers the claims for fresh checks.
 Queue items include
 .BR change_id ,
 .BR commit_id ,
@@ -231,6 +295,19 @@ looks up an item by its candidate change ID.
 and
 .B \-\-resolve
 are mutually exclusive.
+.SS history [id] [--json] | --change change_id [--json]
+Display the durable lifecycle history for a queue submission. Exactly one
+sequence ID or
+.B \-\-change
+selector is required. Change-ID lookup returns every matching submission,
+preserving separate retries and sequence IDs.
+.PP
+The text view is chronological. With
+.B \-\-json ,
+outputs a versioned JSON envelope with each submission's immutable lifecycle
+events, including available candidate, trunk, result, failure, and timing
+facts. History remains available after the corresponding queue or failed
+bookmark is deleted.
 .SS requeue \fIid\fR
 Re\-push a failed item back onto the queue under a new sequence ID.
 Runs the same pre\-flight conflict check and working\-copy handling as

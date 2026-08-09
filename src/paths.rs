@@ -26,3 +26,13 @@ pub fn failed_log(id: u32) -> Result<PathBuf> {
         .join("failed-logs")
         .join(format!("{:06}.log", id)))
 }
+
+/// Directory containing ephemeral, atomically-published active check state.
+pub fn active_checks_dir() -> Result<PathBuf> {
+    Ok(jjq_dir()?.join("active-checks"))
+}
+
+/// Durable cooperative cancellation intents, keyed by never-reused queue ID.
+pub fn cancellations_dir() -> Result<PathBuf> {
+    Ok(jjq_dir()?.join("cancellations"))
+}

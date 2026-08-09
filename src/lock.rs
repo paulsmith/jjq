@@ -15,6 +15,16 @@ pub struct Lock {
 }
 
 impl Lock {
+    /// Acquire a named exclusive lock, waiting until its owner releases it.
+    /// The operating system releases flock locks if the owning process exits.
+    pub fn acquire_blocking(name: &str) -> Result<Lock> {
+        let path = lock_file_path(name)?;
+        fs::create_dir_all(path.parent().unwrap())?;
+        let file = File::create(&path)?;
+        FileExt::lock_exclusive(&file)?;
+        Ok(Lock { _file: file })
+    }
+
     /// Try to acquire a named lock. Returns Ok(Some) if acquired, Ok(None) if
     /// already held by another process.
     pub fn acquire(name: &str) -> Result<Option<Lock>> {

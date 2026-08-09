@@ -479,6 +479,18 @@ pub fn file_show(path: &str, rev: &str) -> Result<String> {
     run_ok(&["file", "show", path, "-r", rev])
 }
 
+/// List paths below `path` in a revision. This is deliberately narrow so
+/// metadata readers do not need to infer filesystem state from commit text.
+pub fn file_list(path: &str, rev: &str) -> Result<Vec<String>> {
+    let output = run_ok(&["file", "list", "-r", rev, path])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
 /// Create a workspace.
 pub fn workspace_add(path: &str, name: &str, parents: &[&str]) -> Result<()> {
     let mut args = vec!["workspace", "add"];
@@ -510,4 +522,3 @@ pub fn workspace_forget(name: &str) -> Result<()> {
 pub fn workspace_list() -> Result<String> {
     run_ok(&["workspace", "list"])
 }
-
