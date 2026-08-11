@@ -3,8 +3,19 @@ set -euo pipefail
 
 repo_dir="$(cd -P "$(dirname "$0")/.." >/dev/null && pwd -P)"
 ram_device=""
+managed_shm_dir=""
 
 cleanup() {
+  if [[ -n "$managed_shm_dir" ]]; then
+    local shm_dir="$managed_shm_dir"
+    managed_shm_dir=""
+    if [[ "$shm_dir" =~ ^/dev/shm/jjq-e2e\.[[:alnum:]]{6}$ ]]; then
+      rm -rf -- "$shm_dir" ||
+        echo "warning: failed to remove shared-memory test directory: $shm_dir" >&2
+    else
+      echo "warning: refusing to remove unexpected shared-memory path: $shm_dir" >&2
+    fi
+  fi
   if [[ -n "$ram_device" ]]; then
     local device="$ram_device"
     ram_device=""
@@ -15,18 +26,36 @@ trap cleanup EXIT
 
 if [[ -n "${JJQ_E2E_TMPDIR:-}" ]]; then
   test_tmpdir="$JJQ_E2E_TMPDIR"
-elif [[ "$(uname -s)" == "Darwin" ]]; then
-  ram_device="$(hdiutil attach -nomount ram://2097152 | awk 'NR == 1 { print $1 }')"
-  if [[ ! "$ram_device" =~ ^/dev/disk[0-9]+$ ]]; then
-    echo "unexpected RAM-disk device: $ram_device" >&2
-    exit 1
-  fi
-  volume_name="JJQTests-$$"
-  diskutil erasevolume HFS+ "$volume_name" "$ram_device" >/dev/null
-  test_tmpdir="/Volumes/$volume_name"
 else
-  echo "JJQ_E2E_TMPDIR is required outside macOS" >&2
-  exit 1
+  case "$(uname -s)" in
+    Darwin)
+      ram_device="$(hdiutil attach -nomount ram://2097152 | awk 'NR == 1 { print $1 }')"
+      if [[ ! "$ram_device" =~ ^/dev/disk[0-9]+$ ]]; then
+        echo "unexpected RAM-disk device: $ram_device" >&2
+        exit 1
+      fi
+      volume_name="JJQTests-$$"
+      diskutil erasevolume HFS+ "$volume_name" "$ram_device" >/dev/null
+      test_tmpdir="/Volumes/$volume_name"
+      ;;
+    Linux)
+      if [[ ! -d /dev/shm || ! -w /dev/shm || ! -x /dev/shm ]]; then
+        echo "/dev/shm is not an accessible shared-memory directory" >&2
+        exit 1
+      fi
+      shm_type="$(stat -f -c %T /dev/shm 2>/dev/null || true)"
+      if [[ "$shm_type" != "tmpfs" ]]; then
+        echo "/dev/shm is not backed by tmpfs (found: ${shm_type:-unknown})" >&2
+        exit 1
+      fi
+      managed_shm_dir="$(mktemp -d /dev/shm/jjq-e2e.XXXXXX)"
+      test_tmpdir="$managed_shm_dir"
+      ;;
+    *)
+      echo "JJQ_E2E_TMPDIR is required outside macOS and Linux" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 if [[ ! -d "$test_tmpdir" || ! -w "$test_tmpdir" ]]; then

@@ -104,14 +104,15 @@ Relative to the 259.24s baseline, product/test-harness changes reduced the
 ordinary-disk run substantially. Moving only temporary test repositories and
 jjq workspaces to the RAM-backed `TMPDIR` produced the stable sub-minute path,
 for an overall reduction of 225.12s (86.8%) from baseline to the latest
-34.12s median. The
-project volume was 96% full with 17 GiB free during these measurements, which
-made its many-small-file workload particularly expensive.
+34.12s median. The project volume was 96% full with 17 GiB free during these
+measurements, which made its many-small-file workload particularly expensive.
 
-Run `scripts/test-e2e-fast` on macOS to create a disposable 1 GiB RAM disk,
-run the complete suite, and detach the disk on exit. Set `JJQ_E2E_TMPDIR` to
-reuse another writable temporary volume. This changes only the I/O location;
-it does not filter tests, change assertions, or alter libtest concurrency.
+Run `scripts/test-e2e-fast` on macOS to create a disposable 1 GiB RAM disk, or
+on Linux to create a private directory on the `/dev/shm` tmpfs. The runner
+executes the complete suite and removes the platform-specific environment on
+exit. Set `JJQ_E2E_TMPDIR` to reuse another writable temporary volume. This
+changes only the I/O location; it does not filter tests, change assertions, or
+alter libtest concurrency.
 
 ## Command-level `jj` profile
 
@@ -324,6 +325,9 @@ default concurrency, assertions, and test selection are identical. All three
 samples passed 129 tests with zero failures and the same one manual stress test
 ignored. `scripts/test-e2e-fast` creates and validates an exact RAM-disk device,
 mounts a process-unique volume, and detaches that device through an exit trap.
+On Linux, the same script verifies that `/dev/shm` is an accessible tmpfs,
+creates a mode-private `jjq-e2e.XXXXXX` directory with `mktemp`, and removes
+only that validated generated path through the same exit trap.
 
 ## Semantic compression follow-up
 
