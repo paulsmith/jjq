@@ -806,70 +806,58 @@ pub fn push(revset: &str) -> Result<()> {
         .into());
     }
 
-    // Read every queue-state namespace and target in one jj operation. Strict
-    // name parsing ignores unrelated and co-located bookmarks.
-    let state = queue::state_snapshot()?;
-
-    // Idempotent push: clean up existing queue/failed entries for this change.
-    for entry in state.queued()? {
-        let bookmark = queue::queue_bookmark(entry.id);
-        if entry.commit_id == commit_id {
-            preferr(&format!("revision already queued at {}", entry.id));
-            return Err(ExitError::new(exit_codes::USAGE, "revision already queued").into());
-        }
-        if entry.change_id == change_id {
-            jj::bookmark_delete(&bookmark)?;
-            let mut event = Event::new(entry.id, kind::REPLACED);
-            event.candidate_change_id = Some(entry.change_id);
-            event.candidate_commit_id = Some(entry.commit_id);
-            record_history(event)?;
-            prefout(&format!("replacing queued entry {}", entry.id));
+    // An exact duplicate push must report the documented USAGE error, not a
+    // conflict: if trunk has advanced incompatibly since the identical
+    // commit was queued, the pre-flight merge below would fail first and
+    // return CONFLICT instead of "already queued". Check the queue namespace
+    // for the exact commit before the merge; replacement transitions still
+    // happen after the conflict check so a conflicting re-push cannot clear
+    // a prior entry.
+    {
+        let state = queue::state_snapshot()?;
+        for entry in state.queued()? {
+            if entry.commit_id == commit_id {
+                preferr(&format!("revision already queued at {}", entry.id));
+                return Err(ExitError::new(exit_codes::USAGE, "revision already queued").into());
+            }
         }
     }
 
-    // Running claims: an item claimed by an active runner must not be
-    // replaced or cleared out from under it. Holding the run lock across the
-    // mutation (not just probing it) keeps a starting runner from re-claiming
-    // the entry mid-replacement; with the lock unavailable the runner is live
-    // and the push is refused.
-    for entry in state.running()? {
-        let bookmark = queue::running_bookmark(entry.id);
-        if entry.change_id == change_id || entry.commit_id == commit_id {
-            let Some(_run_lock) = Lock::acquire("run")? else {
-                return Err(ExitError::new(
-                    exit_codes::USAGE,
-                    format!("revision is currently being processed (item {})", entry.id),
-                )
-                .into());
-            };
-            jj::bookmark_delete(&bookmark)?;
-            let mut event = Event::new(entry.id, kind::REPLACED);
-            event.candidate_change_id = Some(entry.change_id);
-            event.candidate_commit_id = Some(entry.commit_id);
-            record_history(event)?;
-            prefout(&format!("replacing interrupted entry {}", entry.id));
-            cleanup_run_workspace(entry.id);
+    // A live runner's claim must refuse the push with the documented USAGE
+    // error, not a conflict: if trunk has advanced incompatibly since the
+    // runner claimed this change, the pre-flight merge below would fail
+    // first and return CONFLICT. Only the refusal is ordered here; the
+    // claim's actual replacement still happens after the conflict check so
+    // a conflicting re-push cannot clear a prior entry. A runner holding
+    // the run lock is processing this exact claim right now, so refusing
+    // needs no lock (the runner cannot finish the claim and delete the
+    // bookmark without observing the same conflict at landing).
+    {
+        let state = queue::state_snapshot()?;
+        for entry in state.running()? {
+            if entry.change_id == change_id || entry.commit_id == commit_id {
+                if lock::is_held("run")? {
+                    return Err(ExitError::new(
+                        exit_codes::USAGE,
+                        format!(
+                            "revision is currently being processed (item {})",
+                            entry.id
+                        ),
+                    )
+                    .into());
+                }
+            }
         }
     }
 
-    // Failed entries: match on the jjq-candidate trailer.
-    for entry in state.failed()? {
-        let trailers = extract_trailers(&entry.description);
-        if let Some(candidate_change_id) = trailers.get("candidate")
-            && *candidate_change_id == change_id
-        {
-            let mut event = Event::new(entry.id, kind::REPLACED);
-            event.candidate_change_id = Some(candidate_change_id.clone());
-            event.candidate_commit_id = trailers.get("candidate-commit").cloned();
-            remove_failed_entry(entry.id)?;
-            record_history(event)?;
-            prefout(&format!("clearing failed entry {}", entry.id));
-        }
-    }
-
-    // Pre-flight conflict check using headless merge commit.
-    // Ensure the temporary commit is always abandoned, even if has_conflicts errors.
-    let conflict_check_id = jj::new_rev(&[&trunk_bookmark, revset])?;
+    // Pre-flight conflict check using headless merge commit, before any
+    // prior queue/failed entry for this change is cleared: a re-push that
+    // now conflicts must not silently remove the previously queued or
+    // failed entry.
+    // Test the pinned commit, not the revset: a concurrent rewrite (or a
+    // snapshot amending @) would otherwise test a different revision than
+    // the one queued below. The temporary commit is always abandoned.
+    let conflict_check_id = jj::new_rev(&[&trunk_bookmark, &commit_id])?;
     let has_conflicts = match jj::has_conflicts(&conflict_check_id) {
         Ok(v) => {
             jj::abandon(&conflict_check_id)?;
@@ -893,6 +881,115 @@ pub fn push(revset: &str) -> Result<()> {
         return Err(ExitError::new(exit_codes::CONFLICT, "revision conflicts with trunk").into());
     }
 
+
+    // Replacement transitions serialize with the runner's claim window on
+    // publication.lock (the same lock the claim takes), so a runner cannot
+    // claim an entry between the snapshot below and its deletion, and
+    // history cannot observe a cleared entry without its replaced event.
+    // The run lock is only ever taken before publication, so the running
+    // loop below re-acquires publication per entry.
+    let publication_lock = Lock::acquire_blocking("publication")?;
+    let state = queue::state_snapshot()?;
+
+    // A matching running claim needs the run lock across the whole
+    // replacement, not just the claim's own deletion: without it, a runner
+    // that starts after the queued entry is deleted (publication released)
+    // can recover the claim back to the queue and re-claim the superseded
+    // commit while push has already recorded its replaced event. Taking
+    // run first also preserves the lock order run → publication — a
+    // starting runner holds run and waits on publication, never the
+    // reverse, so this cannot deadlock. With run unavailable the runner is
+    // live and processing the claim; refuse as before.
+    let matching_running: Vec<_> = state
+        .running()?
+        .into_iter()
+        .filter(|entry| entry.change_id == change_id || entry.commit_id == commit_id)
+        .collect();
+    let mut run_lock = None;
+    if !matching_running.is_empty() {
+        run_lock = Some(Lock::acquire("run")?.ok_or_else(|| {
+            let id = matching_running[0].id;
+            ExitError::new(
+                exit_codes::USAGE,
+                format!("revision is currently being processed (item {})", id),
+            )
+        })?);
+    }
+
+    // Idempotent push: clean up existing queue/failed entries for this change.
+    for entry in state.queued()? {
+        let bookmark = queue::queue_bookmark(entry.id);
+        if entry.commit_id == commit_id {
+            preferr(&format!("revision already queued at {}", entry.id));
+            return Err(ExitError::new(exit_codes::USAGE, "revision already queued").into());
+        }
+        if entry.change_id == change_id {
+            // The snapshot was taken before publication was acquired: a
+            // runner may have claimed this item in between, so re-check.
+            if !queue::queue_item_exists(entry.id)? {
+                drop(publication_lock);
+                return Err(ExitError::new(
+                    exit_codes::USAGE,
+                    format!("revision is currently being processed (item {})", entry.id),
+                )
+                .into());
+            }
+            jj::bookmark_delete(&bookmark)?;
+            let mut event = Event::new(entry.id, kind::REPLACED);
+            event.candidate_change_id = Some(entry.change_id);
+            event.candidate_commit_id = Some(entry.commit_id);
+            record_history(event)?;
+            prefout(&format!("replacing queued entry {}", entry.id));
+        }
+    }
+
+    // Failed entries: match on the jjq-candidate trailer.
+    for entry in state.failed()? {
+        let trailers = extract_trailers(&entry.description);
+        if let Some(candidate_change_id) = trailers.get("candidate")
+            && *candidate_change_id == change_id
+        {
+            let mut event = Event::new(entry.id, kind::REPLACED);
+            event.candidate_change_id = Some(candidate_change_id.clone());
+            event.candidate_commit_id = trailers.get("candidate-commit").cloned();
+            remove_failed_entry(entry.id)?;
+            record_history(event)?;
+            prefout(&format!("clearing failed entry {}", entry.id));
+        }
+    }
+
+    // Running claims. We hold both the run lock (acquired above, so no
+    // runner is live) and publication. Re-read each entry's state: a
+    // runner may have recovered the claim back to the queue before we got
+    // here (replacing it then follows the queue semantics).
+    for entry in matching_running {
+        let bookmark = queue::running_bookmark(entry.id);
+        if !queue::running_item_exists(entry.id)? {
+            // The claim was recovered to the queue (or already resolved
+            // by another mutation) after the snapshot. Replace the
+            // recovered queue entry here under both locks.
+            if queue::queue_item_exists(entry.id)? {
+                jj::bookmark_delete(&queue::queue_bookmark(entry.id))?;
+                let mut event = Event::new(entry.id, kind::REPLACED);
+                event.candidate_change_id = Some(entry.change_id);
+                event.candidate_commit_id = Some(entry.commit_id);
+                record_history(event)?;
+                prefout(&format!("replacing recovered entry {}", entry.id));
+            }
+            cleanup_run_workspace(entry.id);
+            continue;
+        }
+        jj::bookmark_delete(&bookmark)?;
+        let mut event = Event::new(entry.id, kind::REPLACED);
+        event.candidate_change_id = Some(entry.change_id);
+        event.candidate_commit_id = Some(entry.commit_id);
+        record_history(event)?;
+        prefout(&format!("replacing interrupted entry {}", entry.id));
+        cleanup_run_workspace(entry.id);
+    }
+    drop(run_lock);
+    drop(publication_lock);
+
     // Publication couples the authoritative queue bookmark to its first
     // durable event. A runner holds the same lock while claiming, so history
     // cannot observe a newly claimed submission without its queued event.
@@ -902,7 +999,7 @@ pub fn push(revset: &str) -> Result<()> {
 
     jj::bookmark_create_internal(&bookmark, &commit_id)?;
     let mut event = Event::new(id, kind::QUEUED);
-    event.candidate_change_id = Some(change_id);
+    event.candidate_change_id = Some(change_id.clone());
     event.candidate_commit_id = Some(commit_id.clone());
     event.trunk_commit_id = Some(jj::get_commit_id(&format!(
         "bookmarks(exact:{})",
@@ -920,7 +1017,7 @@ pub fn push(revset: &str) -> Result<()> {
         repo_path.display()
     ));
 
-    move_working_copy_off_queued(&commit_id)?;
+    move_working_copy_off_queued(&change_id)?;
 
     // Show one-time hint about configuring jj log
     config::maybe_show_log_hint()?;
@@ -1039,9 +1136,16 @@ pub fn history(id: Option<&str>, change: Option<&str>, json: bool) -> Result<()>
 /// fresh child (exactly what `jj commit` does) keeps the queued commit as
 /// pushed. Only the invoking workspace can be moved: jj manipulates the
 /// working copy of the workspace a command runs in, and no other.
-fn move_working_copy_off_queued(queued_commit_id: &str) -> Result<()> {
-    let (_, wc_commit_id) = jj::resolve_revset_full("@")?;
-    if wc_commit_id == queued_commit_id {
+/// Park the invoking workspace's working copy on a new empty child when it
+/// still sits on the just-queued commit. Compare change IDs, not commit IDs:
+/// jj rewrites the working-copy commit (and follows the queue bookmark) on
+/// every snapshot, so any file change between the initial revset resolution
+/// and this check makes the commit IDs diverge while the change stays the
+/// same. A commit-ID comparison would then skip the move-off and later
+/// landing would absorb the workspace's pending edits into trunk.
+fn move_working_copy_off_queued(queued_change_id: &str) -> Result<()> {
+    let (wc_change_id, _) = jj::resolve_revset_full("@")?;
+    if wc_change_id == queued_change_id {
         jj::new_working_copy()?;
         prefout("working copy moved to a new change; the queued commit stays as pushed");
     }
@@ -3130,14 +3234,19 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
 }
 
 fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()> {
-    let (is_queued, entry) = if let Some(id_str) = id {
+    // Running is a reportable state like queued/failed: the USAGE(10) exit is
+    // reserved for IDs that exist in no namespace.
+    enum ItemState {
+        Queued,
+        Failed,
+        Running,
+    }
+    let (state, entry) = if let Some(id_str) = id {
         let id = queue::parse_seq_id(id_str)?;
         match queue::state_snapshot()?.state_for(id)? {
-            Some((queue::State::Queued, entry)) => (true, entry),
-            Some((queue::State::Failed, entry)) => (false, entry),
-            Some((queue::State::Running, _)) => {
-                bail!("item {} is currently being processed (run in progress)", id)
-            }
+            Some((queue::State::Queued, entry)) => (ItemState::Queued, entry),
+            Some((queue::State::Failed, entry)) => (ItemState::Failed, entry),
+            Some((queue::State::Running, entry)) => (ItemState::Running, entry),
             None => {
                 return Err(ExitError::new(
                     exit_codes::USAGE,
@@ -3147,17 +3256,45 @@ fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<
             }
         }
     } else if let Some(change_id) = resolve {
-        find_by_change_id(change_id)?
+        let (found_state, entry) = find_by_change_id(change_id)?;
+        match found_state {
+            queue::State::Queued => (ItemState::Queued, entry),
+            queue::State::Running => (ItemState::Running, entry),
+            queue::State::Failed => (ItemState::Failed, entry),
+        }
     } else {
         unreachable!()
     };
 
-    if is_queued {
+    if !matches!(state, ItemState::Failed) {
         let item = build_item_from_state(entry);
         if json {
-            println!("{}", serde_json::to_string_pretty(&item)?);
+            // The queue and running namespaces share this item shape; an
+            // explicit state field lets machine consumers tell them apart.
+            #[derive(Serialize)]
+            struct SingleItemStatus<'a> {
+                #[serde(flatten)]
+                item: &'a QueueItem,
+                state: &'a str,
+            }
+            let state_name = match state {
+                ItemState::Queued => "queued",
+                ItemState::Running => "running",
+                ItemState::Failed => unreachable!("failed handled below"),
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&SingleItemStatus {
+                    item: &item,
+                    state: state_name,
+                })?
+            );
         } else {
-            println!("Queue item {}", item.id);
+            if matches!(state, ItemState::Running) {
+                println!("Queue item {} (running)", item.id);
+            } else {
+                println!("Queue item {}", item.id);
+            }
             println!("  Change ID:   {}", item.change_id);
             println!("  Commit ID:   {}", item.commit_id);
             println!("  Description: {}", item.description);
@@ -3199,20 +3336,32 @@ fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<
     Ok(())
 }
 
-/// Find a queue or failed item by candidate change ID.
-/// Returns (sequence_id, is_queued).
-fn find_by_change_id(change_id: &str) -> Result<(bool, queue::StateEntry)> {
+/// Find a queue, running, or failed item by candidate change ID.
+/// Returns the concrete queue state so callers report claims accurately.
+fn find_by_change_id(change_id: &str) -> Result<(queue::State, queue::StateEntry)> {
     let state = queue::state_snapshot()?;
     for entry in state.queued()? {
         if entry.change_id == change_id {
-            return Ok((true, entry));
+            return Ok((queue::State::Queued, entry));
         }
     }
 
+    // Match state_for's precedence (queued → failed → running): a crash
+    // during failure publication can leave both failed and running
+    // bookmarks, and reporting failed keeps --resolve consistent with
+    // status <id>.
     for entry in state.failed()? {
         let trailers = extract_trailers(&entry.description);
         if trailers.get("candidate").map(|s| s.as_str()) == Some(change_id) {
-            return Ok((false, entry));
+            return Ok((queue::State::Failed, entry));
+        }
+    }
+
+    // A running claim keeps the same candidate change ID as its queued
+    // predecessor; report it instead of pretending the item does not exist.
+    for entry in state.running()? {
+        if entry.change_id == change_id {
+            return Ok((queue::State::Running, entry));
         }
     }
 
@@ -3222,10 +3371,10 @@ fn find_by_change_id(change_id: &str) -> Result<(bool, queue::StateEntry)> {
 /// Find a queued submission for a stable change ID. This is used to finish a
 /// requeue which was interrupted after creating its new bookmark but before
 /// the old failed bookmark could be removed.
-fn queued_submission_for_change(change_id: &str) -> Result<Option<(u32, String)>> {
+fn queued_submission_for_change(change_id: &str) -> Result<Option<(u32, String, String)>> {
     for entry in queue::state_snapshot()?.queued()? {
         if entry.change_id == change_id {
-            return Ok(Some((entry.id, entry.commit_id)));
+            return Ok(Some((entry.id, entry.change_id, entry.commit_id)));
         }
     }
     Ok(None)
@@ -3241,32 +3390,37 @@ fn finish_requeue(
     candidate_commit_id: &str,
     trunk_commit_id: &str,
 ) -> Result<()> {
-    let padded = queue::format_seq_id(old_id);
-    let run_name = format!("jjq-run-{}", padded);
-    let workspace_path = lookup_workspace_path(old_id);
+    // Record the linked audit events before the failed bookmark disappears
+    // (create-before-delete): a crash then leaves both bookmarks, and a
+    // retried requeue reaches the queued-submission branch and completes the
+    // removal idempotently. The old order - remove, then record - lost the
+    // requeued/queued events on a crash in between, and a retry stopped at
+    // "item is already queued" without ever completing recovery.
+    let already_recorded = history::read(old_id)?.iter().any(|event| {
+        event.kind == kind::REQUEUED && event.related_sequence_id == Some(new_id)
+    });
+    if !already_recorded {
+        let mut requeued = Event::new(old_id, kind::REQUEUED);
+        requeued.candidate_change_id = Some(candidate_change_id.to_string());
+        requeued.candidate_commit_id = Some(candidate_commit_id.to_string());
+        requeued.trunk_commit_id = Some(trunk_commit_id.to_string());
+        requeued.related_sequence_id = Some(new_id);
 
+        let mut queued = Event::new(new_id, kind::QUEUED);
+        queued.candidate_change_id = Some(candidate_change_id.to_string());
+        queued.candidate_commit_id = Some(candidate_commit_id.to_string());
+        queued.trunk_commit_id = Some(trunk_commit_id.to_string());
+        queued.related_sequence_id = Some(old_id);
+        history::record_many(&[requeued, queued])?;
+    }
     remove_failed_entry(old_id)?;
 
-    let mut requeued = Event::new(old_id, kind::REQUEUED);
-    requeued.candidate_change_id = Some(candidate_change_id.to_string());
-    requeued.candidate_commit_id = Some(candidate_commit_id.to_string());
-    requeued.trunk_commit_id = Some(trunk_commit_id.to_string());
-    requeued.related_sequence_id = Some(new_id);
-
-    let mut queued = Event::new(new_id, kind::QUEUED);
-    queued.candidate_change_id = Some(candidate_change_id.to_string());
-    queued.candidate_commit_id = Some(candidate_commit_id.to_string());
-    queued.trunk_commit_id = Some(trunk_commit_id.to_string());
-    queued.related_sequence_id = Some(old_id);
-    history::record_many(&[requeued, queued])?;
-
-    let _ = jj::workspace_forget(&run_name);
-    if let Some(path) = workspace_path {
-        let path = std::path::Path::new(&path);
-        if path.is_dir() {
-            let _ = std::fs::remove_dir_all(path);
-        }
-    }
+    // Forget the run workspace by its registered name. Runner workspaces are
+    // named jjq-run-NNNNNN-<run_token>; the legacy bare-ID guess never
+    // matched and left a stale registration pointing at the deleted
+    // directory. cleanup_run_workspace resolves the name from metadata and
+    // keeps a surviving check child's directory.
+    cleanup_run_workspace(old_id);
     Ok(())
 }
 
@@ -3348,7 +3502,9 @@ pub fn requeue(id_str: &str) -> Result<()> {
     // Reuse that already allocated queue ID rather than minting a duplicate,
     // then record both linked events only after the old failed state is gone.
     let publication_lock = Lock::acquire_blocking("publication")?;
-    if let Some((new_id, queued_commit_id)) = queued_submission_for_change(candidate_change_id)? {
+    if let Some((new_id, queued_change_id, queued_commit_id)) =
+        queued_submission_for_change(candidate_change_id)?
+    {
         finish_requeue(
             id,
             new_id,
@@ -3365,7 +3521,7 @@ pub fn requeue(id_str: &str) -> Result<()> {
             trunk_bookmark,
             repo_path.display()
         ));
-        move_working_copy_off_queued(&queued_commit_id)?;
+        move_working_copy_off_queued(&queued_change_id)?;
         return Ok(());
     }
     drop(publication_lock);
@@ -3375,8 +3531,9 @@ pub fn requeue(id_str: &str) -> Result<()> {
     let (_change_id, commit_id) = jj::resolve_revset_full(revset)
         .map_err(|e| ExitError::new(exit_codes::USAGE, format!("candidate not found: {}", e)))?;
 
-    // Pre-flight conflict check against current trunk
-    let conflict_check_id = jj::new_rev(&[&trunk_bookmark, revset])?;
+    // Pre-flight conflict check against current trunk. Test the pinned
+    // commit so the merge exercised here is exactly the one queued below.
+    let conflict_check_id = jj::new_rev(&[&trunk_bookmark, &commit_id])?;
     let has_conflicts = match jj::has_conflicts(&conflict_check_id) {
         Ok(v) => {
             jj::abandon(&conflict_check_id)?;
@@ -3425,7 +3582,7 @@ pub fn requeue(id_str: &str) -> Result<()> {
         repo_path.display()
     ));
 
-    move_working_copy_off_queued(&commit_id)?;
+    move_working_copy_off_queued(&_change_id)?;
 
     Ok(())
 }
@@ -3512,26 +3669,56 @@ pub fn delete(id_str: &str) -> Result<()> {
     require_initialized()?;
     let _mutation_lock = Lock::acquire_blocking("mutation")?;
 
-    // Check queue first
+    // Check queue first. Publication serializes the deletion against the
+    // runner's claim window (the queue -> running rename takes the same
+    // lock), so a delete cannot observe a claim appearing mid-mutation and
+    // strip a live runner's claim.
+    let publication_lock = Lock::acquire_blocking("publication")?;
     if queue::queue_item_exists(id)? {
+        // A legacy dual state (queue and running bookmarks both name this
+        // ID) needs the run lock before either deletion: a runner that
+        // starts between deleting the queue bookmark and handling the claim
+        // recovers the claim back to the queue and re-claims the supposedly
+        // deleted item. Runners take run before publication, so run cannot
+        // be acquired while holding publication — release it, take run
+        // (refusing when a live runner holds it), then re-acquire
+        // publication. With mutation and run both held nothing else can
+        // touch these bookmarks, so no re-validation is needed.
+        if queue::running_item_exists(id)? {
+            drop(publication_lock);
+            let _run_lock = Lock::acquire("run")?.ok_or_else(|| {
+                ExitError::new(
+                    exit_codes::USAGE,
+                    format!(
+                        "item {} is being processed by a running queue runner (jjq delete can only remove it after the run finishes)",
+                        id
+                    ),
+                )
+            })?;
+            let publication_lock = Lock::acquire_blocking("publication")?;
+            let event = history_for_revision(
+                id,
+                kind::DELETED,
+                &format!("bookmarks(exact:{})", queue::queue_bookmark(id)),
+            )?;
+            jj::bookmark_delete(&queue::queue_bookmark(id))?;
+            jj::bookmark_delete(&queue::running_bookmark(id))?;
+            record_history(event)?;
+            drop(publication_lock);
+            prefout(&format!("deleted queued item {}", id));
+            return Ok(());
+        }
         let event = history_for_revision(
             id,
             kind::DELETED,
             &format!("bookmarks(exact:{})", queue::queue_bookmark(id)),
         )?;
         jj::bookmark_delete(&queue::queue_bookmark(id))?;
-        // A crash between claim-create and queue-delete leaves both
-        // bookmarks; remove the leftover claim too, or the next run's
-        // recovery resurrects and lands the item just deleted. If a live
-        // runner is mid-claim, its pre-land verification discards the
-        // result — the delete still wins.
-        if queue::running_item_exists(id)? {
-            jj::bookmark_delete(&queue::running_bookmark(id))?;
-        }
         record_history(event)?;
         prefout(&format!("deleted queued item {}", id));
         return Ok(());
     }
+    drop(publication_lock);
 
     // A running item is claimed by a queue runner. With the run lock held
     // the runner is live and deleting would be silently overridden when it
@@ -3571,12 +3758,6 @@ pub fn delete(id_str: &str) -> Result<()> {
 
     // Check failed
     if queue::failed_item_exists(id)? {
-        let padded = queue::format_seq_id(id);
-        let run_name = format!("jjq-run-{}", padded);
-
-        // Look up workspace path before deleting
-        let workspace_path = lookup_workspace_path(id);
-
         let mut event = Event::new(id, kind::DELETED);
         let item = build_failed_item(id)?;
         if !item.candidate_change_id.is_empty() {
@@ -3592,17 +3773,14 @@ pub fn delete(id_str: &str) -> Result<()> {
         record_history(event)?;
         prefout(&format!("deleted failed item {}", id));
 
-        // Try to forget the workspace (silently ignore if not found)
-        let _ = jj::workspace_forget(&run_name);
-
-        // Remove directory if found and still exists
-        if let Some(ref path) = workspace_path {
-            let p = std::path::Path::new(path);
-            if p.is_dir() {
-                let _ = std::fs::remove_dir_all(p);
+        // Forget the workspace by the name recorded at claim time (tokened)
+        // and remove its directory, exactly like stale-claim cleanup.
+        if let Some(path) = lookup_workspace_path(id) {
+            if std::path::Path::new(&path).is_dir() {
                 prefout(&format!("removed workspace {}", path));
             }
         }
+        cleanup_run_workspace(id);
 
         return Ok(());
     }

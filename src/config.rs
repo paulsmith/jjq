@@ -41,7 +41,10 @@ impl TryFrom<&str> for Strategy {
     }
 }
 
-/// Default strategy for existing repos (backward compat).
+/// Strategy for repositories whose metadata branch predates strategy
+/// configuration and carries no strategy file. Kept as `merge` — their
+/// established landing semantics — per the documented behavior; `init`
+/// writes an explicit strategy file (defaulting to rebase) for new repos.
 pub const DEFAULT_STRATEGY: Strategy = Strategy::Merge;
 
 /// Valid configuration keys.
@@ -95,22 +98,22 @@ pub fn snapshot() -> Result<Option<Snapshot>> {
 impl Snapshot {
     /// Read a file from the pinned metadata commit. Ok(None) means the file
     /// does not exist; any other failure (unreadable repo state) is an error.
+    /// Existence is probed via `jj file list` rather than by matching the
+    /// wording of `jj file show`'s not-found stderr, which could change.
     pub fn file(&self, path: &str) -> Result<Option<String>> {
-        match jj::file_show_pinned(path, &self.commit_id) {
-            Ok(contents) => Ok(Some(contents)),
-            Err(e) if e.to_string().contains("No such path") => Ok(None),
-            Err(e) => Err(e),
+        if !jj::file_exists_pinned(path, &self.commit_id)? {
+            return Ok(None);
         }
+        Ok(Some(jj::file_show_pinned(path, &self.commit_id)?))
     }
 
     /// Read all files below a path from this exact metadata generation in one
     /// jj process. A missing path is a normal empty result.
     pub fn files_contents(&self, path: &str) -> Result<Vec<(String, String)>> {
-        match jj::file_show_many_pinned(path, &self.commit_id) {
-            Ok(files) => Ok(files),
-            Err(e) if e.to_string().contains("No such path") => Ok(vec![]),
-            Err(e) => Err(e),
+        if !jj::file_exists_pinned(path, &self.commit_id)? {
+            return Ok(vec![]);
         }
+        Ok(jj::file_show_many_pinned(path, &self.commit_id)?)
     }
 
     fn config_values(&self) -> Result<&BTreeMap<String, String>> {

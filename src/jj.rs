@@ -273,13 +273,55 @@ fn supports_allow_protected() -> bool {
 
 /// Move a bookmark from one revision to another (compare-and-swap).
 /// Uses --allow-protected if the jj binary supports it.
+///
+/// jj treats a stale `--from` as a silent no-op ("No bookmarks to update.",
+/// exit 0) rather than an error, so a concurrent move of the bookmark between
+/// the caller's read of `from` and this command would be indistinguishable
+/// from a successful landing. Detect the no-op from the move command's own
+/// output ("Moved N bookmarks" appears only when something moved) and fail
+/// the CAS when nothing did.
+///
+/// A later read of the bookmark cannot distinguish a no-op from a successful
+/// move followed by a concurrent advance: both leave the bookmark elsewhere
+/// than `to`. Requeuing in the second case would resurrect an item that
+/// already landed, so a completed move is success even if the bookmark has
+/// since moved on. The one no-op that is legitimate success — the bookmark
+/// already names `to` — is confirmed by the post-move read.
 pub fn bookmark_move(name: &str, from: &str, to: &str) -> Result<()> {
     let mut args = vec!["bookmark", "move"];
     if supports_allow_protected() {
         args.push("--allow-protected");
     }
     args.extend_from_slice(&["--from", from, "--to", to, name]);
-    run_quiet_ignore_working_copy(&args)
+    let output = run_ignore_working_copy(&args)?;
+    if !output.status.success() {
+        bail!(
+            "jj {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Moved") {
+        return Ok(());
+    }
+    let current = run_ok_ignore_working_copy(&[
+        "log",
+        "-r",
+        &format!("bookmarks(exact:\"{}\")", name),
+        "--no-graph",
+        "-T",
+        "commit_id",
+    ])?;
+    if current.trim() != to {
+        bail!(
+            "bookmark '{}' is at {}, not the requested {} (moved concurrently?)",
+            name,
+            current.trim(),
+            to
+        );
+    }
+    Ok(())
 }
 
 /// List bookmarks matching a glob pattern.
@@ -543,6 +585,14 @@ pub fn rebase_branch_onto(source: &str, destination: &str) -> Result<()> {
 /// the caller's working copy.
 pub fn file_show_pinned(path: &str, commit_id: &str) -> Result<String> {
     run_ok_ignore_working_copy(&["file", "show", path, "-r", commit_id])
+}
+
+/// Whether any file exists under `path` in the pinned commit. `jj file list`
+/// exits successfully with empty output for an absent path, so existence
+/// needs no parsing of jj stderr wording.
+pub fn file_exists_pinned(path: &str, commit_id: &str) -> Result<bool> {
+    let output = run_ok_ignore_working_copy(&["file", "list", "-r", commit_id, path])?;
+    Ok(!output.trim().is_empty())
 }
 
 const FILE_SHOW_FRAME: &str = "\0JJQ-FILE\0";

@@ -41,7 +41,10 @@ pub fn publish_attempt_log(source: &Path) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating run log directory {}", parent.display()))?;
     }
-    fs::copy(source, &destination)
+    let temporary = destination.with_extension(format!("{}.tmp", std::process::id()));
+    fs::copy(source, &temporary)
+        .with_context(|| format!("publishing check log {}", source.display()))?;
+    fs::rename(&temporary, &destination)
         .with_context(|| format!("publishing check log {}", source.display()))?;
     Ok(())
 }
@@ -53,7 +56,10 @@ pub fn archive_failed(id: u32, source: &Path) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating failed log directory {}", parent.display()))?;
     }
-    fs::copy(source, &destination)
+    let temporary = destination.with_extension(format!("{}.tmp", std::process::id()));
+    fs::copy(source, &temporary)
+        .with_context(|| format!("archiving failed check output to {}", destination.display()))?;
+    fs::rename(&temporary, &destination)
         .with_context(|| format!("archiving failed check output to {}", destination.display()))?;
     Ok(())
 }

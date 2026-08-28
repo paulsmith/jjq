@@ -5,6 +5,14 @@ use anyhow::Result;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
+/// Stable identity of an open log file across polls. The publish-by-rename
+/// pattern gives a replaced log a fresh inode, which distinguishes replacement
+/// from appends of any length.
+fn identity_of(file: &File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
 /// View check command output, optionally following new output in real time.
 ///
 /// In dump mode (`!follow`), prints existing log content and exits.
@@ -26,7 +34,14 @@ pub fn tail(id: Option<&str>, all: bool, follow: bool) -> Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&path)?;
+    // Read the initial content and its identity from one open handle: a
+    // publish-by-rename between a path-based read and a separate identity
+    // probe could pair the old content's offset with the new file's
+    // identity, making the follower skip the replacement's content.
+    let mut initial_file = File::open(&path)?;
+    let initial_identity = identity_of(&initial_file);
+    let mut content = String::new();
+    initial_file.read_to_string(&mut content)?;
     let lines: Vec<&str> = content.lines().collect();
 
     if !follow {
@@ -77,10 +92,19 @@ pub fn tail(id: Option<&str>, all: bool, follow: bool) -> Result<()> {
     // Track our read position by byte offset; use seek-based reads
     // to avoid re-reading the entire file each iteration.
     let mut offset = content.len() as u64;
+    // The log is republished by rename, so a new attempt replaces the file
+    // rather than appending. Byte offsets alone cannot distinguish that
+    // from an append when the replacement is at least as long; track the
+    // file identity too and restart from the beginning on replacement.
+    let mut identity = initial_identity;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
+        // Identity comes from the open handle itself: reading it from the
+        // path again could straddle a rename, pairing the old handle with
+        // the new file's identity (and length) and skipping the start of
+        // the new log.
         let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(_) => {
@@ -88,6 +112,13 @@ pub fn tail(id: Option<&str>, all: bool, follow: bool) -> Result<()> {
                 return Ok(());
             }
         };
+        let current_identity = identity_of(&file);
+
+        if current_identity != identity {
+            // The log was replaced by a new publication; read it fresh.
+            identity = current_identity;
+            offset = 0;
+        }
 
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
 

@@ -76,7 +76,11 @@ pub fn lock_state(name: &str) -> Result<LockState> {
             file.unlock()?;
             Ok(LockState::Free)
         }
-        Err(_) => Ok(LockState::Held),
+        // Only a contended lock means Held; other I/O errors (e.g. a
+        // removed lock directory) must surface instead of masquerading as
+        // "held by another process".
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(LockState::Held),
+        Err(e) => Err(e.into()),
     }
 }
 

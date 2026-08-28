@@ -2180,6 +2180,41 @@ fn test_push_exact_duplicate_rejected() {
 }
 
 #[test]
+fn test_push_exact_duplicate_rejected_after_trunk_advance() {
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    run_jj(repo.path(), &["new", "-m", "dup feature", "main"]);
+    fs::write(repo.path().join("dup.txt"), "dup\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "dup-feature"]);
+    repo.jjq_success(&["push", "dup-feature"]);
+
+    // Advance trunk incompatibly: a conflicting edit to the same file.
+    run_jj(repo.path(), &["new", "-m", "trunk advance", "main"]);
+    fs::write(repo.path().join("dup.txt"), "trunk version\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "move", "main"]);
+
+    // The identical queued commit is still queued; the documented duplicate
+    // push error must win over the pre-flight conflict.
+    let output = repo
+        .jjq()
+        .args(["push", "dup-feature"])
+        .output()
+        .expect("failed to run jjq push");
+    assert_eq!(
+        output.status.code(),
+        Some(10),
+        "duplicate push should be USAGE even when it now conflicts with trunk; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already queued"),
+        "should report the duplicate, not the conflict: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn test_push_idempotent_clears_failed() {
     let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_MERGE_CHECK_FALSE_TEMPLATE);
 
@@ -2442,6 +2477,7 @@ fn test_status_single_json() {
     assert_eq!(parsed["id"], 1);
     assert!(parsed["change_id"].is_string(), "should have change_id");
     assert_eq!(parsed["description"], "json feature");
+    assert_eq!(parsed["state"], "queued", "single-item JSON names its state");
 }
 
 #[test]
@@ -2734,6 +2770,83 @@ fn test_config_without_init_fails() {
     let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
     let output = repo.jjq_failure(&["config"]);
     insta::assert_snapshot!(output, @"jjq: jjq is not initialized. Run 'jjq init' first.");
+}
+
+#[test]
+fn test_tail_follow_sees_replaced_log() {
+    // The run log is published by rename; a follower that only tracks byte
+    // offsets would mistake a longer replacement for an append and skip its
+    // content. Start a follower, replace the log with longer content the way
+    // publish_attempt_log does, and verify the follower prints it.
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+    let log = repo.path().join(".jj/jjq/run.log");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&log, "first attempt output\n").unwrap();
+
+    let mut follower = repo
+        .jjq_std()
+        .args(["tail"])
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Read follower output on a thread so the deadline below is enforceable:
+    // a blocking read on the pipe would hang forever if the follower went
+    // quiet, and the deadline assertion would never run.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut follower_stdout = follower.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 512];
+        loop {
+            match follower_stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(String::from_utf8_lossy(&buf[..n]).to_string()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut seen = String::new();
+
+    // Wait for the follower to print the initial content, then publish a
+    // longer replacement by rename.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !seen.contains("first attempt output") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "follower did not print initial content: {}",
+            seen
+        );
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(chunk) => seen.push_str(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => panic!("follower output reader exited unexpectedly"),
+        }
+    }
+
+    let replacement = repo.path().join(".jj/jjq/run.log.replacement");
+    fs::write(&replacement, "second attempt output with much longer content\n").unwrap();
+    fs::rename(&replacement, &log).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !seen.contains("second attempt output") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "follower must print replaced log content, saw: {}",
+            seen
+        );
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(chunk) => seen.push_str(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => panic!("follower output reader exited unexpectedly"),
+        }
+    }
+    follower.kill().unwrap();
+    let _ = follower.wait();
 }
 
 #[test]
@@ -4873,6 +4986,160 @@ fn test_cancel_wins_after_claim_before_active_check_publication() {
 }
 
 #[test]
+fn test_trunk_cas_after_validation_requeues_without_false_landed_event() {
+    // Hold the runner between receipt validation and the trunk CAS, advance
+    // trunk out-of-band in that window, and verify the CAS failure routes
+    // through stale-receipt handling: the item is requeued, no LANDED event
+    // is recorded, and a retry lands against the advanced trunk.
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    repo.init_jjq();
+    run_jj(repo.path(), &["new", "-m", "cas race", "main"]);
+    fs::write(repo.path().join("cas-race.txt"), "cas\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "cas-race"]);
+    repo.jjq_success(&["push", "cas-race"]);
+
+    let sync = TempDir::new().unwrap();
+    let validated = sync.path().join("validated");
+    let release = sync.path().join("release");
+    let runner = repo
+        .jjq_std()
+        .args(["run"])
+        .env("JJQTEST_RECEIPT_VALIDATED", &validated)
+        .env("JJQTEST_RECEIPT_VALIDATION_RELEASE", &release)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&validated, std::time::Duration::from_secs(30));
+
+    advance_trunk(&repo);
+
+    fs::write(&release, "").unwrap();
+    let output = runner.wait_with_output().expect("failed to wait for run");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "trunk CAS failure should exit CONFLICT; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("trunk changed while landing"),
+        "should explain the CAS failure: {}",
+        stderr
+    );
+    assert!(
+        repo.jj_file_exists("trunk-advance.txt", "main"),
+        "the independent trunk move must survive"
+    );
+    assert!(
+        !repo.jj_file_exists("cas-race.txt", "main"),
+        "the stale checked result must not land"
+    );
+    assert!(
+        run_jj(
+            repo.path(),
+            &[
+                "bookmark",
+                "list",
+                "-r",
+                "bookmarks(exact:\"jjq/queue/000001\")",
+                "-T",
+                "name",
+            ],
+        )
+        .contains("jjq/queue/000001"),
+        "CAS failure should restore the original queue item"
+    );
+    let history = repo.jjq_success(&["history", "1", "--json"]);
+    assert!(
+        !history.contains("landed"),
+        "no LANDED event may be recorded when trunk never moved: {}",
+        history
+    );
+
+    // A retry re-checks against the advanced trunk and lands cleanly.
+    repo.jjq_success(&["run"]);
+    assert!(repo.jj_file_exists("cas-race.txt", "main"));
+    assert!(
+        repo.jjq_success(&["history", "1", "--json"]).contains("landed"),
+        "the retry should record the real landing"
+    );
+}
+
+#[test]
+fn test_cas_success_survives_post_move_trunk_advance() {
+    // A CAS that actually moved trunk is a landing, even when trunk advances
+    // out-of-band before the post-move read: requeueing would resurrect an
+    // item that already landed. Hold the runner between the CAS and the rest
+    // of the landing bookkeeping, advance trunk, and verify the run still
+    // reports the item as landed and never requeues it.
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    repo.init_jjq();
+    run_jj(repo.path(), &["new", "-m", "post-cas advance", "main"]);
+    fs::write(repo.path().join("post-cas.txt"), "post\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "post-cas"]);
+    repo.jjq_success(&["push", "post-cas"]);
+
+    let sync = TempDir::new().unwrap();
+    let cas = sync.path().join("cas");
+    let release = sync.path().join("release");
+    let runner = repo
+        .jjq_std()
+        .args(["run"])
+        .env("JJQTEST_LANDING_CAS", &cas)
+        .env("JJQTEST_LANDING_CAS_RELEASE", &release)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&cas, std::time::Duration::from_secs(30));
+
+    // The CAS has completed and trunk now names the landed result. Advance
+    // trunk out-of-band on top of it before the runner resumes.
+    advance_trunk(&repo);
+
+    fs::write(&release, "").unwrap();
+    let output = runner.wait_with_output().expect("failed to wait for run");
+    assert!(
+        output.status.success(),
+        "a completed CAS must land the item even if trunk advanced after: stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        repo.jj_file_exists("trunk-advance.txt", "main"),
+        "the independent trunk move must survive"
+    );
+    assert!(
+        repo.jj_file_exists("post-cas.txt", "main"),
+        "the landed result stays in trunk's history"
+    );
+    let history = repo.jjq_success(&["history", "1", "--json"]);
+    assert!(
+        history.contains("landed"),
+        "the real landing must be recorded: {}",
+        history
+    );
+    assert!(
+        !run_jj(
+            repo.path(),
+            &[
+                "bookmark",
+                "list",
+                "-r",
+                "bookmarks(glob:\"jjq/queue/??????\")",
+                "-T",
+                "name",
+            ],
+        )
+        .contains("jjq/queue/"),
+        "an item whose CAS completed must not be requeued"
+    );
+}
+
+#[test]
 fn test_landing_cas_wins_over_late_cancel() {
     let repo = TestRepo::from_template(&QUEUED_RUN_ALL_HAPPY_MERGE_TEMPLATE);
     let sync = TempDir::new().unwrap();
@@ -5305,6 +5572,176 @@ fn test_validation_receipt_never_lands_a_retargeted_claim() {
 }
 
 #[test]
+fn test_push_replaces_stale_claim_recovered_by_new_runner() {
+    // Legacy dual state (queue + running for one ID) with the run lock free:
+    // push must clear both the queued entry and the stale claim — held
+    // together under run → publication so a runner starting mid-replacement
+    // cannot recover and re-claim the superseded commit — and a later run
+    // lands only the replacement.
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    run_jj(repo.path(), &["new", "-m", "superseded", "main"]);
+    fs::write(repo.path().join("superseded.txt"), "old\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "superseded"]);
+    repo.jjq_success(&["push", "superseded"]);
+
+    // Manufacture the legacy crash shape: the queue entry exists and a stale
+    // running claim names the same commit. No runner is live, so the run
+    // lock is free and the claim is an orphan.
+    run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "create",
+            "-r",
+            "bookmarks(exact:\"jjq/queue/000001\")",
+            "jjq/running/000001",
+        ],
+    );
+
+    // Push a fixed version of the same change. The user amends their branch;
+    // the queue and running bookmarks follow the rewrite, so pin them back
+    // to the pre-fix commit to reproduce the legacy dual state the reviewer
+    // described (stale entries naming the old commit while the user's tip
+    // moved on).
+    let old_commit = run_jj(
+        repo.path(),
+        &[
+            "log",
+            "--ignore-working-copy",
+            "-r",
+            "bookmarks(exact:\"jjq/queue/000001\")",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
+    )
+    .trim()
+    .to_string();
+    run_jj(repo.path(), &["edit", "superseded"]);
+    fs::write(repo.path().join("superseded.txt"), "fixed\n").unwrap();
+    run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "set",
+            "--allow-backwards",
+            "-r",
+            &old_commit,
+            "jjq/queue/000001",
+            "jjq/running/000001",
+        ],
+    );
+    let push = repo
+        .jjq()
+        .args(["push", "superseded"])
+        .output()
+        .expect("failed to run jjq push");
+    assert!(
+        push.status.success(),
+        "push must replace the dual-state entry: stdout: {} stderr: {}",
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+    let push_stdout = String::from_utf8_lossy(&push.stdout).to_string();
+    assert!(
+        push_stdout.contains("replacing"),
+        "push should report the replacement: {}",
+        push_stdout
+    );
+
+    // Both namespaces for the old submission are gone; only the new
+    // submission remains queued.
+    let leftovers = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/queue/??????\") | bookmarks(glob:\"jjq/running/??????\")",
+            "-T",
+            "name ++ \"\\n\"",
+        ],
+    )
+    .lines()
+    .filter(|name| name.starts_with("jjq/"))
+    .count();
+    assert_eq!(
+        leftovers, 1,
+        "exactly one queue entry (the new push) may remain"
+    );
+    let history = history_kinds(&repo, "1");
+    assert!(
+        history.contains(&"replaced".to_string()),
+        "the superseded submission keeps its replacement audit event: {:?}",
+        history
+    );
+
+    // The manufactured stale state pinned a second copy of the change; drop
+    // it so the landed change resolves uniquely for the run below.
+    run_jj(repo.path(), &["abandon", &old_commit]);
+
+    // A later run lands the pushed content; the stale claim is gone so the
+    // replaced entry cannot run a second time.
+    repo.jjq_success(&["run"]);
+    assert!(repo.jj_file_exists("superseded.txt", "main"));
+    let landed = run_jj(
+        repo.path(),
+        &["file", "show", "superseded.txt", "-r", "main"],
+    );
+    assert_eq!(
+        landed.lines().count(),
+        1,
+        "the change must land exactly once, not once per replaced bookmark: {:?}",
+        landed
+    );
+}
+
+#[test]
+fn test_push_during_run_refused_even_when_conflicting() {
+    // A live runner's claim refuses the push with USAGE even when trunk has
+    // advanced incompatibly since the claim: the conflict check must not
+    // turn the documented "currently being processed" refusal into CONFLICT.
+    let (repo, sync) = repo_with_gated_check();
+
+    let child = repo.spawn_jjq(&["run"]);
+    wait_for_file(
+        &sync.path().join("started"),
+        std::time::Duration::from_secs(30),
+    );
+
+    // Advance trunk with a conflicting edit to the same file the check is
+    // validating, then try to re-push the same change.
+    run_jj(repo.path(), &["new", "-m", "trunk advance", "main"]);
+    fs::write(repo.path().join("slow.txt"), "trunk version\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "move", "main"]);
+
+    let output = repo
+        .jjq()
+        .args(["push", "slow"])
+        .output()
+        .expect("failed to run jjq push");
+    assert_eq!(
+        output.status.code(),
+        Some(10),
+        "push of an in-flight item should refuse with USAGE even though it now conflicts; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("currently being processed"),
+        "refusal should explain the item is being processed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Release the check; the run completes. The receipt's trunk moved, so
+    // the item returns to the queue rather than landing on a stale check.
+    fs::write(sync.path().join("release"), "").unwrap();
+    let run_output = child.wait_with_output().expect("failed to wait for run");
+    assert_eq!(run_output.status.code(), Some(1));
+}
+
+#[test]
 fn test_delete_during_run_refused() {
     let (repo, sync) = repo_with_gated_check();
 
@@ -5356,7 +5793,7 @@ fn test_delete_stale_running_claim() {
     let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
     run_jj(repo.path(), &["new", "-m", "interrupted feature", "main"]);
-    fs::write(repo.path().join("feature.txt"), "content").unwrap();
+    fs::write(repo.path().join("feature.txt"), "content\n").unwrap();
     run_jj(repo.path(), &["bookmark", "create", "feature"]);
 
     // Manufacture a stale claim, as a runner crash mid-processing leaves it.
@@ -5389,6 +5826,70 @@ fn test_delete_stale_running_claim() {
         "stale running bookmark should be gone: {}",
         bookmarks
     );
+}
+
+#[test]
+fn test_delete_dual_state_removes_both_without_recovery_race() {
+    // Legacy dual state (queue + running for one ID) with the run lock free:
+    // delete must remove both bookmarks under run → publication, so a runner
+    // starting mid-delete cannot recover the claim back to the queue and
+    // land the supposedly deleted item.
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    run_jj(repo.path(), &["new", "-m", "dual state", "main"]);
+    fs::write(repo.path().join("dual.txt"), "content\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "dual"]);
+    repo.jjq_success(&["push", "dual"]);
+
+    // Manufacture the dual state: the queue entry exists and a stale
+    // running claim names the same commit. No runner is live.
+    run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "create",
+            "-r",
+            "bookmarks(exact:\"jjq/queue/000001\")",
+            "jjq/running/000001",
+        ],
+    );
+
+    let output = repo.jjq_success(&["delete", "1"]);
+    assert!(
+        output.contains("deleted"),
+        "delete should remove the dual-state entry: {}",
+        output
+    );
+
+    let leftovers = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/queue/??????\") | bookmarks(glob:\"jjq/running/??????\")",
+            "-T",
+            "name ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        leftovers.lines().filter(|name| name.starts_with("jjq/")).count() == 0,
+        "both queue and running bookmarks must be gone: {}",
+        leftovers
+    );
+    assert!(
+        history_kinds(&repo, "1").contains(&"deleted".to_string()),
+        "the deletion must be recorded"
+    );
+
+    // A later run finds an empty queue and must not resurrect the item.
+    let run_output = repo.jjq_success(&["run"]);
+    assert!(
+        run_output.contains("queue is empty"),
+        "the deleted item must not be recoverable: {}",
+        run_output
+    );
+    assert!(!repo.jj_file_exists("dual.txt", "main"));
 }
 
 #[test]
