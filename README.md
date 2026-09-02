@@ -34,7 +34,7 @@ the included install script:
 curl -LO https://github.com/paulsmith/jjq/releases/latest/download/jjq-VERSION-PLATFORM.tar.gz
 tar xzf jjq-VERSION-PLATFORM.tar.gz
 cd jjq-VERSION-PLATFORM
-sudo ./install                    # installs to /usr/local
+sudo ./install.sh                 # installs to /usr/local
 ```
 
 Available platforms: `aarch64-darwin`, `x86_64-darwin`, `aarch64-linux`,
