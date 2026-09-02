@@ -100,6 +100,10 @@ struct QueueItem {
     change_id: String,
     commit_id: String,
     description: String,
+    /// The single-revision landing policy exemption, so operators can see a
+    /// deliberate stack before the item fails.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    allow_stack: bool,
 }
 
 #[derive(Serialize)]
@@ -111,6 +115,14 @@ struct FailedItem {
     trunk_commit_id: String,
     workspace_path: String,
     failure_reason: String,
+    /// Recorded by `jjq reject`. Empty means no reason exists: the failed
+    /// item is still pending in the fix loop rather than terminal.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    reject_reason: String,
+    /// The single-revision landing policy exemption, recorded at push time
+    /// so the fixer can tell a deliberate stack from an accidental one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    allow_stack: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     conflict_paths: Vec<String>,
 }
@@ -785,8 +797,41 @@ fn prompt_choice(label: &str, max: u32) -> Result<u32> {
     }
 }
 
+/// Count revisions the candidate would land atop trunk and apply the
+/// single-revision policy. Returns Ok(()) to proceed. `trunk_commit` is the
+/// pinned trunk commit ID (not a bookmark name: `bookmarks(exact:)` on a
+/// commit ID silently matches unrelated short-prefix bookmarks); callers
+/// pass the candidate's pinned commit ID too, so the count never depends on
+/// working-copy state.
+fn check_landing_policy(candidate_commit: &str, trunk_commit: &str, exempt: bool) -> Result<()> {
+    let revset = format!("{}..{}", trunk_commit, candidate_commit);
+    let output = jj::run_ok_ignore_working_copy(&[
+        "log",
+        "-r",
+        &revset,
+        "--no-graph",
+        "-T",
+        "\"x\"",
+    ])?;
+    let n = output.trim().len();
+    if n == 0 {
+        return Err(ExitError::new(exit_codes::USAGE, "nothing to land atop trunk").into());
+    }
+    if n > 1 && !exempt && config::get_require_single_revision()? {
+        return Err(ExitError::new(
+            exit_codes::USAGE,
+            format!(
+                "{} revisions atop trunk; squash and re-push (or push --allow-stack)",
+                n
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Push a revision onto the merge queue.
-pub fn push(revset: &str) -> Result<()> {
+pub fn push(revset: &str, allow_stack: bool) -> Result<()> {
     // Resolve both change ID and commit ID
     let (change_id, commit_id) = jj::resolve_revset_full(revset)
         .map_err(|e| ExitError::new(exit_codes::USAGE, e.to_string()))?;
@@ -805,6 +850,12 @@ pub fn push(revset: &str) -> Result<()> {
         )
         .into());
     }
+
+    // Single-revision landing policy, checked synchronously so the submitter
+    // gets immediate feedback. The zero-revision refusal applies regardless
+    // of config or exemption: there is never a reason to queue nothing.
+    let trunk_commit_id = jj::get_commit_id(&format!("bookmarks(exact:{})", trunk_bookmark))?;
+    check_landing_policy(&commit_id, &trunk_commit_id, allow_stack)?;
 
     // An exact duplicate push must report the documented USAGE error, not a
     // conflict: if trunk has advanced incompatibly since the identical
@@ -1005,6 +1056,7 @@ pub fn push(revset: &str) -> Result<()> {
         "bookmarks(exact:{})",
         trunk_bookmark
     ))?);
+    event.allow_stack = allow_stack.then_some(true);
     record_history(event)?;
     drop(publication_lock);
 
@@ -1453,9 +1505,10 @@ pub fn run(all: bool, stop_on_failure: bool, jobs: usize) -> Result<()> {
         ),
     };
 
-    if all {
+    let (result, processed) = if all {
         if jobs > 1 && run_config.strategy == Strategy::Merge && !stop_on_failure {
-            run_all_parallel_merge(&run_lock, &run_config, jobs)
+            let outcome = run_all_parallel_merge(&run_lock, &run_config, jobs);
+            batch_run_outcome(outcome)
         } else {
             if jobs > 1 {
                 if stop_on_failure {
@@ -1468,18 +1521,40 @@ pub fn run(all: bool, stop_on_failure: bool, jobs: usize) -> Result<()> {
                     );
                 }
             }
-            run_all(&run_lock, &run_config, stop_on_failure)
+            let outcome = run_all(&run_lock, &run_config, stop_on_failure);
+            batch_run_outcome(outcome)
         }
     } else {
         match run_one(&run_lock, &run_config)? {
-            RunResult::Success => Ok(()),
-            RunResult::Empty => Ok(()),
-            RunResult::Skipped => Ok(()),
-            RunResult::Canceled => Ok(()),
-            RunResult::StaleReceipt => Err(ExitError::code_only(exit_codes::CONFLICT).into()),
+            RunResult::Success => (Ok(()), 1),
+            RunResult::Empty => (Ok(()), 0),
+            RunResult::Skipped => (Ok(()), 1),
+            RunResult::Canceled => (Ok(()), 1),
+            RunResult::StaleReceipt => (
+                Err(ExitError::code_only(exit_codes::CONFLICT).into()),
+                1,
+            ),
             // run_one already reported the failure in detail
-            RunResult::Failure => Err(ExitError::code_only(exit_codes::CONFLICT).into()),
+            RunResult::Failure => (Err(ExitError::code_only(exit_codes::CONFLICT).into()), 1),
         }
+    };
+    if processed > 0 {
+        // Residue from this run's landings (a fixer's obsolete originals) is
+        // abandoned while the run lock is still held. Failures are warnings.
+        cleanup_residue()?;
+    }
+    result
+}
+
+/// Map a batch outcome of (processed count, any failure) onto the command
+/// result and exit code: PARTIAL when some items failed, Ok otherwise.
+fn batch_run_outcome(
+    outcome: anyhow::Result<(usize, bool)>,
+) -> (Result<()>, usize) {
+    match outcome {
+        Ok((count, failed)) if failed => (Err(ExitError::code_only(exit_codes::PARTIAL).into()), count),
+        Ok((count, _)) => (Ok(()), count),
+        Err(error) => (Err(error), 1),
     }
 }
 
@@ -1497,12 +1572,15 @@ enum RunResult {
     Failure,
 }
 
-fn run_all(run_lock: &Lock, run_config: &RunConfig, stop_on_failure: bool) -> Result<()> {
+fn run_all(
+    run_lock: &Lock,
+    run_config: &RunConfig,
+    stop_on_failure: bool,
+) -> Result<(usize, bool)> {
     let mut merged_count = 0u32;
     let mut failed_count = 0u32;
     let mut skipped_count = 0u32;
     let mut canceled_count = 0u32;
-
     loop {
         match run_one(run_lock, run_config)? {
             RunResult::Success => {
@@ -1529,20 +1607,21 @@ fn run_all(run_lock: &Lock, run_config: &RunConfig, stop_on_failure: bool) -> Re
                             merged_count
                         ));
                     }
-                    return Err(ExitError::code_only(exit_codes::CONFLICT).into());
+                    return Ok((1, true));
                 }
                 failed_count += 1;
             }
         }
     }
 
+    let processed = (merged_count + failed_count + skipped_count + canceled_count) as usize;
     if merged_count > 0 || failed_count > 0 || skipped_count > 0 || canceled_count > 0 {
         if failed_count > 0 {
             prefout(&format!(
                 "processed {} item(s), {} failed",
                 merged_count, failed_count
             ));
-            return Err(ExitError::code_only(exit_codes::PARTIAL).into());
+            return Ok((processed, true));
         }
         if skipped_count > 0 {
             prefout(&format!(
@@ -1558,7 +1637,7 @@ fn run_all(run_lock: &Lock, run_config: &RunConfig, stop_on_failure: bool) -> Re
             prefout(&format!("processed {} item(s)", merged_count));
         }
     }
-    Ok(())
+    Ok((processed, false))
 }
 
 /// A claimed merge item materialized on a predicted trunk. The workspace and
@@ -1585,13 +1664,20 @@ enum SpeculativeOutcome {
     },
     Conflict(Vec<String>),
     Empty,
+    /// Refused by the run-time landing-policy re-check before any
+    /// materialization; the item was already moved to failed.
+    PolicyRejected,
 }
 
 /// Merge-only bounded optimistic lookahead. Rebase remains deliberately
 /// serial: the current materialization is a duplicate with a different change
 /// ID, so it cannot produce a receipt whose exact base is the later rebase of
 /// the original candidate without mutating that candidate before its check.
-fn run_all_parallel_merge(run_lock: &Lock, run_config: &RunConfig, jobs: usize) -> Result<()> {
+fn run_all_parallel_merge(
+    run_lock: &Lock,
+    run_config: &RunConfig,
+    jobs: usize,
+) -> Result<(usize, bool)> {
     let run_token = run_config.run_token.clone();
     let mut merged_count = 0u32;
     let mut failed_count = 0u32;
@@ -1710,9 +1796,7 @@ fn run_all_parallel_merge(run_lock: &Lock, run_config: &RunConfig, jobs: usize) 
                 "processed {} item(s), {} failed",
                 merged_count, failed_count
             ));
-            return Err(ExitError::code_only(exit_codes::PARTIAL).into());
-        }
-        if skipped_count > 0 {
+        } else if skipped_count > 0 {
             prefout(&format!(
                 "processed {} item(s), {} skipped (empty)",
                 merged_count, skipped_count
@@ -1727,7 +1811,10 @@ fn run_all_parallel_merge(run_lock: &Lock, run_config: &RunConfig, jobs: usize) 
         }
     }
     let _ = run_lock; // documents that this scheduler owns the exclusive run.
-    Ok(())
+    Ok((
+        (merged_count + failed_count + skipped_count + canceled_count) as usize,
+        failed_count > 0,
+    ))
 }
 
 fn prepare_speculative_merge(
@@ -1763,6 +1850,43 @@ fn prepare_speculative_merge(
     history::record_claim_with_workspace(claimed, workspace_path.to_str().unwrap(), &run_name)?;
     drop(publication_lock);
     claim_published_test_hook()?;
+
+    // Authoritative landing-policy re-check for the speculative path, same
+    // as the serial one. A violation is a terminal failure for the item.
+    if let Err(policy_error) = check_landing_policy(
+        &candidate_commit_id,
+        base_commit_id,
+        history::allow_stack(id)?,
+    ) {
+        let _publication_lock = Lock::acquire_blocking("publication")?;
+        let trunk_bookmark = config::get_trunk_bookmark()?;
+        let trunk_commit_id =
+            jj::get_commit_id(&format!("bookmarks(exact:{})", trunk_bookmark))?;
+        reject_claimed_item(
+            id,
+            &candidate_change_id,
+            &candidate_commit_id,
+            &trunk_commit_id,
+            &workspace_path,
+            &Strategy::Merge,
+            &policy_error.to_string(),
+        )?;
+        // Return an attempt whose outcome reports the rejection as a
+        // failure for FIFO consumption.
+        let attempt = SpeculativeAttempt {
+            id,
+            candidate_change_id,
+            candidate_commit_id,
+            base_commit_id: base_commit_id.to_string(),
+            workspace: Some(workspace),
+            workspace_path,
+            run_name,
+            log_path: crate::runlog::attempt_log(run_token, id)?,
+            run_token: run_token.to_string(),
+            outcome: SpeculativeOutcome::PolicyRejected,
+        };
+        return Ok(Some(attempt));
+    }
 
     jj::workspace_add(
         workspace_path.to_str().unwrap(),
@@ -1999,6 +2123,13 @@ fn consume_speculative_merge(
             }
             return Ok(RunResult::Failure);
         }
+        SpeculativeOutcome::PolicyRejected => {
+            // The rejection happens before workspace_add, so run_name was
+            // never registered — forgetting it would fail the whole run.
+            attempt.workspace.take();
+            remove_active_check(&attempt.run_token, attempt.id);
+            Ok(RunResult::Failure)
+        }
         SpeculativeOutcome::Empty => {
             jj::bookmark_delete(&queue::running_bookmark(attempt.id))?;
             let mut event = Event::new(attempt.id, kind::SKIPPED_EMPTY);
@@ -2180,6 +2311,144 @@ fn recover_claim(id: u32) -> Result<bool> {
     Ok(false)
 }
 
+/// Reject a claimed item for a landing-policy violation, using the same
+/// create-before-delete bookkeeping as the run failure paths. The caller
+/// holds publication.lock. Returns the failed marker commit's change ID.
+#[allow(clippy::too_many_arguments)]
+fn reject_claimed_item(
+    id: u32,
+    candidate_change_id: &str,
+    candidate_commit_id: &str,
+    trunk_commit_id: &str,
+    _workspace_path: &std::path::Path,
+    strategy: &Strategy,
+    reason: &str,
+) -> Result<()> {
+    let marker = jj::new_rev(&[candidate_commit_id])?;
+    let entry = queue::StateEntry {
+        id,
+        change_id: candidate_change_id.to_string(),
+        commit_id: candidate_commit_id.to_string(),
+        description: String::new(),
+    };
+    let desc = reject_description(id, &entry, trunk_commit_id, strategy, reason);
+    jj::describe(&marker, &desc)?;
+    jj::bookmark_create_internal(&queue::failed_bookmark(id), &marker)?;
+    jj::bookmark_delete(&queue::running_bookmark(id))?;
+    let mut event = Event::new(id, kind::REJECTED);
+    event.candidate_change_id = Some(candidate_change_id.to_string());
+    event.candidate_commit_id = Some(candidate_commit_id.to_string());
+    event.trunk_commit_id = Some(trunk_commit_id.to_string());
+    event.strategy = Some(strategy.as_str().to_string());
+    event.failure_reason = Some(reason.to_string());
+    record_history(event)?;
+    preferr(&format!("merge {} rejected: {}", id, reason));
+    Ok(())
+}
+
+/// A visible leaf commit considered for residue cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Leaf {
+    change_id: String,
+    commit_id: String,
+    description: String,
+}
+
+/// Partition leaves into (abandon, keep). A leaf is abandoned only when its
+/// exact commit ID was recorded as the queued candidate of a submission that
+/// landed; every other leaf is kept. Commit-ID matching, not change-ID: a
+/// divergent copy of a landed change can carry unlanded local edits, and a
+/// change-ID match would abandon them.
+fn residue_selection(
+    leaves: &[Leaf],
+    landed_candidates: &std::collections::HashSet<String>,
+) -> (Vec<Leaf>, Vec<Leaf>) {
+    let mut abandon: Vec<Leaf> = Vec::new();
+    let mut keep: Vec<Leaf> = Vec::new();
+    for leaf in leaves {
+        let leaf = leaf.clone();
+        if landed_candidates.contains(&leaf.commit_id) {
+            abandon.push(leaf);
+        } else {
+            keep.push(leaf);
+        }
+    }
+    (abandon, keep)
+}
+
+/// Abandon residue leaves after a run processed items or before clean
+/// finishes. Failures are downgraded to warnings: cleanup must never fail
+/// the caller's run.
+fn cleanup_residue() -> Result<()> {
+    let result = cleanup_residue_inner();
+    if let Err(error) = &result {
+        preferr(&format!("residue cleanup failed: {}", error));
+    }
+    Ok(())
+}
+
+fn cleanup_residue_inner() -> Result<()> {
+    let trunk = config::get_trunk_bookmark()?;
+    let revset = format!(
+        r#"heads(~::bookmarks(exact:{})) ~ bookmarks() ~ working_copies() ~ ({})"#,
+        trunk,
+        meta::meta_revset()
+    );
+    // Unit-separator framing: change_id \x1f commit_id \x1f json-escaped
+    // first description line, then \x1e record end. escape_json makes the
+    // description safe to split on.
+    let template = concat!(
+        r#"change_id.short() ++ "\x1f" ++ commit_id ++ "\x1f" ++"#,
+        r#"description.first_line().escape_json() ++ "\x1e" ++ "\n""#,
+    );
+    let output = jj::run_ok_ignore_working_copy(&[
+        "log",
+        "-r",
+        &revset,
+        "--no-graph",
+        "-T",
+        template,
+    ])?;
+
+    let mut leaves: Vec<Leaf> = Vec::new();
+    for record in output.split('\u{1e}') {
+        let record = record.trim();
+        if record.is_empty() {
+            continue;
+        }
+        let mut parts = record.split('\u{1f}');
+        let (Some(change_id), Some(commit_id), Some(description)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let description = serde_json::from_str::<String>(description)
+            .unwrap_or_else(|_| description.trim().to_string());
+        leaves.push(Leaf {
+            change_id: change_id.to_string(),
+            commit_id: commit_id.to_string(),
+            description,
+        });
+    }
+
+    let landed_candidates = history::landed_candidate_commit_ids()?;
+    let (abandon, keep) = residue_selection(&leaves, &landed_candidates);
+    for leaf in &abandon {
+        jj::abandon(&leaf.commit_id)?;
+        prefout(&format!(
+            "residue: abandoned {} {}",
+            leaf.change_id, leaf.description
+        ));
+    }
+    for leaf in &keep {
+        prefout(&format!(
+            "residue: kept {} (not a queued candidate of landed work)",
+            leaf.change_id
+        ));
+    }
+    Ok(())
+}
+
 /// Process the next queue item. The caller must hold the run lock, passed
 /// here as evidence, and supplies the batch-wide configuration.
 fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
@@ -2264,6 +2533,26 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
     )?;
     drop(publication_lock);
     claim_published_test_hook()?;
+
+    // Authoritative landing-policy re-check. The push-time gate is
+    // synchronous feedback; this is the gate that governs landing.
+    if let Err(policy_error) = check_landing_policy(
+        &candidate_commit_id,
+        &trunk_commit_id,
+        history::allow_stack(id)?,
+    ) {
+        let _publication_lock = Lock::acquire_blocking("publication")?;
+        reject_claimed_item(
+            id,
+            &candidate_change_id,
+            &candidate_commit_id,
+            &trunk_commit_id,
+            &runner_workspace_path,
+            &strategy,
+            &policy_error.to_string(),
+        )?;
+        return Ok(RunResult::Failure);
+    }
 
     // Token-scoped until FIFO terminal consumption. This is the same attempt
     // isolation used by speculative workers.
@@ -2966,13 +3255,14 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
     }
 }
 
-fn build_item_from_state(entry: queue::StateEntry) -> QueueItem {
-    QueueItem {
+fn build_item_from_state(entry: queue::StateEntry) -> Result<QueueItem> {
+    Ok(QueueItem {
         id: entry.id,
         change_id: entry.change_id,
         commit_id: entry.commit_id,
         description: entry.description.lines().next().unwrap_or("").to_string(),
-    }
+        allow_stack: history::allow_stack(entry.id).unwrap_or(false),
+    })
 }
 
 /// Build a FailedItem by parsing trailers from the bookmark target description.
@@ -2980,15 +3270,27 @@ fn build_failed_item(id: u32) -> Result<FailedItem> {
     let bookmark = queue::failed_bookmark(id);
     let revset = format!("bookmarks(exact:{})", bookmark);
     let desc = jj::get_description(&revset)?;
-    build_failed_item_from_description(id, &desc)
+    let mut item = build_failed_item_from_description(id, &desc)?;
+    item.allow_stack = history::allow_stack(id).unwrap_or(false);
+    Ok(item)
 }
 
 fn build_failed_item_from_state(entry: queue::StateEntry) -> Result<FailedItem> {
-    build_failed_item_from_description(entry.id, &entry.description)
+    let mut item = build_failed_item_from_description(entry.id, &entry.description)?;
+    item.allow_stack = history::allow_stack(entry.id).unwrap_or(false);
+    Ok(item)
+}
+
+/// Parse failed-item trailer facts from a failure description. Split out of
+/// `build_failed_item_from_description` as a pure function: the full builder
+/// resolves the candidate description through `jj`, which under `cargo test`
+/// would snapshot the developer's real repository.
+fn parse_failed_item_trailers(desc: &str) -> HashMap<String, String> {
+    extract_trailers(desc)
 }
 
 fn build_failed_item_from_description(id: u32, desc: &str) -> Result<FailedItem> {
-    let trailers = extract_trailers(&desc);
+    let trailers = parse_failed_item_trailers(desc);
 
     let candidate_change_id = trailers.get("candidate").cloned().unwrap_or_default();
     let candidate_commit_id = trailers
@@ -2998,6 +3300,7 @@ fn build_failed_item_from_description(id: u32, desc: &str) -> Result<FailedItem>
     let trunk_commit_id = trailers.get("trunk").cloned().unwrap_or_default();
     let workspace_path = trailers.get("workspace").cloned().unwrap_or_default();
     let failure_reason = trailers.get("failure").cloned().unwrap_or_default();
+    let reject_reason = trailers.get("reject-reason").cloned().unwrap_or_default();
     let conflict_paths = trailers
         .get("conflicts")
         .map(|s| s.split(',').map(|p| p.to_string()).collect())
@@ -3020,6 +3323,8 @@ fn build_failed_item_from_description(id: u32, desc: &str) -> Result<FailedItem>
         trunk_commit_id,
         workspace_path,
         failure_reason,
+        reject_reason,
+        allow_stack: false,
         conflict_paths,
     })
 }
@@ -3111,12 +3416,12 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
         .running()?
         .into_iter()
         .map(build_item_from_state)
-        .collect();
+        .collect::<Result<_>>()?;
     let queue_items: Vec<QueueItem> = state
         .queued()?
         .into_iter()
         .map(build_item_from_state)
-        .collect();
+        .collect::<Result<_>>()?;
     let failed_items: Vec<FailedItem> = state
         .failed()?
         .into_iter()
@@ -3267,7 +3572,7 @@ fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<
     };
 
     if !matches!(state, ItemState::Failed) {
-        let item = build_item_from_state(entry);
+        let item = build_item_from_state(entry)?;
         if json {
             // The queue and running namespaces share this item shape; an
             // explicit state field lets machine consumers tell them apart.
@@ -3311,6 +3616,9 @@ fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<
             );
             println!("  Description: {}", item.description);
             println!("  Failure:     {}", item.failure_reason);
+            if !item.reject_reason.is_empty() {
+                println!("  Rejected:    {}", item.reject_reason);
+            }
             if !item.conflict_paths.is_empty() {
                 println!("  Conflicts:   {}", item.conflict_paths.join(", "));
             }
@@ -3400,17 +3708,20 @@ fn finish_requeue(
         event.kind == kind::REQUEUED && event.related_sequence_id == Some(new_id)
     });
     if !already_recorded {
+        let exempt = history::allow_stack(old_id)?;
         let mut requeued = Event::new(old_id, kind::REQUEUED);
         requeued.candidate_change_id = Some(candidate_change_id.to_string());
         requeued.candidate_commit_id = Some(candidate_commit_id.to_string());
         requeued.trunk_commit_id = Some(trunk_commit_id.to_string());
         requeued.related_sequence_id = Some(new_id);
+        requeued.allow_stack = exempt.then_some(true);
 
         let mut queued = Event::new(new_id, kind::QUEUED);
         queued.candidate_change_id = Some(candidate_change_id.to_string());
         queued.candidate_commit_id = Some(candidate_commit_id.to_string());
         queued.trunk_commit_id = Some(trunk_commit_id.to_string());
         queued.related_sequence_id = Some(old_id);
+        queued.allow_stack = exempt.then_some(true);
         history::record_many(&[requeued, queued])?;
     }
     remove_failed_entry(old_id)?;
@@ -3556,6 +3867,10 @@ pub fn requeue(id_str: &str) -> Result<()> {
         ));
         return Err(ExitError::new(exit_codes::CONFLICT, "revision conflicts with trunk").into());
     }
+
+    // The landing policy re-applies on requeue with the same exemption the
+    // failed item carried.
+    check_landing_policy(&commit_id, &trunk_commit_id, history::allow_stack(id)?)?;
 
     // Preserve create-before-delete crash safety. The cleanup and both audit
     // records happen below; a crash before then is recovered by the existing
@@ -3792,6 +4107,282 @@ pub fn delete(id_str: &str) -> Result<()> {
     .into())
 }
 
+/// Insert or replace one `jjq-<key>: <value>` trailer in a description,
+/// keeping the trailer block as the final lines.
+fn upsert_trailer(description: &str, key: &str, value: &str) -> String {
+    let trailer_line = format!("jjq-{}: {}", key, value);
+    let mut lines: Vec<String> = description.lines().map(str::to_string).collect();
+    if let Some(existing) = lines
+        .iter_mut()
+        .find(|line| line.starts_with(&format!("jjq-{}: ", key)))
+    {
+        *existing = trailer_line;
+        return lines.join("\n");
+    }
+    // Find the end of the trailer block: jjq-* lines at the tail.
+    let mut insert_at = lines.len();
+    while insert_at > 0
+        && lines[insert_at - 1]
+            .split_once(": ")
+            .is_some_and(|(prefix, _)| prefix.starts_with("jjq-"))
+    {
+        insert_at -= 1;
+    }
+    // A non-trailer last line needs a blank separator before the trailer
+    // block only if the description doesn't already end with one.
+    if insert_at > 0 && !lines[insert_at - 1].is_empty() {
+        lines.insert(insert_at, String::new());
+        insert_at += 1;
+    }
+    lines.insert(insert_at, trailer_line);
+    lines.join("\n")
+}
+
+/// Build the failure-marker description for a policy rejection. Mirrors
+/// `failure_description` with `jjq-failure: rejected`, an empty workspace
+/// (a rejection never materializes one), and the reason as its own trailer.
+fn reject_description(
+    id: u32,
+    entry: &queue::StateEntry,
+    trunk_commit_id: &str,
+    strategy: &Strategy,
+    reason: &str,
+) -> String {
+    let context = FailureContext {
+        candidate_change_id: &entry.change_id,
+        candidate_commit_id: &entry.commit_id,
+        trunk_commit_id,
+        workspace_path: std::path::Path::new(""),
+        strategy,
+    };
+    let desc = failure_description(id, "rejected", &context, &[]);
+    upsert_trailer(&desc, "reject-reason", reason)
+}
+
+/// Reject an item: mark it failed without running, with a reason. Accepts a
+/// queued item (moves it to failed) or an already-failed item (attaches or
+/// replaces the reason). The reason is the state bit the fix loop and
+/// `jjq wait` read: a failed item with a reason is terminal.
+pub fn reject(id_str: &str, reason: &str) -> Result<()> {
+    let id = queue::parse_seq_id(id_str)?;
+    // Single-line trailer value: collapse any whitespace runs.
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if reason.is_empty() {
+        return Err(ExitError::new(exit_codes::USAGE, "reason must not be empty").into());
+    }
+
+    require_initialized()?;
+    // The same pair of locks delete() takes, in the same order. Publication
+    // serializes the queue->failed move against the runner's claim rename:
+    // with only the mutation lock, reject could create the failed bookmark
+    // and then fail to delete a queue bookmark the runner just renamed,
+    // leaving dual state. Both are held across the snapshot and both
+    // bookmark mutations.
+    let _mutation_lock = Lock::acquire_blocking("mutation")?;
+    let _publication_lock = Lock::acquire_blocking("publication")?;
+
+    let state = queue::state_snapshot()?;
+    match state.state_for(id)? {
+        Some((queue::State::Queued, entry)) => {
+            let trunk_bookmark = config::get_trunk_bookmark()?;
+            let trunk_commit_id = jj::get_commit_id(&format!("bookmarks(exact:{})", trunk_bookmark))
+                .unwrap_or_default();
+            let strategy = config::snapshot()?
+                .ok_or_else(|| anyhow!("jjq metadata missing; run 'jjq doctor'"))?
+                .strategy()?;
+            // Marker commit: child of the candidate, described with the
+            // failure trailer block plus the reject reason.
+            let marker = jj::new_rev(&[&entry.commit_id])?;
+            let desc = reject_description(id, &entry, &trunk_commit_id, &strategy, &reason);
+            jj::describe(&marker, &desc)?;
+            // Create-before-delete, the same crash ordering as the run
+            // failure path: a crash here leaves both bookmarks and a retry
+            // finds the failed entry first.
+            jj::bookmark_create_internal(&queue::failed_bookmark(id), &marker)?;
+            jj::bookmark_delete(&queue::queue_bookmark(id))?;
+        }
+        Some((queue::State::Failed, entry)) => {
+            // Rewrite the failed marker's description, replacing any
+            // existing reject-reason trailer. The failed bookmark is the
+            // only pointer to this commit, so redescribing is safe.
+            let new_desc = upsert_trailer(&entry.description, "reject-reason", &reason);
+            jj::describe(&entry.commit_id, &new_desc)?;
+        }
+        Some((queue::State::Running, _)) => {
+            return Err(ExitError::new(
+                exit_codes::USAGE,
+                format!("item {} is running; cancel it first (jjq cancel {})", id, id),
+            )
+            .into());
+        }
+        None => {
+            return Err(ExitError::new(
+                exit_codes::USAGE,
+                format!("no queued or failed item {}", id),
+            )
+            .into());
+        }
+    }
+
+    let mut event = Event::new(id, kind::REJECTED);
+    event.failure_reason = Some(reason);
+    record_history(event)?;
+    Ok(())
+}
+
+/// The wait verdict for one candidate, checked in this order each poll:
+/// landed (handled inline in the poll loop, since it outranks everything),
+/// rejected, pending, unknown.
+enum Verdict {
+    /// A failed entry carries a recorded reject reason.
+    Rejected { id: u32, reason: String },
+    /// Queued, claimed, or failed without a reason: the fix loop may
+    /// still be working it.
+    Pending,
+    /// The candidate matches no queue state (and did not land).
+    Unknown,
+}
+
+/// Resolve the wait target tolerantly: run `jj log -r <input>` and accept
+/// exactly one distinct change ID. Divergent copies of one change dedupe to
+/// a single ID, which is fine — the landed check and classify both key on
+/// change ID. Any jj error, zero lines, or multiple distinct IDs is not a
+/// target; `wait` treats that as the Unknown verdict instead of crashing
+/// through the generic error path.
+fn wait_resolve_target(revset: &str) -> Option<String> {
+    let output = jj::run_ok_ignore_working_copy(&[
+        "log",
+        "-r",
+        revset,
+        "--no-graph",
+        "-T",
+        "change_id.short() ++ \"\\n\"",
+    ])
+    .ok()?;
+    let mut ids: Vec<&str> = output.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    match ids.len() {
+        1 => Some(ids[0].to_string()),
+        _ => None,
+    }
+}
+
+/// True when the candidate's change ID is an ancestor of (or at) trunk.
+/// Uses the `change_id()` revset function, not a bare symbol: a divergent
+/// change-ID symbol errors on resolution, and a jj error here means "not
+/// proven landed", which the caller treats as fall-through.
+fn wait_is_landed(change_id: &str, trunk: &str) -> Result<bool> {
+    let revset = format!("::bookmarks(exact:{}) & change_id({})", trunk, change_id);
+    let output = jj::run_ok_ignore_working_copy(&[
+        "log",
+        "-r",
+        &revset,
+        "--no-graph",
+        "-T",
+        "\"x\"",
+    ]);
+    match output {
+        Ok(text) => Ok(!text.trim().is_empty()),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Classify one queue-state snapshot against the resolved candidate. Exact
+/// short-ID matching only: resolution already normalized the input.
+fn wait_classify(state: &queue::StateSnapshot, change_id: &str) -> Result<Verdict> {
+    for entry in state.queued()? {
+        if entry.change_id == change_id {
+            return Ok(Verdict::Pending);
+        }
+    }
+    for entry in state.running()? {
+        if entry.change_id == change_id {
+            return Ok(Verdict::Pending);
+        }
+    }
+    for entry in state.failed()? {
+        let item = build_failed_item_from_state(entry.clone())?;
+        if item.candidate_change_id == change_id {
+            return Ok(if item.reject_reason.is_empty() {
+                Verdict::Pending
+            } else {
+                Verdict::Rejected {
+                    id: entry.id,
+                    reason: item.reject_reason,
+                }
+            });
+        }
+    }
+    Ok(Verdict::Unknown)
+}
+
+/// Wait for a candidate to reach a terminal verdict, then print it and exit:
+/// 0 landed, 1 rejected (reason and item ID on stdout), 2 unknown or timed
+/// out. This is the submitter's half of the feedback loop: a development
+/// agent runs `jjq push @ && jjq wait <change-id>` as a background task.
+pub fn wait(revset: &str, interval_secs: u64, timeout_secs: Option<u64>) -> Result<()> {
+    require_initialized()?;
+    let trunk = config::get_trunk_bookmark()?;
+    let deadline = timeout_secs
+        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+    let mut unknown_streak = 0u32;
+    loop {
+        // 0. Resolve the target inside the loop: the fixer may rewrite the
+        //    candidate mid-wait, and an unresolvable input is the Unknown
+        //    verdict, not a crash.
+        let Some(change_id) = wait_resolve_target(revset) else {
+            unknown_streak += 1;
+            if unknown_streak >= 2 {
+                return Err(ExitError::new(
+                    2,
+                    format!("revset '{}' does not resolve to one change", revset),
+                )
+                .into());
+            }
+            if wait_deadline_passed(deadline) {
+                return Err(ExitError::new(2, "timed out waiting for verdict").into());
+            }
+            std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+            continue;
+        };
+
+        // 1. Landed outranks any stale queue entry or rejection.
+        if wait_is_landed(&change_id, &trunk)? {
+            prefout(&format!("landed: {}", change_id));
+            return Ok(());
+        }
+
+        // 2/3. Classify one snapshot: rejected, pending, or unknown.
+        let state = queue::state_snapshot()?;
+        match wait_classify(&state, &change_id)? {
+            Verdict::Rejected { id, reason } => {
+                prefout(&format!("rejected: item {}: {}", id, reason));
+                return Err(ExitError::code_only(1).into());
+            }
+            Verdict::Pending => unknown_streak = 0,
+            Verdict::Unknown => {
+                unknown_streak += 1;
+                if unknown_streak >= 2 {
+                    return Err(ExitError::new(
+                        2,
+                        format!("no queue entry for {}", change_id),
+                    )
+                    .into());
+                }
+            }
+        }
+        if wait_deadline_passed(deadline) {
+            return Err(ExitError::new(2, "timed out waiting for verdict").into());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+    }
+}
+
+fn wait_deadline_passed(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|d| std::time::Instant::now() >= d)
+}
+
 /// Get or set configuration. Reads pin one metadata snapshot and take no
 /// lock; writes serialize inside config::set via the meta lock.
 pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
@@ -3810,6 +4401,10 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
                     .unwrap_or_else(|| "(not set)".to_string())
             );
             println!("strategy = {}", snapshot.strategy()?.as_str());
+            println!(
+                "require_single_revision = {}",
+                snapshot.require_single_revision()?
+            );
             Ok(())
         }
         (Some(k), None) => {
@@ -3828,6 +4423,7 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
                     "trunk_bookmark" => config::DEFAULT_TRUNK_BOOKMARK.to_string(),
                     "check_command" => String::new(),
                     "strategy" => config::DEFAULT_STRATEGY.as_str().to_string(),
+                    "require_single_revision" => "true".to_string(),
                     _ => unreachable!(),
                 };
                 println!("{}", value);
@@ -3838,6 +4434,7 @@ pub fn config(key: Option<&str>, value: Option<&str>) -> Result<()> {
                 "trunk_bookmark" => snapshot.trunk_bookmark()?,
                 "check_command" => snapshot.check_command()?.unwrap_or_default(),
                 "strategy" => snapshot.strategy()?.as_str().to_string(),
+                "require_single_revision" => snapshot.require_single_revision()?.to_string(),
                 _ => unreachable!(),
             };
             println!("{}", value);
@@ -4484,6 +5081,10 @@ pub fn clean() -> Result<()> {
 
     remove_legacy_filesystem_state()?;
 
+    // Standalone residue pass: abandon the recorded candidates of landed
+    // work that are still visible as leaves. Failures are warnings.
+    cleanup_residue()?;
+
     if removed == 0 {
         prefout("no workspaces to clean");
     } else {
@@ -4548,5 +5149,34 @@ mod process_liveness_tests {
         };
         assert!(!active_check_is_live(&check));
         child.wait().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod failed_item_tests {
+    use super::{build_failed_item_from_description, parse_failed_item_trailers};
+
+    #[test]
+    fn failed_item_parses_reject_reason_trailer() {
+        let desc = "Failed: merge 3 (rejected)\n\njjq-candidate: abc123\njjq-candidate-commit: def456\njjq-trunk: 789\njjq-workspace: \njjq-failure: rejected\njjq-strategy: rebase\njjq-reject-reason: 2 revisions atop trunk; squash and re-push";
+        let item = build_failed_item_from_description(3, desc).unwrap();
+        assert_eq!(item.reject_reason, "2 revisions atop trunk; squash and re-push");
+        assert_eq!(item.failure_reason, "rejected");
+    }
+
+    #[test]
+    fn failed_item_without_reject_reason_is_empty() {
+        let desc = "Failed: merge 3 (check)\n\njjq-candidate: abc123\njjq-candidate-commit: def456\njjq-trunk: 789\njjq-workspace: /tmp/ws\njjq-failure: check\njjq-strategy: rebase";
+        let item = build_failed_item_from_description(3, desc).unwrap();
+        assert!(item.reject_reason.is_empty());
+    }
+
+    #[test]
+    fn trailer_parsing_exposes_reject_reason_key() {
+        let trailers = parse_failed_item_trailers(
+            "Failed: merge 4 (rejected)\n\njjq-failure: rejected\njjq-reject-reason: nothing to land atop trunk",
+        );
+        assert_eq!(trailers.get("reject-reason").map(String::as_str), Some("nothing to land atop trunk"));
+        assert_eq!(trailers.get("failure").map(String::as_str), Some("rejected"));
     }
 }

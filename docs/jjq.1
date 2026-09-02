@@ -44,6 +44,18 @@ jjq \- local merge queue for jj
 .B jjq requeue
 .I id
 .br
+.B jjq reject
+.I id
+.B \-\-reason
+.I text
+.br
+.B jjq wait
+.I revset
+.RB [ \-\-interval
+.IR secs ]
+.RB [ \-\-timeout
+.IR secs ]
+.br
 .B jjq delete
 .I id
 .br
@@ -201,6 +213,16 @@ Returns 0 if all processed items succeeded (or the queue was empty). Returns 2
 if any items failed. Returns 1 if another queue runner is active, the check
 command is not configured, a conflict is detected, or trunk moved during
 processing.
+.PP
+After processing at least one item, and again in
+.BR "jjq clean" ,
+jjq abandons residue leaves: visible bookmark-less commits, no workspace's
+working copy, whose exact commit ID was recorded as the queued candidate of
+a submission that landed (the obsolete originals a failed first attempt
+leaves behind once a fix lands, reached through the requeue lineage).
+Matching is on commit ID, never change ID, so a divergent copy of a landed
+change that carries unlanded edits is kept. Abandoned and kept leaves are
+logged; cleanup failures are warnings and never fail the run.
 .SS cancel \fIid\fR
 Cancel a queued or running submission. Queued work is removed immediately.
 For a running item, jjq durably records intent and the owning runner terminates
@@ -326,6 +348,66 @@ confirmation messages.
 An item claimed by an active queue runner cannot be deleted until the
 run finishes; a stale claim left by a crashed runner is removed along
 with its leftover workspace.
+.SS reject \fIid\fR \fB\-\-reason \fItext\fR
+Mark an item failed without running it and record
+.IR text " as the reason."
+A queued item moves to the failed list; an already-failed item gains or
+replaces the reason. An item claimed by a runner is refused (suggest
+.BR "jjq cancel" ).
+The reason appears in
+.B status
+and
+.B "status \-\-json"
+as
+.BR reject_reason ,
+and is recorded durably as a
+.B rejected
+history event.
+.PP
+A failed item with a reason is terminal: policy rejections and escalated
+failures carry one, while bare check failures do not.
+The reason is stored as a single line; newlines collapse to spaces.
+.SS wait \fIrevset\fR [\fB\-\-interval \fIsecs\fR] [\fB\-\-timeout \fIsecs\fR]
+Block until the candidate reaches a terminal state, then print the verdict
+and exit. The candidate is identified by any revset that resolves to one
+change (a short change ID from
+.B push
+output is typical).
+Polls every
+.I secs
+seconds (default 10).
+Verdicts are checked in this order each poll:
+.RS
+.TP
+.B landed
+The candidate's change ID is an ancestor of trunk: exit 0. Landed takes
+precedence over any stale entry.
+.TP
+.B rejected
+A failed entry with a recorded reason exists: the reason and item ID are
+printed to stdout and the exit code is 1.
+.TP
+.B pending
+A queue entry, a running claim, or a failed entry without a reason exists:
+keep polling. A bare check failure is pending, not terminal.
+.TP
+.B unknown
+None of the above: exit 2 after two consecutive unknown polls.
+.RE
+.PP
+With
+.BR \-\-timeout ,
+exit 2 after that many seconds while still pending. The intended submitter
+pattern is a background task:
+.RS
+.nf
+jjq push @ && jjq wait <change\-id>
+.fi
+.RE
+After a landed verdict the working copy may sit on an obsolete revision
+(a fixer may have rewritten the candidate): run
+.B jj workspace update\-stale
+and start from trunk rather than resuming the old commit.
 .SS clean
 Remove jjq workspaces left behind by failed merges. Removes only the exact
 workspace names jjq generates (such as

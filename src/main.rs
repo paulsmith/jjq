@@ -42,6 +42,9 @@ enum Commands {
     Push {
         /// Revset expression resolving to exactly one revision
         revset: String,
+        /// Exempt a multi-revision stack from the single-revision policy
+        #[arg(long)]
+        allow_stack: bool,
     },
     /// Process the next item(s) in the queue
     Run {
@@ -79,6 +82,25 @@ enum Commands {
     Requeue {
         /// Sequence ID of the failed item
         id: String,
+    },
+    /// Reject an item: mark it failed without running, with a reason
+    Reject {
+        /// Sequence ID of the queued or failed item
+        id: String,
+        /// Why the item is rejected (shown to the submitter via status/wait)
+        #[arg(long)]
+        reason: String,
+    },
+    /// Wait for a candidate to reach a terminal verdict (landed or rejected)
+    Wait {
+        /// Revset or change ID of the pushed candidate
+        revset: String,
+        /// Poll period in seconds
+        #[arg(long, default_value_t = 10)]
+        interval: u64,
+        /// Give up after this many seconds (default: wait forever)
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Remove an item from queue or failed list
     Delete {
@@ -175,7 +197,10 @@ fn run() -> Result<()> {
         Commands::Init { trunk, check, strategy } => {
             commands::init(trunk.as_deref(), check.as_deref(), &strategy)
         }
-        Commands::Push { revset } => commands::push(&revset),
+        Commands::Push {
+            revset,
+            allow_stack,
+        } => commands::push(&revset, allow_stack),
         Commands::Run {
             all,
             stop_on_failure,
@@ -186,6 +211,12 @@ fn run() -> Result<()> {
             commands::status(id.as_deref(), json, resolve.as_deref())
         }
         Commands::Requeue { id } => commands::requeue(&id),
+        Commands::Reject { id, reason } => commands::reject(&id, &reason),
+        Commands::Wait {
+            revset,
+            interval,
+            timeout,
+        } => commands::wait(&revset, interval, timeout),
         Commands::Delete { id } => commands::delete(&id),
         Commands::Cancel { id } => commands::cancel(&id),
         Commands::History { id, change, json } => {

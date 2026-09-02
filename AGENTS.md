@@ -61,16 +61,18 @@ jjq stores all state in the jj repository itself:
 | Command | Function |
 |---------|----------|
 | `init [--trunk <bookmark>] [--check <cmd>] [--strategy <strategy>]` | Initialize jjq, set trunk, check command, and strategy |
-| `push <revset>` | Add revision to queue (idempotent: clears stale entries for same change ID; pushing the current workspace's @ moves the working copy to a new empty child) |
+| `push <revset> [--allow-stack]` | Add revision to queue (idempotent: clears stale entries for same change ID; pushing the current workspace's @ moves the working copy to a new empty child); by default refuses multi-revision candidates unless `--allow-stack` is given |
 | `run [--all] [--stop-on-failure] [--jobs N]` | Process next queue item, or all items in batch; merge batches may check up to N predicted states concurrently and still land FIFO |
 | `check [--rev <revset>] [-v]` | Run check command against a revision (default @); -v shows workspace/env details |
 | `status [id] [--json] [--resolve]` | Show running/queued items, recent failures (with conflicting file paths), and recently landed items; JSON output has `runner_active` (bool) plus `running`/`queue`/`failed`/`landed` arrays |
 | `requeue <id>` | Re-push a failed item back onto the queue (with pre-flight conflict check); refuses an item being processed; recovers a stale claim back to the queue |
+| `reject <id> --reason <text>` | Mark a queued or failed item as failed without running it, recording the reason; a failed item with a reason is terminal |
+| `wait <revset> [--interval] [--timeout]` | Block until the candidate lands (exit 0) or is rejected (exit 1, reason on stdout); unknown/timeout exits 2 |
 | `delete <id>` | Remove item from queue/failed; refuses an item being processed by an active runner (removes stale claims when the run lock is free) |
 | `cancel <id>` | Immediately remove queued work or cooperatively stop a running check; idempotent after cancellation |
 | `history [<id> | --change <change-id>] [--json]` | Show durable submission lifecycle events, including cancellation intent/outcome |
 | `config [key] [value]` | Get/set configuration |
-| `clean` | Remove all jjq-generated workspaces; refuses while a run or check is active |
+| `clean` | Remove all jjq-generated workspaces; refuses while a run or check is active; also runs the residue-cleanup pass |
 | `doctor [--fix]` | Validate config, conflicted jjq bookmarks, sequence counter, locks, stale claims, and workspace preconditions; `--fix` repairs a conflicted metadata bookmark (keeps the side with the highest `last_id`) |
 | `tail [--all] [--no-follow]` | View the last check output (with optional follow) |
 | `quickstart` | Print a short guide for LLM agents |
@@ -84,6 +86,15 @@ jjq stores all state in the jj repository itself:
 | 2 | `PARTIAL` | Batch run processed some items but left failures |
 | 3 | `LOCK_HELD` | Metadata lock still held after the wait timeout (a concurrent writer is stuck) |
 | 10 | `USAGE` | Bad arguments, invalid revset, duplicate push of an already-queued commit, or an item ID not found in queue or failed (`status`/`delete`/`requeue`) |
+
+### Config Keys
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `trunk_bookmark` | `main` | Bookmark pointing to trunk |
+| `check_command` | *(set during init)* | Command run on merge candidates |
+| `strategy` | `rebase` (new repos) | `rebase` or `merge` landing strategy |
+| `require_single_revision` | `true` | Refuse candidates that are more than one revision atop trunk at push/requeue/run; `--allow-stack` exempts a single item |
 
 ### Key Concepts
 

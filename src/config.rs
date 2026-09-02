@@ -48,7 +48,12 @@ impl TryFrom<&str> for Strategy {
 pub const DEFAULT_STRATEGY: Strategy = Strategy::Merge;
 
 /// Valid configuration keys.
-pub const VALID_KEYS: &[&str] = &["trunk_bookmark", "check_command", "strategy"];
+pub const VALID_KEYS: &[&str] = &[
+    "trunk_bookmark",
+    "check_command",
+    "strategy",
+    "require_single_revision",
+];
 
 /// Check if jjq is initialized (metadata bookmark exists).
 pub fn is_initialized() -> Result<bool> {
@@ -160,6 +165,29 @@ impl Snapshot {
             None => Ok(DEFAULT_STRATEGY),
         }
     }
+
+    /// Get the single-revision landing policy (default true when absent).
+    pub fn require_single_revision(&self) -> Result<bool> {
+        parse_bool(
+            self.config_values()?
+                .get("require_single_revision")
+                .map(String::as_str),
+        )
+    }
+}
+
+/// Parse a boolean config value; None (absent) means the default, true.
+/// Anything other than "true"/"false" is a damaged configuration.
+fn parse_bool(value: Option<&str>) -> Result<bool> {
+    match value {
+        None => Ok(true),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(anyhow::anyhow!(
+            "invalid boolean value for require_single_revision: {} (valid values: true, false)",
+            other
+        )),
+    }
 }
 
 /// Get the trunk bookmark name.
@@ -178,6 +206,15 @@ pub fn get_check_command() -> Result<Option<String>> {
     }
 }
 
+/// Get the single-revision landing policy. Defaults to true when the key is
+/// absent (including before initialization).
+pub fn get_require_single_revision() -> Result<bool> {
+    match snapshot()? {
+        Some(snap) => snap.require_single_revision(),
+        None => Ok(true),
+    }
+}
+
 /// Set a config value on the metadata branch.
 pub fn set(key: &str, value: &str) -> Result<()> {
     // Validate key
@@ -193,6 +230,16 @@ pub fn set(key: &str, value: &str) -> Result<()> {
     if key == "strategy" && Strategy::try_from(value).is_err() {
         bail!(
             "invalid value for strategy: {}\nvalid values: rebase, merge",
+            value
+        );
+    }
+
+    // Validate boolean values
+    if key == "require_single_revision"
+        && !matches!(value, "true" | "false")
+    {
+        bail!(
+            "invalid value for require_single_revision: {}\nvalid values: true, false",
             value
         );
     }

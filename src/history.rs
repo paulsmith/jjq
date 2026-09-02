@@ -22,6 +22,7 @@ pub mod kind {
     pub const RECOVERED: &str = "recovered";
     pub const CHECK_STARTED: &str = "check_started";
     pub const FAILED: &str = "failed";
+    pub const REJECTED: &str = "rejected";
     pub const SKIPPED_EMPTY: &str = "skipped_empty";
     pub const LANDED: &str = "landed";
     pub const REQUEUED: &str = "requeued";
@@ -62,6 +63,8 @@ pub struct Event {
     pub elapsed_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub related_sequence_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_stack: Option<bool>,
 }
 
 impl Event {
@@ -81,6 +84,7 @@ impl Event {
             conflict_paths: None,
             elapsed_ms: None,
             related_sequence_id: None,
+            allow_stack: None,
         }
     }
 }
@@ -207,6 +211,103 @@ pub fn read_by_change(change_id: &str) -> Result<Vec<(u32, Vec<Event>)>> {
         })
         .collect();
     Ok(submissions)
+}
+
+/// Collect the candidate commit IDs of every submission that contains a
+/// landed event, in one bulk scan. The residue-cleanup predicate keys on
+/// commit ID (not change ID): a divergent copy of a landed change can carry
+/// unlanded local edits, but a commit jjq itself queued for work that landed
+/// is byte-exactly the obsolete original.
+pub fn landed_candidate_commit_ids() -> Result<std::collections::HashSet<String>> {
+    let mut landed = std::collections::HashSet::new();
+    let Some(snapshot) = config::snapshot()? else {
+        return Ok(landed);
+    };
+    let mut files = snapshot.files_contents("history")?;
+    files.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut submissions: BTreeMap<u32, Vec<Event>> = BTreeMap::new();
+    for (path, contents) in files {
+        let Some(id_part) = path
+            .strip_prefix("history/")
+            .and_then(|p| p.split('/').next())
+        else {
+            continue;
+        };
+        let Ok(id) = id_part.parse::<u32>() else {
+            continue;
+        };
+        if id_part != queue::format_seq_id(id) {
+            continue;
+        }
+        if !path.ends_with(".json") {
+            continue;
+        }
+        submissions
+            .entry(id)
+            .or_default()
+            .push(decode_event(&path, &contents, None)?);
+    }
+    // Expand the landed set along requeue links: a submission whose
+    // candidate failed and was requeued belongs to the same work as the
+    // submission that eventually landed, so its recorded candidate commits
+    // (the obsolete originals) qualify too. The closure walks
+    // related_sequence_id in both directions.
+    let mut lineage: std::collections::HashSet<u32> = submissions
+        .iter()
+        .filter(|(_, events)| events.iter().any(|event| event.kind == kind::LANDED))
+        .map(|(id, _)| *id)
+        .collect();
+    loop {
+        let mut grew = false;
+        for (id, events) in &submissions {
+            if lineage.contains(id) {
+                continue;
+            }
+            let linked = events.iter().any(|event| {
+                event
+                    .related_sequence_id
+                    .is_some_and(|related| lineage.contains(&related))
+            });
+            if linked {
+                lineage.insert(*id);
+                grew = true;
+            }
+        }
+        for &seed in lineage.clone().iter() {
+            if let Some(events) = submissions.get(&seed) {
+                for event in events {
+                    if let Some(related) = event.related_sequence_id {
+                        if lineage.insert(related) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for (id, events) in &submissions {
+        if !lineage.contains(id) {
+            continue;
+        }
+        for event in events {
+            if let Some(commit_id) = &event.candidate_commit_id {
+                landed.insert(commit_id.clone());
+            }
+        }
+    }
+    Ok(landed)
+}
+
+/// True iff any recorded event for this submission carries the stack
+/// exemption. Requeues carry the exemption forward onto the fresh queued
+/// event, so any event is authoritative.
+pub fn allow_stack(id: u32) -> Result<bool> {
+    Ok(read(id)?
+        .iter()
+        .any(|event| event.allow_stack == Some(true)))
 }
 
 fn decode_event(path: &str, contents: &str, version_path: Option<&str>) -> Result<Event> {

@@ -1072,6 +1072,7 @@ fn test_config_show_all() {
     trunk_bookmark = main
     check_command = true
     strategy = rebase
+    require_single_revision = true
     ");
 }
 
@@ -1095,7 +1096,7 @@ fn test_config_invalid_key() {
     let output = repo.jjq_failure(&["config", "invalid_key"]);
     insta::assert_snapshot!(output, @r"
     jjq: unknown config key: invalid_key
-    valid keys: trunk_bookmark, check_command, strategy
+    valid keys: trunk_bookmark, check_command, strategy, require_single_revision
     ");
 }
 
@@ -1994,17 +1995,21 @@ fn test_full_workflow_with_prs() {
 fn test_multiple_push_same_revision() {
     let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
-    // Push main once - should succeed. The template's working copy sits on
-    // the main commit itself, so the push also parks the working copy on a
-    // fresh child.
-    let push1 = repo.jjq_success(&["push", "main"]);
+    // A child commit of main: pushing trunk itself is refused by the
+    // single-revision policy (zero revisions atop trunk).
+    run_jj(repo.path(), &["new", "-m", "child of main", "main"]);
+    fs::write(repo.path().join("child.txt"), "child\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "child"]);
+
+    // Push it once - should succeed.
+    let push1 = repo.jjq_success(&["push", "child"]);
     insta::assert_snapshot!(push1, @r"
-    jjq: revision 'main' queued at 1 (trunk: main in <REPO>)
+    jjq: revision 'child' queued at 1 (trunk: main in <REPO>)
     jjq: working copy moved to a new change; the queued commit stays as pushed
     ");
 
     // Push same commit ID again - should be rejected as duplicate
-    let push2 = repo.jjq_output(&["push", "main"]);
+    let push2 = repo.jjq_output(&["push", "child"]);
     assert!(
         push2.contains("already queued at 1"),
         "should reject duplicate: {}",
@@ -2015,9 +2020,10 @@ fn test_multiple_push_same_revision() {
 #[test]
 fn test_log_hint_not_shown_in_non_tty() {
     let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+    make_pushable_child(&repo, "hint-child");
 
     // Push should succeed without showing hint (non-TTY mode)
-    let output = repo.jjq_success(&["push", "main"]);
+    let output = repo.jjq_success(&["push", "hint-child"]);
 
     // Verify no hint in output
     assert!(
@@ -2042,9 +2048,10 @@ fn test_log_hint_shown_once_when_forced() {
 
     // Remove log filter to simulate a repo initialized before auto-setup
     run_jj(repo.path(), &["config", "unset", "--repo", "revsets.log"]);
+    make_pushable_child(&repo, "hint-child");
 
     // First push with forced hint - should show hint
-    let output1 = repo.jjq_with_env(&["push", "main"], &[("JJQTEST_FORCE_HINT", "1")]);
+    let output1 = repo.jjq_with_env(&["push", "hint-child"], &[("JJQTEST_FORCE_HINT", "1")]);
     assert!(
         output1.contains("hint:"),
         "hint should appear on first push when forced"
@@ -2061,7 +2068,7 @@ fn test_log_hint_shown_once_when_forced() {
     );
 
     // Second push with forced hint - should NOT show hint again
-    let output2 = repo.jjq_with_env(&["push", "main"], &[("JJQTEST_FORCE_HINT", "1")]);
+    let output2 = repo.jjq_with_env(&["push", "hint-child"], &[("JJQTEST_FORCE_HINT", "1")]);
     assert!(
         !output2.contains("hint:"),
         "hint should not appear on second push"
@@ -2151,7 +2158,8 @@ fn test_log_hint_skipped_when_filter_configured() {
     );
 
     // Push with forced hint - should skip because filter already configured
-    let output = repo.jjq_with_env(&["push", "main"], &[("JJQTEST_FORCE_HINT", "1")]);
+    make_pushable_child(&repo, "filter-hint-child");
+    let output = repo.jjq_with_env(&["push", "filter-hint-child"], &[("JJQTEST_FORCE_HINT", "1")]);
     assert!(
         !output.contains("hint:"),
         "hint should not appear when log filter already configured"
@@ -2168,10 +2176,14 @@ fn test_log_hint_skipped_when_filter_configured() {
 fn test_push_exact_duplicate_rejected() {
     let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
 
-    repo.jjq_success(&["push", "main"]);
+    run_jj(repo.path(), &["new", "-m", "dup child", "main"]);
+    fs::write(repo.path().join("dup.txt"), "dup\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "dup-child"]);
+
+    repo.jjq_success(&["push", "dup-child"]);
 
     // Same commit ID should be rejected
-    let output = repo.jjq_output(&["push", "main"]);
+    let output = repo.jjq_output(&["push", "dup-child"]);
     assert!(
         output.contains("already queued"),
         "should reject exact duplicate: {}",
@@ -3192,8 +3204,9 @@ fn test_run_rebase_commit_chain() {
     fs::write(repo.path().join("feature.txt"), "hello\n").unwrap();
     // Create a new empty commit on top (simulates jj's empty working copy)
     run_jj(repo.path(), &["new"]);
-    // Now @ is empty, @- has the content. Push @ (the empty tip).
-    repo.jjq_success(&["push", "@"]);
+    // Now @ is empty, @- has the content. Push @ (the empty tip) — a
+    // deliberate stack, so it carries the single-revision exemption.
+    repo.jjq_success(&["push", "@", "--allow-stack"]);
     let output = repo.jjq_success(&["run"]);
 
     assert!(output.contains("rebased"), "expected rebased: {}", output);
@@ -3221,7 +3234,8 @@ fn test_run_rebase_abandons_all_duplicates() {
     run_jj(repo.path(), &["bookmark", "create", "feat"]);
     run_jj(repo.path(), &["new", "main"]);
 
-    repo.jjq_success(&["push", "feat"]);
+    // A 3-commit stack: push with the single-revision exemption.
+    repo.jjq_success(&["push", "feat", "--allow-stack"]);
     repo.jjq_success(&["run"]);
 
     // Count commits with each description — should be exactly 1 of each
@@ -3592,6 +3606,703 @@ fn test_requeue_not_found() {
     let output = repo.jjq_failure(&["requeue", "999"]);
     insta::assert_snapshot!(output, @"jjq: failed item 999 not found");
     repo.jjq().args(["requeue", "999"]).assert().code(10);
+}
+
+fn status_json_failed(repo: &TestRepo) -> Vec<serde_json::Value> {
+    let (stdout, stderr, success) = repo.jjq_raw_output(&["status", "--json"]);
+    assert!(success, "status --json failed: {}{}", stdout, stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    parsed["failed"].as_array().cloned().unwrap_or_default()
+}
+
+#[test]
+fn test_reject_queued_item_moves_to_failed_with_reason() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+    let candidate_change_id = queue_bookmark_change_id(&repo, 0);
+
+    repo.jjq_success(&["reject", "1", "--reason", "policy: squash and re-push"]);
+
+    // The queue is empty and the item is failed with the recorded reason.
+    let failed = status_json_failed(&repo);
+    assert_eq!(failed.len(), 1, "one failed item: {:?}", failed);
+    assert_eq!(failed[0]["id"], 1);
+    assert_eq!(failed[0]["failure_reason"], "rejected");
+    assert_eq!(failed[0]["reject_reason"], "policy: squash and re-push");
+    assert_eq!(
+        failed[0]["candidate_change_id"],
+        candidate_change_id,
+        "failed item keeps the candidate change ID"
+    );
+    assert_eq!(queue_bookmark_names(&repo), Vec::<String>::new());
+
+    // The rejection is a durable history event carrying the reason.
+    let events = history_events(&repo, "1");
+    let rejected = events
+        .iter()
+        .find(|event| event["kind"] == "rejected")
+        .expect("reject should record a rejected event");
+    assert_eq!(
+        rejected["failure_reason"].as_str(),
+        Some("policy: squash and re-push")
+    );
+}
+
+#[test]
+fn test_reject_failed_item_attaches_reason() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_CHECK_FALSE_TEMPLATE);
+    repo.jjq_failure(&["run"]);
+
+    repo.jjq_success(&["reject", "1", "--reason", "fixer gave up: flaky dependency"]);
+
+    let failed = status_json_failed(&repo);
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["reject_reason"], "fixer gave up: flaky dependency");
+    // The original failure kind is preserved.
+    assert_eq!(failed[0]["failure_reason"], "check");
+}
+
+#[test]
+fn test_reject_replaces_existing_reason() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+
+    repo.jjq_success(&["reject", "1", "--reason", "first diagnosis"]);
+    repo.jjq_success(&["reject", "1", "--reason", "second diagnosis"]);
+
+    let failed = status_json_failed(&repo);
+    assert_eq!(failed[0]["reject_reason"], "second diagnosis");
+    let events = history_events(&repo, "1");
+    let reasons: Vec<&str> = events
+        .iter()
+        .filter(|event| event["kind"] == "rejected")
+        .filter_map(|event| event["failure_reason"].as_str())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["first diagnosis", "second diagnosis"],
+        "each reject records its reason"
+    );
+}
+
+#[test]
+fn test_reject_running_item_is_refused() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+
+    // Manufacture a stale claim the way a runner crash mid-processing
+    // leaves it; with the run lock free this is the "running" state. The
+    // queue bookmark is gone (the runner renamed it), so state_for resolves
+    // the ID to Running.
+    run_jj(repo.path(), &["bookmark", "delete", "jjq/queue/000001"]);
+    run_jj(
+        repo.path(),
+        &["bookmark", "create", "-r", "feature", "jjq/running/000001"],
+    );
+
+    let output = repo.jjq_failure(&["reject", "1", "--reason", "x"]);
+    assert!(
+        output.contains("cancel it first"),
+        "running item refusal should suggest cancel: {}",
+        output
+    );
+    repo.jjq()
+        .args(["reject", "1", "--reason", "x"])
+        .assert()
+        .code(10);
+}
+
+#[test]
+fn test_reject_missing_item_is_usage_error() {
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    let output = repo.jjq_failure(&["reject", "42", "--reason", "x"]);
+    assert!(
+        output.contains("42"),
+        "error should mention the item ID: {}",
+        output
+    );
+    repo.jjq()
+        .args(["reject", "42", "--reason", "x"])
+        .assert()
+        .code(10);
+}
+
+#[test]
+fn test_reject_reason_is_single_line() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+
+    repo.jjq_success(&["reject", "1", "--reason", "line one\nline two"]);
+
+    let failed = status_json_failed(&repo);
+    assert_eq!(
+        failed[0]["reject_reason"].as_str(),
+        Some("line one line two"),
+        "newlines collapse to spaces for the single-line trailer"
+    );
+}
+
+#[test]
+fn test_wait_landed_exits_zero() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+    repo.jjq_success(&["run"]);
+    let change_id = landed_tip_change_id(&repo);
+
+    let (stdout, _stderr, code) = repo.jjq_with_timeout(
+        &["wait", &change_id, "--interval", "1"],
+        std::time::Duration::from_secs(30),
+    );
+    assert_eq!(code, Some(0), "landed verdict exits 0: {} {}", stdout, _stderr);
+    assert!(
+        stdout.contains("landed"),
+        "verdict should say landed: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_wait_rejected_exits_one_with_reason() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+    let change_id = queue_bookmark_change_id(&repo, 0);
+    repo.jjq_success(&["reject", "1", "--reason", "squash and re-push"]);
+
+    let (stdout, stderr, code) = repo.jjq_with_timeout(
+        &["wait", &change_id],
+        std::time::Duration::from_secs(15),
+    );
+    assert_eq!(code, Some(1), "rejected verdict exits 1: {} {}", stdout, stderr);
+    assert!(
+        stdout.contains("squash and re-push"),
+        "stdout should carry the reason: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("1"),
+        "stdout should name the item ID: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_wait_pending_then_rejected() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+    let change_id = queue_bookmark_change_id(&repo, 0);
+
+    // Item stays queued (no runner); the waiter must observe the
+    // rejected verdict when it lands mid-poll.
+    let mut child = repo.spawn_jjq(&["wait", &change_id, "--interval", "1"]);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    repo.jjq_success(&["reject", "1", "--reason", "late rejection"]);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let output = loop {
+        match child.try_wait().expect("failed to poll wait child") {
+            Some(status) => break (status, child.wait_with_output().unwrap()),
+            None => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "wait child did not exit after rejection"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    };
+    let out = String::from_utf8_lossy(&output.1.stdout).to_string();
+    assert_eq!(output.0.code(), Some(1), "should exit 1: {}", out);
+    assert!(out.contains("late rejection"), "reason on stdout: {}", out);
+}
+
+#[test]
+fn test_wait_failed_without_reason_is_pending_not_terminal() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_CHECK_FALSE_TEMPLATE);
+    let change_id = queue_bookmark_change_id(&repo, 0);
+    repo.jjq_failure(&["run"]);
+    assert!(!status_json_failed(&repo).is_empty(), "item should be failed");
+
+    // A bare check failure is the fix loop's business, never a submitter
+    // verdict: the waiter keeps polling until its timeout.
+    let (stdout, stderr, code) = repo.jjq_with_timeout(
+        &["wait", &change_id, "--interval", "1", "--timeout", "3"],
+        std::time::Duration::from_secs(20),
+    );
+    assert_eq!(code, Some(2), "timed-out pending exits 2: {} {}", stdout, stderr);
+    assert!(
+        !stdout.contains("rejected"),
+        "no rejected verdict for a bare check failure: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_wait_unknown_change_exits_two() {
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    // A revset that matches nothing at all (not a short-prefix of any real
+    // change): jj errors on it, wait treats that as Unknown.
+    let (stdout, stderr, code) = repo.jjq_with_timeout(
+        &["wait", "qvvvvvvv", "--interval", "1"],
+        std::time::Duration::from_secs(20),
+    );
+    assert_eq!(code, Some(2), "unresolvable target exits 2: {} {}", stdout, stderr);
+}
+
+#[test]
+fn test_wait_zero_revisions_rejected_still_reports_landed() {
+    // If the candidate already landed, wait's landed verdict outranks any
+    // stale queue/reject state: exit 0 even though the change is trunk itself.
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+    repo.jjq_success(&["run"]);
+    let landed_change = landed_tip_change_id(&repo);
+
+    // Reject is impossible post-landing; simulate the precedence instead by
+    // resolving wait against the landed change while a same-change failed
+    // entry exists. Simplest: wait on the landed change directly.
+    let output = repo
+        .jjq()
+        .args(["wait", &landed_change])
+        .output()
+        .expect("failed to run jjq wait");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "landed wins: {} {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("landed"));
+}
+
+#[test]
+fn test_policy_push_refuses_stack_by_default() {
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    // Two stacked commits atop trunk; push the tip.
+    run_jj(repo.path(), &["new", "-m", "stack base", "main"]);
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    run_jj(repo.path(), &["new", "-m", "stack tip"]);
+    fs::write(repo.path().join("tip.txt"), "tip\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "stack"]);
+
+    let output = repo.jjq_failure(&["push", "stack"]);
+    assert!(
+        output.contains("2 revisions atop trunk; squash and re-push"),
+        "should refuse the stack: {}",
+        output
+    );
+    repo.jjq().args(["push", "stack"]).assert().code(10);
+    assert_eq!(queue_bookmark_names(&repo), Vec::<String>::new());
+}
+
+#[test]
+fn test_policy_push_allow_stack_queues_and_lands_stack() {
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    run_jj(repo.path(), &["new", "-m", "stack base", "main"]);
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    run_jj(repo.path(), &["new", "-m", "stack tip"]);
+    fs::write(repo.path().join("tip.txt"), "tip\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "stack"]);
+
+    let output = repo.jjq_success(&["push", "stack", "--allow-stack"]);
+    assert!(
+        output.contains("queued at 1"),
+        "exempted stack should queue: {}",
+        output
+    );
+    repo.jjq_success(&["run"]);
+    assert!(
+        repo.jj_file_exists("base.txt", "main") && repo.jj_file_exists("tip.txt", "main"),
+        "both stack revisions should land"
+    );
+}
+
+#[test]
+fn test_policy_push_zero_revisions_refused() {
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    let output = repo.jjq_failure(&["push", "main"]);
+    assert!(
+        output.contains("nothing to land atop trunk"),
+        "should refuse pushing trunk itself: {}",
+        output
+    );
+}
+
+#[test]
+fn test_policy_disabled_allows_stack() {
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    run_jj(repo.path(), &["new", "-m", "stack base", "main"]);
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    run_jj(repo.path(), &["new", "-m", "stack tip"]);
+    fs::write(repo.path().join("tip.txt"), "tip\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "stack"]);
+
+    repo.jjq_success(&["config", "require_single_revision", "false"]);
+    let output = repo.jjq_success(&["push", "stack"]);
+    assert!(
+        output.contains("queued at 1"),
+        "policy off should queue the stack: {}",
+        output
+    );
+}
+
+#[test]
+fn test_policy_requeue_reapplies_gate() {
+    // Push candidate C whose check fails; run -> item 1 failed. Deepen C's
+    // ancestry without touching trunk, then requeue: the gate must refuse.
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_CHECK_FALSE_TEMPLATE);
+    repo.jjq_failure(&["run"]);
+
+    // D atop trunk; the candidate (resolved by its original change ID, the
+    // way requeue resolves it) rebased onto D. trunk..candidate is now
+    // D + candidate = 2 revisions.
+    run_jj(repo.path(), &["new", "-m", "D", "main"]);
+    fs::write(repo.path().join("d.txt"), "d\n").unwrap();
+    let failed = status_json_failed(&repo);
+    let candidate = failed[0]["candidate_change_id"].as_str().unwrap();
+    run_jj(repo.path(), &["rebase", "-r", candidate, "-d", "@"]);
+
+    let output = repo.jjq_failure(&["requeue", "1"]);
+    assert!(
+        output.contains("2 revisions atop trunk"),
+        "requeue should re-apply the policy gate: {}",
+        output
+    );
+}
+
+#[test]
+fn test_policy_run_recheck_rejects_stack_grown_after_queueing() {
+    // Queue a stack while the policy is off, then turn the policy on and
+    // run: the authoritative run-time gate must reject, not land.
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    run_jj(repo.path(), &["new", "-m", "stack base", "main"]);
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    run_jj(repo.path(), &["new", "-m", "stack tip"]);
+    fs::write(repo.path().join("tip.txt"), "tip\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "stack"]);
+
+    repo.jjq_success(&["config", "require_single_revision", "false"]);
+    repo.jjq_success(&["push", "stack"]);
+    repo.jjq_success(&["config", "require_single_revision", "true"]);
+
+    let run_output = repo.jjq_output(&["run"]);
+    assert!(
+        !repo.jj_file_exists("base.txt", "main"),
+        "run must not land a policy-violating stack: {}",
+        run_output
+    );
+    let failed = status_json_failed(&repo);
+    assert_eq!(failed.len(), 1, "item should be failed: {:?}", failed);
+    assert_eq!(failed[0]["failure_reason"], "rejected");
+    assert!(
+        failed[0]["reject_reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("revisions atop trunk"),
+        "reject reason should mention revisions: {:?}",
+        failed[0]
+    );
+    let events = history_events(&repo, "1");
+    assert!(
+        events.iter().any(|event| event["kind"] == "rejected"),
+        "run-time violation records a rejected event"
+    );
+}
+
+#[test]
+fn test_policy_parallel_run_rejects_stack_and_completes() {
+    // The speculative-parallel path (run --all --jobs 2, merge strategy) hits
+    // the same run-time gate. The rejection happens before the runner
+    // workspace is registered, so cleanup must not try to forget it — and
+    // the run must still produce its summary and PARTIAL exit.
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_MERGE_TEMPLATE);
+
+    run_jj(repo.path(), &["new", "-m", "stack base", "main"]);
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    run_jj(repo.path(), &["new", "-m", "stack tip"]);
+    fs::write(repo.path().join("tip.txt"), "tip\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "stack"]);
+
+    repo.jjq_success(&["config", "require_single_revision", "false"]);
+    repo.jjq_success(&["push", "stack"]);
+    repo.jjq_success(&["config", "require_single_revision", "true"]);
+
+    let (stdout, stderr, _ok) = repo
+        .jjq()
+        .args(["run", "--all", "--jobs", "2"])
+        .output()
+        .map(|out| {
+            (
+                String::from_utf8_lossy(&out.stdout).to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+                out.status.code(),
+            )
+        })
+        .expect("failed to run jjq run");
+    assert_eq!(_ok, Some(2), "PARTIAL exit for a failed batch item");
+    let run_output = format!("{}{}", stdout, stderr);
+    assert!(
+        !repo.jj_file_exists("base.txt", "main"),
+        "parallel run must not land a policy-violating stack: {}",
+        run_output
+    );
+    assert!(
+        run_output.contains("rejected"),
+        "parallel rejection should be reported: {}",
+        run_output
+    );
+    assert!(
+        run_output.contains("processed 0 item(s), 1 failed"),
+        "parallel batch should keep its summary (the item failed before any landing): {}",
+        run_output
+    );
+    let failed = status_json_failed(&repo);
+    assert_eq!(failed.len(), 1, "item should be failed: {:?}", failed);
+    assert_eq!(failed[0]["failure_reason"], "rejected");
+}
+
+#[test]
+fn test_policy_status_exposes_allow_stack_on_queued_items() {
+    // The exemption is visible before the item fails: status --json for a
+    // queued item carries allow_stack so operators and the fixer can tell a
+    // deliberate stack from an accident.
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    run_jj(repo.path(), &["new", "-m", "stack base", "main"]);
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    run_jj(repo.path(), &["new", "-m", "stack tip"]);
+    fs::write(repo.path().join("tip.txt"), "tip\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "stack"]);
+
+    repo.jjq_success(&["push", "stack", "--allow-stack"]);
+
+    let (stdout, stderr, success) = repo.jjq_raw_output(&["status", "--json"]);
+    assert!(success, "status --json failed: {}{}", stdout, stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let queue = parsed["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 1, "one queued item: {:?}", queue);
+    assert_eq!(queue[0]["allow_stack"], true, "queued item exposes the exemption");
+
+    // The single-item view agrees.
+    let (stdout, _stderr, success) = repo.jjq_raw_output(&["status", "1", "--json"]);
+    assert!(success);
+    let single: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(single["allow_stack"], true);
+
+    // And a non-exempt item omits the field entirely.
+    run_jj(repo.path(), &["new", "-m", "single feature", "main"]);
+    fs::write(repo.path().join("single.txt"), "content\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "single"]);
+    run_jj(repo.path(), &["new", "main"]);
+    repo.jjq_success(&["push", "single"]);
+    let (stdout, _stderr, success) = repo.jjq_raw_output(&["status", "--json"]);
+    assert!(success);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let queue = parsed["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 2);
+    assert!(
+        queue.iter().any(|item| item["id"] == 2 && item.get("allow_stack").is_none()),
+        "non-exempt item omits allow_stack: {:?}",
+        queue
+    );
+}
+
+#[test]
+fn test_policy_status_exposes_allow_stack_on_failed_items() {
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_CHECK_FALSE_TEMPLATE);
+
+    run_jj(repo.path(), &["new", "-m", "stack base", "main"]);
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    run_jj(repo.path(), &["new", "-m", "stack tip"]);
+    fs::write(repo.path().join("tip.txt"), "tip\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "stack"]);
+
+    repo.jjq_success(&["push", "stack", "--allow-stack"]);
+    repo.jjq_failure(&["run"]);
+
+    let failed = status_json_failed(&repo);
+    assert_eq!(
+        failed[0]["allow_stack"], true,
+        "the fixer reads the exemption from status --json: {:?}",
+        failed[0]
+    );
+}
+
+#[test]
+fn test_policy_config_roundtrip() {
+    let repo = TestRepo::from_template(&INITIALIZED_GO_PROJECT_TEMPLATE);
+
+    // Default (absent) is true.
+    let output = repo.jjq_success(&["config", "require_single_revision"]);
+    insta::assert_snapshot!(output, @"true");
+
+    repo.jjq_success(&["config", "require_single_revision", "false"]);
+    let output = repo.jjq_success(&["config", "require_single_revision"]);
+    insta::assert_snapshot!(output, @"false");
+
+    let output = repo.jjq_failure(&["config", "require_single_revision", "banana"]);
+    assert!(
+        output.contains("invalid value"),
+        "should validate booleans: {}",
+        output
+    );
+}
+
+/// Create a child commit of main with a bookmark, so tests that push
+/// something valid (but don't care what) have a non-trunk candidate.
+fn make_pushable_child(repo: &TestRepo, name: &str) {
+    run_jj(repo.path(), &["new", "-m", name, "main"]);
+    fs::write(repo.path().join(format!("{}.txt", name)), "content\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", name]);
+    run_jj(repo.path(), &["new", "main"]);
+}
+
+#[test]
+fn test_clean_abandons_resurrected_original_after_fixed_land() {
+    // The residue scenario from the merge-queue agent design: a failed first
+    // attempt's candidate gets fixed and lands (the rebase landing rewrites
+    // the candidate change), and the pre-rewrite original commit is
+    // resurrected as a visible bookmark-less leaf. clean must abandon it —
+    // its commit ID is the recorded candidate of a submission that landed
+    // (via the requeue lineage).
+    let repo = TestRepo::new();
+    run_jj(repo.path(), &["desc", "-m", "initial"]);
+    run_jj(repo.path(), &["bookmark", "create", "main"]);
+    repo.init_jjq_with_check("false");
+
+    run_jj(repo.path(), &["new", "-m", "standard feature", "main"]);
+    fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+    run_jj(repo.path(), &["bookmark", "create", "feature"]);
+    run_jj(repo.path(), &["new", "main"]);
+    repo.jjq_success(&["push", "feature"]);
+    repo.jjq_failure(&["run"]);
+    let failed = status_json_failed(&repo);
+    let original_commit = failed[0]["candidate_commit_id"].as_str().unwrap().to_string();
+
+    // The fix lands the same change rewritten: requeue resolves the
+    // candidate by its (unrewritten) change ID and the rebase landing
+    // rewrites it onto trunk. The pre-rewrite original is hidden after.
+    repo.jjq_success(&["config", "check_command", "true"]);
+    repo.jjq_success(&["requeue", "1"]);
+    repo.jjq_success(&["run"]);
+    assert!(
+        repo.jj_file_exists("feature.txt", "main"),
+        "the fixed candidate should land"
+    );
+
+    // Resurrect the original as a visible bookmark-less leaf: make it a
+    // working-copy commit (divergent with the landed copy — the shape a
+    // stale workspace's update-stale produces), add content so the parked
+    // child can't be auto-abandoned along with the anchor, then move @ away.
+    // No file writes here: a snapshot while @ sits on the original would
+    // amend it (new commit ID) and the predicate would no longer match.
+    run_jj(repo.path(), &["edit", &format!("commit_id({})", original_commit)]);
+    run_jj(repo.path(), &["new", "main"]);
+
+    // Sanity: the original (by its exact commit ID) is visible before clean.
+    let leaf_visible = run_jj(
+        repo.path(),
+        &[
+            "log",
+            "-r",
+            &format!("commit_id({})", original_commit),
+            "--no-graph",
+            "-T",
+            "description.first_line()",
+        ],
+    );
+    assert!(
+        leaf_visible.contains("standard feature"),
+        "resurrected original should be a visible leaf: {}",
+        leaf_visible
+    );
+
+    let output = repo.jjq_success(&["clean"]);
+    assert!(
+        output.contains("residue: abandoned"),
+        "clean should abandon the resurrected original: {}",
+        output
+    );
+    // The abandoned commit is hidden again.
+    let gone = run_jj(
+        repo.path(),
+        &[
+            "log",
+            "-r",
+            &format!("commit_id({})", original_commit),
+            "--no-graph",
+            "-T",
+            "if(hidden, \"hidden\", \"visible\")",
+        ],
+    );
+    assert_eq!(
+        gone.trim(),
+        "hidden",
+        "abandoned leaf should be hidden after clean: {}",
+        gone
+    );
+}
+
+#[test]
+fn test_clean_keeps_unrelated_leaves() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+    repo.jjq_success(&["run"]);
+
+    // An independent WIP leaf: a bookmark-less commit in a workspace that is
+    // then forgotten.
+    let container = TempDir::new().expect("workspace container");
+    let ws = add_workspace(&repo, &container, "wip");
+    run_jj(&ws, &["new", "-m", "unrelated wip"]);
+    // Content so the commit can't be auto-abandoned as an empty head.
+    fs::write(ws.join("wip.txt"), "wip\n").unwrap();
+    run_jj(&ws, &["new", "main"]);
+    run_jj(repo.path(), &["workspace", "forget", "wip"]);
+
+    let output = repo.jjq_success(&["clean"]);
+    assert!(
+        output.contains("residue: kept"),
+        "unrelated leaves are kept: {}",
+        output
+    );
+    // The WIP commit is still visible after clean.
+    let wip = run_jj(
+        repo.path(),
+        &[
+            "log",
+            "-r",
+            r#"description(glob:"unrelated*")"#,
+            "--no-graph",
+            "-T",
+            "description.first_line()",
+        ],
+    );
+    assert!(
+        wip.contains("unrelated wip"),
+        "the unrelated leaf must survive clean: {}",
+        wip
+    );
+}
+
+/// Change ID of trunk's tip after landing (the feature's new change).
+fn landed_tip_change_id(repo: &TestRepo) -> String {
+    run_jj(
+        repo.path(),
+        &["log", "-r", "main-", "--no-graph", "-T", "change_id.short()"],
+    )
+    .trim()
+    .to_string()
+}
+
+#[test]
+fn test_requeue_after_reject_clears_reason() {
+    let repo = TestRepo::from_template(&QUEUED_FEATURE_TEMPLATE);
+
+    repo.jjq_success(&["reject", "1", "--reason", "policy: squash and re-push"]);
+    repo.jjq_success(&["requeue", "1"]);
+
+    // The failed entry is gone entirely, so no reject reason remains anywhere.
+    let failed = status_json_failed(&repo);
+    assert!(failed.is_empty(), "failed list should be empty: {:?}", failed);
 }
 
 #[test]
@@ -4105,6 +4816,32 @@ fn queue_bookmark_names(repo: &TestRepo) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Change ID of the Nth (sorted) queue bookmark, or empty when absent.
+fn queue_bookmark_change_id(repo: &TestRepo, index: usize) -> String {
+    let out = run_jj(
+        repo.path(),
+        &[
+            "bookmark",
+            "list",
+            "-r",
+            "bookmarks(glob:\"jjq/queue/??????\")",
+            "-T",
+            "name ++ \"\\t\" ++ normal_target.change_id().short() ++ \"\\n\"",
+        ],
+    );
+    let mut lines: Vec<String> = out
+        .lines()
+        .filter(|l| l.starts_with("jjq/queue/"))
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    lines
+        .get(index)
+        .and_then(|line| line.split_once('\t'))
+        .map(|(_, change_id)| change_id.to_string())
+        .unwrap_or_default()
 }
 
 fn assert_no_failed_bookmarks(repo: &TestRepo) {

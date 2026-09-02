@@ -12,6 +12,8 @@ SSYYNNOOPPSSIISS
        jjjjqq hhiissttoorryy [_i_d] [----jjssoonn]
        jjjjqq hhiissttoorryy ----cchhaannggee _c_h_a_n_g_e___i_d [----jjssoonn]
        jjjjqq rreeqquueeuuee _i_d
+       jjjjqq rreejjeecctt _i_d ----rreeaassoonn _t_e_x_t
+       jjjjqq wwaaiitt _r_e_v_s_e_t [----iinntteerrvvaall _s_e_c_s] [----ttiimmeeoouutt _s_e_c_s]
        jjjjqq ddeelleettee _i_d
        jjjjqq ccaanncceell _i_d
        jjjjqq cclleeaann
@@ -119,6 +121,16 @@ CCOOMMMMAANNDDSS
        active, the check command is not configured, a conflict is detected, or
        trunk moved during processing.
 
+       After processing at least one item, and again in jjjjqq cclleeaann, jjq
+       abandons residue leaves: visible bookmark-less commits, no workspace's
+       working copy, whose exact commit ID was recorded as the queued
+       candidate of a submission that landed (the obsolete originals a failed
+       first attempt leaves behind once a fix lands, reached through the
+       requeue lineage).  Matching is on commit ID, never change ID, so a
+       divergent copy of a landed change that carries unlanded edits is kept.
+       Abandoned and kept leaves are logged; cleanup failures are warnings and
+       never fail the run.
+
    ccaanncceell _i_d
        Cancel a queued or running submission. Queued work is removed
        immediately.  For a running item, jjq durably records intent and the
@@ -202,6 +214,47 @@ CCOOMMMMAANNDDSS
        confirmation messages.  An item claimed by an active queue runner
        cannot be deleted until the run finishes; a stale claim left by a
        crashed runner is removed along with its leftover workspace.
+
+   rreejjeecctt _i_d ----rreeaassoonn _t_e_x_t
+       Mark an item failed without running it and record _t_e_x_t as the reason.
+       A queued item moves to the failed list; an already-failed item gains or
+       replaces the reason. An item claimed by a runner is refused (suggest
+       jjjjqq ccaanncceell).  The reason appears in ssttaattuuss and ssttaattuuss ----jjssoonn as
+       rreejjeecctt__rreeaassoonn, and is recorded durably as a rreejjeecctteedd history event.
+
+       A failed item with a reason is terminal: policy rejections and
+       escalated failures carry one, while bare check failures do not.  The
+       reason is stored as a single line; newlines collapse to spaces.
+
+   wwaaiitt _r_e_v_s_e_t [----iinntteerrvvaall _s_e_c_s] [----ttiimmeeoouutt _s_e_c_s]
+       Block until the candidate reaches a terminal state, then print the
+       verdict and exit. The candidate is identified by any revset that
+       resolves to one change (a short change ID from ppuusshh output is typical).
+       Polls every _s_e_c_s seconds (default 10).  Verdicts are checked in this
+       order each poll:
+
+              llaannddeedd The candidate's change ID is an ancestor of trunk: exit
+                     0. Landed takes precedence over any stale entry.
+
+              rreejjeecctteedd
+                     A failed entry with a recorded reason exists: the reason
+                     and item ID are printed to stdout and the exit code is 1.
+
+              ppeennddiinngg
+                     A queue entry, a running claim, or a failed entry without
+                     a reason exists: keep polling. A bare check failure is
+                     pending, not terminal.
+
+              uunnkknnoowwnn
+                     None of the above: exit 2 after two consecutive unknown
+                     polls.
+
+       With ----ttiimmeeoouutt, exit 2 after that many seconds while still pending. The
+       intended submitter pattern is a background task:
+              jjq push @ && jjq wait <change-id>
+       After a landed verdict the working copy may sit on an obsolete revision
+       (a fixer may have rewritten the candidate): run jjjj wwoorrkkssppaaccee
+       uuppddaattee--ssttaallee and start from trunk rather than resuming the old commit.
 
    cclleeaann
        Remove jjq workspaces left behind by failed merges. Removes only the

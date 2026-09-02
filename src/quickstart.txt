@@ -24,9 +24,28 @@ CORE COMMANDS
   jjq tail            View check command output (follows by default)
 
 AS AN AGENT
-  Your job is to push finished work to the queue. You don't run it.
-    jjq push @          Queue your current change
-    jjq status          Check if your change merged or failed
+  Your job is to push finished work to the queue and wait for the verdict.
+  You don't run the queue.
+    jjq push @ && jjq wait <change-id>
+  Run the wait as a background task so the queue drains while you work.
+  wait exit codes: 0 = landed, 1 = rejected (reason and item ID on stdout),
+  2 = unknown target or timed out. A bare check failure is pending, not a
+  verdict — the item may be fixed and land later. After a landed verdict
+  your working copy may sit on an obsolete revision: run
+  jj workspace update-stale and start from trunk.
+
+LANDING POLICY
+  One squashed revision per unit of work: pushing more than one revision
+  atop trunk is refused ("n revisions atop trunk; squash and re-push"),
+  and pushing trunk itself is refused ("nothing to land atop trunk").
+  A deliberate stack needs jjq push --allow-stack (recorded on the item,
+  visible in status --json). Requeue re-runs the same gate.
+
+UNFIXABLE FAILURES
+  When an item cannot be fixed, record why:
+    jjq reject <id> --reason "<diagnosis>"
+  The reason reaches the submitter through status and wait (exit 1).
+  Requeue or delete remains the human override for rejected items.
 
 RESOLVING FAILURES
   If your push was marked failed (conflict or check failure):

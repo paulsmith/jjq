@@ -109,10 +109,39 @@ and then rebases the branch onto the latest trunk before moving the trunk
 bookmark. With the `merge` strategy, jjq creates a merge commit with the current
 trunk and the queued tip as parents.
 
+By default (`require_single_revision = true`) the candidate must be a single
+squashed revision atop trunk: pushing more than one revision is refused with
+"n revisions atop trunk; squash and re-push", and pushing trunk itself with
+"nothing to land atop trunk". To queue a deliberate stack, pass
+`--allow-stack`:
+
+```sh
+jjq push feature --allow-stack   # exempt this one item from the policy
+```
+
+The exemption is visible in `jjq status --json` (`allow_stack`) and is
+carried across `jjq requeue`; the policy is re-checked at `jjq run` time as
+the authoritative gate.
+
 If your current `@` is only an empty parking commit above the finished stack,
 prefer `jjq push @-` or a bookmark/workspace name that points at the stack tip.
 Pushing the empty `@` can still include the ancestor changes, but the queued
 revision itself is the empty tip.
+
+#### Wait for the verdict
+
+Agents that push work can block until the candidate reaches a terminal state.
+Run it as a background task so the queue drains while you work:
+
+```sh
+jjq push @ && jjq wait <change-id>   # run as a background task
+```
+
+`wait` exits 0 when the change lands (stdout: `landed: <change-id>`), 1 when
+it is rejected (stdout carries the reject reason and item ID), and 2 when the
+target is unknown or `--timeout` elapses. A bare check failure is *pending*,
+not a verdict — the item may be fixed and land later. After a landed verdict,
+run `jj workspace update-stale` in your workspace before continuing.
 
 ### Run the queue
 
@@ -174,6 +203,17 @@ Push is idempotent: re-pushing the same change ID automatically clears any
 previous queue or failed entries for that change. Re-pushing the exact same
 commit ID that is already queued is rejected as a duplicate.
 
+Agents and operators can mark an item failed without running it, with an
+explicit reason (for example, when a fixer gives up or a policy is
+violated):
+
+```sh
+jjq reject 3 --reason "2 revisions atop trunk; squash and re-push"
+```
+
+The reason shows up in `jjq status` and `jjq status --json`
+(`reject_reason`), and a failed item with a reason is treated as terminal.
+
 ```sh
 jjq delete 3          # remove item 3 from queue/failed
 jjq clean             # remove all orphaned jjq workspaces
@@ -217,6 +257,15 @@ branch:
 - Failed items: `jjq/failed/000001`, ...
 - Metadata branch: `jjq/_/_` (parented to `root()`)
 
+After each run that processed items, and on every `jjq clean`, jjq abandons
+residue: the obsolete originals a failed first attempt leaves behind once a
+fix lands. A leaf is abandoned only when its exact commit ID was recorded as
+the queued candidate of a submission that landed (commit-ID matching, so a
+divergent copy carrying unlanded local edits is kept), it carries no
+bookmark, is no workspace's working copy, and is not an ancestor of trunk.
+Each abandonment is logged with its change ID and description; anything
+uncertain is left alone.
+
 `jjq init` automatically configures `jj log` to hide jjq metadata.
 For repositories initialized before this feature, run:
 
@@ -231,6 +280,7 @@ jj config set --repo revsets.log '~ ::bookmarks(exact:"jjq/_/_")'
 | `trunk_bookmark`   | `main`               | Bookmark pointing to your trunk                                  |
 | `check_command`    | *(set during init)*  | Command to run on merge candidates (required before running)     |
 | `strategy`         | `rebase`             | Strategy for landing the candidate on trunk (`rebase` or `merge`). Existing repos without this key default to `merge` for backward compatibility. |
+| `require_single_revision` | `true`        | Require each candidate to be a single squashed revision atop trunk; `push --allow-stack` exempts one item |
 
 ## Copying
 
