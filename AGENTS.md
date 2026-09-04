@@ -62,9 +62,9 @@ jjq stores all state in the jj repository itself:
 |---------|----------|
 | `init [--trunk <bookmark>] [--check <cmd>] [--strategy <strategy>]` | Initialize jjq, set trunk, check command, and strategy |
 | `push <revset> [--allow-stack]` | Add revision to queue (idempotent: clears stale entries for same change ID; pushing the current workspace's @ moves the working copy to a new empty child); by default refuses multi-revision candidates unless `--allow-stack` is given |
-| `run [--all] [--stop-on-failure] [--jobs N]` | Process next queue item, or all items in batch; merge batches may check up to N predicted states concurrently and still land FIFO |
+| `run [--all] [--stop-on-failure] [--jobs N] [--no-wait]` | Process next queue item, or all items in batch; merge batches may check up to N predicted states concurrently and still land FIFO. Waits for an active runner to finish unless `--no-wait` |
 | `check [--rev <revset>] [-v]` | Run check command against a revision (default @); -v shows workspace/env details |
-| `status [id] [--json] [--resolve]` | Show running/queued items, recent failures (with conflicting file paths), and recently landed items; JSON output has `runner_active` (bool) plus `running`/`queue`/`failed`/`landed` arrays |
+| `status [id] [--json] [--resolve <revset>]` | Show running/queued items, recent failures (with conflicting file paths), and recently landed items; JSON output has `runner_active` (bool) plus `running`/`queue`/`failed`/`landed` arrays. `--resolve` answers where one change stands (the verdict `wait` polls for): `queued`, `running`, `failed`, `rejected`, `landed`, or `unknown` (exit 10), as a `state` field in JSON |
 | `requeue <id>` | Re-push a failed item back onto the queue (with pre-flight conflict check); refuses an item being processed; recovers a stale claim back to the queue |
 | `reject <id> --reason <text>` | Mark a queued or failed item as failed without running it, recording the reason; a failed item with a reason is terminal |
 | `wait <revset> [--interval] [--timeout]` | Block until the candidate lands (exit 0) or is rejected (exit 1, reason on stdout); unknown/timeout exits 2 |
@@ -82,7 +82,7 @@ jjq stores all state in the jj repository itself:
 | Code | Constant | Meaning |
 |------|----------|---------|
 | 0 | *(success)* | Success |
-| 1 | `CONFLICT` | Merge conflict, check failed, check command not configured, trunk moved during run, or another queue runner is active |
+| 1 | `CONFLICT` | Merge conflict, check failed, check command not configured, trunk moved during run, a check that never started (returned to the queue), or another queue runner is active with `--no-wait` |
 | 2 | `PARTIAL` | Batch run processed some items but left failures |
 | 3 | `LOCK_HELD` | Metadata lock still held after the wait timeout (a concurrent writer is stuck) |
 | 10 | `USAGE` | Bad arguments, invalid revset, duplicate push of an already-queued commit, or an item ID not found in queue or failed (`status`/`delete`/`requeue`) |
@@ -103,9 +103,12 @@ jjq stores all state in the jj repository itself:
 - **Check command** - User-configured shell command that determines success/failure
 - **Pre-flight conflict check** - Headless merge commit to verify clean merge before queuing
 - **Idempotent push** - Re-pushing a change ID clears stale queue/failed entries; same commit ID is rejected as duplicate; a revision claimed by an active runner is refused ("currently being processed")
-- **Running claim** - The runner renames `jjq/queue/N` to `jjq/running/N` under the run lock before processing; on success/failure the claim is deleted or becomes `jjq/failed/N`. Immediately before landing, the runner verifies the claim still exists and otherwise discards the result. Claims orphaned by a crash are moved back to the queue at the start of the next run ("recovered interrupted item N")
+- **Running claim** - The runner renames `jjq/queue/N` to `jjq/running/N` under the run lock before processing; on success/failure the claim is deleted or becomes `jjq/failed/N`. Immediately before landing, the runner verifies the claim still exists and otherwise discards the result. Claims orphaned by a crash are moved back to the queue at the start of the next run ("recovered interrupted item N"), unless the claim's target is already on trunk: then the runner died after the trunk CAS and recovery records the landing instead ("finalized landing of interrupted item N")
 - **Requeue** - Re-pushes a failed item back onto the queue, running a pre-flight conflict check first; a shortcut for fixing and re-pushing manually
 - **Landing strategy** - How the candidate is landed on trunk: `rebase` (default) or `merge`
+- **Checked tree lands** - Files a check writes into the runner workspace are never snapshotted. Under merge the exact commit the check ran against lands; under rebase the rebased original must reproduce its tree. Speculative predictions therefore stay exact across artifact-writing checks
+- **Start-gate deadline** - A check supervisor waits a few seconds for the runner to open its start gate (opened under `publication.lock`). If the gate opens too late the user command never runs; the runner treats that as "did not start", returns the claim to the head of the queue, and a batch retries up to three times before stopping with exit 1
+- **Pinned jj calls** - jjq runs jj with `--ignore-working-copy` by default, so a queue run never snapshots or depends on the workspace it was launched from. The exceptions are deliberate: resolving a user revset for `push`/`check`/`requeue`, the working-copy move-off, `jjq check`'s workspace add, and the rebase landing (which keeps the invoking working copy checked out when it descends from the candidate). The runner creates its workspaces from inside jjq's metadata workspace under the `meta` lock, because jj refuses `workspace add` without a writable working copy
 - **Working-copy move-off** - `push`/`requeue` of the invoking workspace's working-copy commit parks the working copy on a new empty child (like `jj commit`), so later snapshots don't amend the queued commit — once landed, trunk would follow those rewrites and absorb unchecked edits (both strategies). `run` warns when a landed change is still another workspace's live working copy
 - **Cooperative cancellation** - An ID-scoped durable marker records accepted intent. The owning runner terminates the token-scoped process group and records `canceled`; cancellation and every terminal outcome serialize on `publication.lock`, so a landing that already won its final CAS remains landed.
 
@@ -118,7 +121,8 @@ jjq stores all state in the jj repository itself:
 - Metadata reads take no lock: each group of reads pins the `jjq/_/_` bookmark to a single commit and reads every value in the group from that commit
 - `check` lock is held shared by `jjq check`; `clean` holds `run` and probes `check` exclusively so it never destroys a live run or check workspace
 - `mutation.lock` serializes `push`, `requeue`, `delete`, and `cancel`. `publication.lock` couples queue/history publication, claims, cancellation intent, and every terminal bookmark/history choice.
-- Lock order is mutation → publication → meta for producers and run → publication → meta for claims. Mutation paths may acquire `run` only before `publication`; no run path acquires `mutation`. Run → check remains for `clean`, and no code path acquires `run` while holding `meta` or `check`.
+- Lock order is mutation → publication → meta for producers and run → publication → meta for claims. Mutation paths may acquire `run` only before `publication`; no run path acquires `mutation`. Run → check remains for `clean`, and no code path acquires `run` while holding `meta` or `check`. Debug builds assert this order (mutation < run < publication < check < meta) on every blocking acquire via a thread-local rank stack in `src/lock.rs`; non-blocking try-acquires are exempt.
+- A blocking lock wait longer than one second prints "waiting for another jjq process to release the X lock" so a contended command never looks hung.
 
 ### Batch Mode (`run --all`)
 
@@ -127,7 +131,7 @@ When running in batch mode, jjq processes items in sequence:
 - Canceled items are not failures and do not trigger `--stop-on-failure` or `PARTIAL`
 - Summary reports merged and failed counts
 - Exits 0 if all items merged or queue was empty; exits 2 (`PARTIAL`) if any items failed
-- Exits 1 up front — even with an empty queue — when another runner is active or `check_command` is not configured
+- Waits for an active runner to finish before starting (running is idempotent, so this closes the gap where a push lands as the previous runner exits); `--no-wait` exits 1 up front instead. Exits 1 up front — even with an empty queue — when `check_command` is not configured
 
 ## Testing
 

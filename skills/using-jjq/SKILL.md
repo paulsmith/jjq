@@ -54,7 +54,8 @@ the check output of the last run.
 |---|---|
 | Viewing check output | `jjq tail --no-follow` — bare `jjq tail` follows the log and hangs a non-interactive session |
 | First-time setup | `jjq init --trunk main --check '<cmd>'` — without flags it prompts interactively |
-| "another queue runner is active" (exit 1) | Don't retry in a loop — check `jjq status`; the other runner is landing items |
+| Another runner is active | `jjq run` waits for it and then processes what is left; only `jjq run --no-wait` exits 1 with "another queue runner is active" |
+| Where does my change stand? | `jjq status --resolve <change> --json` → `state` is queued, running, failed, rejected, landed, or unknown (exit 10) |
 | "working copy is stale" after a landing | `jj workspace update-stale` in that workspace |
 | Parallel agents/developers | One jj workspace each (`jj workspace add`); push from each; the queue serializes landings |
 | Anything looks broken | `jjq doctor` (and `jjq doctor --fix` for a conflicted metadata bookmark) |

@@ -57,6 +57,9 @@ enum Commands {
         /// Maximum concurrent speculative checks (requires --all)
         #[arg(long, default_value_t = 1, requires = "all", value_parser = parse_jobs)]
         jobs: usize,
+        /// Exit instead of waiting when another queue runner is active
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Run check command against a revision without queue processing
     Check {
@@ -74,7 +77,7 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-        /// Look up item by candidate change ID
+        /// Report where a candidate change stands (any revset resolving to one change)
         #[arg(long, conflicts_with = "id")]
         resolve: Option<String>,
     },
@@ -205,7 +208,8 @@ fn run() -> Result<()> {
             all,
             stop_on_failure,
             jobs,
-        } => commands::run(all, stop_on_failure, jobs),
+            no_wait,
+        } => commands::run(all, stop_on_failure, jobs, no_wait),
         Commands::Check { rev, verbose } => commands::check(&rev, verbose),
         Commands::Status { id, json, resolve } => {
             commands::status(id.as_deref(), json, resolve.as_deref())

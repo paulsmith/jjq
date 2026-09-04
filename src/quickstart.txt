@@ -77,6 +77,12 @@ THINGS TO KNOW
     push may wait briefly; it exits 3 only after a 15s timeout
   - The item being processed shows under "Running:" in status; it cannot
     be deleted or requeued while a runner is active
+  - jjq run waits for an active runner, then drains what it left; only
+    --no-wait exits 1 with "another queue runner is active"
+  - jjq status --resolve <change> --json answers where a change stands:
+    queued, running, failed, rejected, landed, or unknown (exit 10)
+  - Files a check writes never land; the exact commit the check ran
+    against is what lands
   - Cancel removes queued work immediately. Running checks stop as a process
     group; cancellation is not a failure and a landing CAS that already won
     remains landed

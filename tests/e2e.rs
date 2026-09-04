@@ -5093,7 +5093,7 @@ fn test_run_all_exits_when_run_lock_held() {
     // on the lock or count the contention as item failures. The timeout
     // bounds the test if a regression reintroduces the retry loop.
     let (stdout, stderr, code) =
-        repo.jjq_with_timeout(&["run", "--all"], std::time::Duration::from_secs(10));
+        repo.jjq_with_timeout(&["run", "--all", "--no-wait"], std::time::Duration::from_secs(10));
     let combined = format!("{}{}", stdout, stderr);
 
     assert_run_lock_notice(&combined, code);
@@ -5106,7 +5106,7 @@ fn test_run_exits_when_run_lock_held() {
 
     // A single run must also observe the lock before touching the queue
     let (stdout, stderr, code) =
-        repo.jjq_with_timeout(&["run"], std::time::Duration::from_secs(10));
+        repo.jjq_with_timeout(&["run", "--no-wait"], std::time::Duration::from_secs(10));
     let combined = format!("{}{}", stdout, stderr);
 
     assert_run_lock_notice(&combined, code);
@@ -6934,4 +6934,350 @@ fn test_doctor_warns_on_bare_symbol_log_filter() {
         "migration hint should show the exact command: {}",
         out
     );
+}
+
+#[test]
+fn test_run_from_stale_workspace_does_not_touch_it() {
+    // The runner must not depend on, or snapshot, the working copy of the
+    // workspace it was launched from. Make a secondary workspace stale by
+    // rewriting its parent from the default workspace, then run the queue
+    // from inside it: the run lands the queued item and leaves the stale
+    // workspace's recorded commit untouched.
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    repo.init_jjq_merge();
+    let ws_dir = TempDir::new().unwrap();
+    let ws = ws_dir.path().join("stale-ws");
+    run_jj(
+        repo.path(),
+        &["workspace", "add", "--name", "stale-ws", "-r", "main", ws.to_str().unwrap()],
+    );
+    fs::write(ws.join("c.txt"), "c\n").unwrap();
+    run_jj(&ws, &["describe", "-m", "C"]);
+    // Rewrite C from the default workspace so stale-ws's checkout is behind.
+    run_jj(repo.path(), &["describe", "-r", "stale-ws@", "-m", "C rewritten"]);
+    fs::write(repo.path().join("d.txt"), "d\n").unwrap();
+    run_jj(repo.path(), &["squash", "--from", "@", "--into", "stale-ws@", "d.txt"]);
+    let stale = process::Command::new("jj")
+        .current_dir(&ws)
+        .args(["status"])
+        .env("HOME", repo.path())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("stale"),
+        "precondition: workspace must be stale"
+    );
+    let recorded_before = run_jj(
+        repo.path(),
+        &["--ignore-working-copy", "log", "-r", "stale-ws@", "--no-graph", "-T", "commit_id"],
+    );
+
+    run_jj(repo.path(), &["new", "main", "-m", "queued from default"]);
+    fs::write(repo.path().join("e.txt"), "e\n").unwrap();
+    repo.jjq_success(&["push", "@"]);
+
+    let output = repo
+        .jjq_in(&ws)
+        .args(["run"])
+        .output()
+        .expect("failed to run jjq");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "run from a stale workspace must succeed: {combined}"
+    );
+    assert!(repo.jj_file_exists("e.txt", "main"), "{combined}");
+    let recorded_after = run_jj(
+        repo.path(),
+        &["--ignore-working-copy", "log", "-r", "stale-ws@", "--no-graph", "-T", "commit_id"],
+    );
+    assert_eq!(
+        recorded_before, recorded_after,
+        "the runner must never snapshot the workspace it was launched from"
+    );
+}
+
+#[test]
+fn test_merge_lands_the_checked_tree_not_check_artifacts() {
+    // A check that writes files into the runner workspace must not have
+    // those files land: trunk moves to the exact pre-check merge commit the
+    // check ran against.
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    repo.init_jjq_merge_with_check("echo built > artifact.txt");
+    run_jj(repo.path(), &["new", "main", "-m", "feature"]);
+    fs::write(repo.path().join("feature.txt"), "f\n").unwrap();
+    repo.jjq_success(&["push", "@"]);
+    repo.jjq_success(&["run"]);
+    assert!(repo.jj_file_exists("feature.txt", "main"));
+    assert!(
+        !repo.jj_file_exists("artifact.txt", "main"),
+        "check artifacts must not land on trunk"
+    );
+    assert_landed_history_matches_main(&repo, "1");
+}
+
+#[test]
+fn test_parallel_merge_predictions_stay_exact_when_checks_write_files() {
+    // With artifact-free landings, item 2's predicted base (item 1's merge
+    // commit) is exactly what lands, so no attempt is discarded and rerun.
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    repo.init_jjq_merge_with_check("echo built > artifact.txt");
+    for name in ["one", "two"] {
+        run_jj(repo.path(), &["new", "main", "-m", name]);
+        fs::write(repo.path().join(format!("{name}.txt")), "x\n").unwrap();
+        repo.jjq_success(&["push", "@"]);
+    }
+    let output = repo.jjq_success(&["run", "--all", "--jobs", "2"]);
+    assert!(output.contains("processed 2 item(s)"), "{output}");
+    assert!(repo.jj_file_exists("one.txt", "main"));
+    assert!(repo.jj_file_exists("two.txt", "main"));
+    assert!(!repo.jj_file_exists("artifact.txt", "main"));
+    let kinds = history_kinds(&repo, "2");
+    assert_eq!(
+        kinds.iter().filter(|kind| *kind == "check_started").count(),
+        1,
+        "item 2 must be checked exactly once: {kinds:?}"
+    );
+}
+
+#[test]
+fn test_check_that_never_starts_is_requeued_not_failed() {
+    // The check supervisor gives the runner a few seconds to open its start
+    // gate. If another jjq process holds the publication lock past that
+    // deadline, the user command never runs; that is not a check failure.
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    repo.init_jjq_merge_with_check("echo CHECK-RAN");
+    run_jj(repo.path(), &["new", "main", "-m", "gated"]);
+    fs::write(repo.path().join("gated.txt"), "g\n").unwrap();
+    repo.jjq_success(&["push", "@"]);
+
+    let sync = TempDir::new().unwrap();
+    let claimed = sync.path().join("claimed");
+    let release = sync.path().join("release");
+    let runner = repo
+        .jjq_std()
+        .args(["run"])
+        .env("JJQTEST_CLAIM_PUBLISHED", &claimed)
+        .env("JJQTEST_CLAIM_RELEASE", &release)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&claimed, std::time::Duration::from_secs(30));
+
+    use fs2::FileExt;
+    let lock_path = repo.path().join(".jj/jjq/locks/publication.lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    fs::write(&release, "").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    lock.unlock().unwrap();
+
+    let output = runner.wait_with_output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{combined}");
+    assert!(combined.contains("did not start"), "{combined}");
+    assert!(!combined.contains("marked as failed"), "{combined}");
+
+    let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
+    assert!(success);
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["queue"].as_array().unwrap().len(), 1, "{status}");
+    assert_eq!(status["failed"].as_array().unwrap().len(), 0, "{status}");
+    let kinds = history_kinds(&repo, "1");
+    assert!(!kinds.iter().any(|kind| kind == "failed"), "{kinds:?}");
+    assert!(
+        !repo.path().join(".jj/jjq/failed-logs/000001.log").exists(),
+        "no failed log may be archived for a check that never ran"
+    );
+
+    let output = repo.jjq_success(&["run"]);
+    assert!(output.contains("merged 1 to main"), "{output}");
+    assert!(repo.jj_file_exists("gated.txt", "main"));
+}
+
+#[test]
+fn test_run_waits_for_active_runner_then_processes() {
+    let (repo, lock_file) = repo_with_queued_item_and_held_run_lock();
+
+    let mut runner = repo.spawn_jjq(&["run"]);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        runner.try_wait().unwrap().is_none(),
+        "run must wait for the active runner instead of exiting"
+    );
+    assert_queue_item_remains(&repo);
+
+    lock_file.unlock().unwrap();
+    drop(lock_file);
+
+    let output = runner.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("waiting for another jjq process to release the run lock"),
+        "{stderr}"
+    );
+    assert!(history_kinds(&repo, "1").contains(&"landed".to_string()));
+}
+
+#[test]
+fn test_recovery_finalizes_claim_whose_landing_crashed_after_cas() {
+    // A runner killed after the trunk CAS but before deleting its claim has
+    // landed the item. Recovery must record that, not requeue and rerun it.
+    for strategy in ["merge", "rebase"] {
+        let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+        repo.jjq_success(&[
+            "init", "--trunk", "main", "--check", "true", "--strategy", strategy,
+        ]);
+        run_jj(repo.path(), &["new", "main", "-m", "crash after cas"]);
+        fs::write(repo.path().join("cas-crash.txt"), "x\n").unwrap();
+        run_jj(repo.path(), &["bookmark", "create", "cas-crash"]);
+        repo.jjq_success(&["push", "cas-crash"]);
+
+        let sync = TempDir::new().unwrap();
+        let cas = sync.path().join("cas");
+        let release = sync.path().join("release");
+        let mut runner = repo
+            .jjq_std()
+            .args(["run"])
+            .env("JJQTEST_LANDING_CAS", &cas)
+            .env("JJQTEST_LANDING_CAS_RELEASE", &release)
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for_file(&cas, std::time::Duration::from_secs(30));
+        runner.kill().unwrap();
+        let _ = runner.wait();
+        assert!(
+            repo.jj_file_exists("cas-crash.txt", "main"),
+            "{strategy}: trunk moved before the crash"
+        );
+        let main_before = run_jj(
+            repo.path(),
+            &["log", "-r", "main", "--no-graph", "-T", "commit_id"],
+        );
+
+        let output = repo.jjq_success(&["run"]);
+        assert!(
+            output.contains("finalized landing of interrupted item 1"),
+            "{strategy}: {output}"
+        );
+        let main_after = run_jj(
+            repo.path(),
+            &["log", "-r", "main", "--no-graph", "-T", "commit_id"],
+        );
+        assert_eq!(main_before, main_after, "{strategy}: recovery must not move trunk");
+        let kinds = history_kinds(&repo, "1");
+        assert_eq!(
+            kinds.iter().filter(|kind| *kind == "landed").count(),
+            1,
+            "{strategy}: {kinds:?}"
+        );
+        for absent in ["recovered", "skipped_empty", "rejected", "failed"] {
+            assert!(!kinds.iter().any(|kind| kind == absent), "{strategy}: {kinds:?}");
+        }
+        assert_landed_history_matches_main(&repo, "1");
+        let (stdout, _, success) = repo.jjq_raw_output(&["status", "--json"]);
+        assert!(success);
+        let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        for section in ["queue", "running", "failed"] {
+            assert!(status[section].as_array().unwrap().is_empty(), "{strategy}: {status}");
+        }
+    }
+}
+
+fn status_resolve_json(repo: &TestRepo, target: &str) -> serde_json::Value {
+    let (stdout, stderr, success) = repo.jjq_raw_output(&["status", "--resolve", target, "--json"]);
+    assert!(success, "status --resolve {target} failed: {stdout}{stderr}");
+    serde_json::from_str(&stdout).unwrap()
+}
+
+#[test]
+fn test_status_resolve_reports_every_verdict() {
+    let repo = TestRepo::from_template(&GO_PROJECT_TEMPLATE);
+    repo.init_jjq_merge();
+
+    run_jj(repo.path(), &["new", "main", "-m", "will land"]);
+    fs::write(repo.path().join("land.txt"), "l\n").unwrap();
+    let landing = run_jj(
+        repo.path(),
+        &["log", "-r", "@", "--no-graph", "-T", "change_id.short()"],
+    );
+    repo.jjq_success(&["push", "@"]);
+    let queued = status_resolve_json(&repo, &landing);
+    assert_eq!(queued["state"], "queued", "{queued}");
+    assert_eq!(queued["id"], 1, "{queued}");
+
+    repo.jjq_success(&["run"]);
+    let landed = status_resolve_json(&repo, &landing);
+    assert_eq!(landed["state"], "landed", "{landed}");
+    assert_eq!(landed["change_id"], landing, "{landed}");
+
+    run_jj(repo.path(), &["new", "main", "-m", "will be rejected"]);
+    fs::write(repo.path().join("reject.txt"), "r\n").unwrap();
+    let rejected_change = run_jj(
+        repo.path(),
+        &["log", "-r", "@", "--no-graph", "-T", "change_id.short()"],
+    );
+    repo.jjq_success(&["push", "@"]);
+    repo.jjq_success(&["reject", "2", "--reason", "not wanted"]);
+    // A revset works too, not only an exact change ID.
+    let rejected = status_resolve_json(&repo, "@-");
+    assert_eq!(rejected["state"], "rejected", "{rejected}");
+    assert_eq!(rejected["id"], 2, "{rejected}");
+    assert_eq!(rejected["reject_reason"], "not wanted", "{rejected}");
+    assert_eq!(rejected["candidate_change_id"], rejected_change, "{rejected}");
+
+    let output = repo
+        .jjq()
+        .args(["status", "--resolve", "none()", "--json"])
+        .assert()
+        .code(10)
+        .get_output()
+        .clone();
+    let unknown: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(unknown["state"], "unknown", "{unknown}");
+}
+
+#[test]
+fn test_waiting_runner_uses_config_changed_while_it_waited() {
+    // A runner that waited for the run lock must read configuration after
+    // acquiring it: a check command changed in the meantime governs its
+    // checks directly instead of surfacing later as a stale receipt.
+    let (repo, lock_file) = repo_with_queued_item_and_held_run_lock();
+
+    let mut runner = repo.spawn_jjq(&["run"]);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(runner.try_wait().unwrap().is_none(), "run must be waiting");
+    repo.jjq_success(&["config", "check_command", "echo FRESH-CONFIG"]);
+    lock_file.unlock().unwrap();
+    drop(lock_file);
+
+    let output = runner.wait_with_output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{combined}");
+    assert!(!combined.contains("stale"), "{combined}");
+    let log = repo.jjq_success(&["tail", "--no-follow"]);
+    assert!(log.contains("FRESH-CONFIG"), "the waited-for run must use the new check command: {log}");
 }

@@ -312,6 +312,23 @@ fn lookup_workspace_path(id: u32) -> Option<String> {
     }
 }
 
+/// Create a runner workspace without touching the invoking workspace. jj
+/// insists on a writable working copy for `workspace add`, so the command
+/// runs inside jjq's own metadata workspace, which is clean between
+/// metadata transactions; the meta lock keeps a concurrent writer from
+/// having files there mid-transaction. Every run path records its claim
+/// (a metadata transaction that creates or refreshes that workspace) before
+/// reaching here.
+fn add_runner_workspace(path: &str, name: &str, parents: &[&str]) -> Result<()> {
+    let _meta_lock = meta::acquire()?;
+    jj::workspace_add(
+        Some(&meta::metadata_workspace_path()?),
+        path,
+        name,
+        parents,
+    )
+}
+
 /// Best-effort removal of a run's workspace registration and directory.
 /// Used when clearing failed items and stale claims; the workspace may
 /// already be gone, so nothing here is an error.
@@ -805,7 +822,7 @@ fn prompt_choice(label: &str, max: u32) -> Result<u32> {
 /// working-copy state.
 fn check_landing_policy(candidate_commit: &str, trunk_commit: &str, exempt: bool) -> Result<()> {
     let revset = format!("{}..{}", trunk_commit, candidate_commit);
-    let output = jj::run_ok_ignore_working_copy(&[
+    let output = jj::run_ok(&[
         "log",
         "-r",
         &revset,
@@ -833,7 +850,7 @@ fn check_landing_policy(candidate_commit: &str, trunk_commit: &str, exempt: bool
 /// Push a revision onto the merge queue.
 pub fn push(revset: &str, allow_stack: bool) -> Result<()> {
     // Resolve both change ID and commit ID
-    let (change_id, commit_id) = jj::resolve_revset_full(revset)
+    let (change_id, commit_id) = jj::resolve_revset_full_wc(revset)
         .map_err(|e| ExitError::new(exit_codes::USAGE, e.to_string()))?;
 
     require_initialized()?;
@@ -1048,7 +1065,7 @@ pub fn push(revset: &str, allow_stack: bool) -> Result<()> {
     let id = queue::next_id()?;
     let bookmark = queue::queue_bookmark(id);
 
-    jj::bookmark_create_internal(&bookmark, &commit_id)?;
+    jj::bookmark_create(&bookmark, &commit_id)?;
     let mut event = Event::new(id, kind::QUEUED);
     event.candidate_change_id = Some(change_id.clone());
     event.candidate_commit_id = Some(commit_id.clone());
@@ -1196,7 +1213,7 @@ pub fn history(id: Option<&str>, change: Option<&str>, json: bool) -> Result<()>
 /// same. A commit-ID comparison would then skip the move-off and later
 /// landing would absorb the workspace's pending edits into trunk.
 fn move_working_copy_off_queued(queued_change_id: &str) -> Result<()> {
-    let (wc_change_id, _) = jj::resolve_revset_full("@")?;
+    let (wc_change_id, _) = jj::resolve_revset_full_wc("@")?;
     if wc_change_id == queued_change_id {
         jj::new_working_copy()?;
         prefout("working copy moved to a new change; the queued commit stays as pushed");
@@ -1216,9 +1233,10 @@ struct RunConfig {
 ///
 /// Receipts deliberately stay in memory. They are only useful while the run
 /// lock is held, and durable outcomes remain the bookmark state plus history.
-/// The checked revision may contain workspace artifacts created by a check:
-/// merge lands those artifacts, while rebase intentionally lands the original
-/// candidate rebased onto trunk, as it did before receipts existed.
+/// `result_commit_id` is the materialized commit the check ran against;
+/// files a check writes are never snapshotted, so under merge that exact
+/// commit lands, and under rebase the original candidate is rebased and must
+/// reproduce its tree.
 #[derive(Debug)]
 struct ValidationReceipt {
     sequence_id: u32,
@@ -1226,8 +1244,7 @@ struct ValidationReceipt {
     candidate_commit_id: String,
     trunk_bookmark: String,
     trunk_commit_id: String,
-    materialized_result_commit_id: String,
-    checked_result_commit_id: String,
+    result_commit_id: String,
     strategy: Strategy,
     check_command: String,
     check_command_fingerprint: String,
@@ -1240,8 +1257,7 @@ impl ValidationReceipt {
         candidate_commit_id: String,
         trunk_bookmark: String,
         trunk_commit_id: String,
-        materialized_result_commit_id: String,
-        checked_result_commit_id: String,
+        result_commit_id: String,
         strategy: Strategy,
         check_command: &str,
     ) -> Self {
@@ -1251,8 +1267,7 @@ impl ValidationReceipt {
             candidate_commit_id,
             trunk_bookmark,
             trunk_commit_id,
-            materialized_result_commit_id,
-            checked_result_commit_id,
+            result_commit_id,
             strategy,
             check_command: check_command.to_string(),
             check_command_fingerprint: check_command_fingerprint(check_command),
@@ -1382,7 +1397,7 @@ fn validate_receipt(receipt: &ValidationReceipt, workspace_rev: &str) -> Result<
     }
 
     let current_result = jj::get_commit_id(workspace_rev)?;
-    if current_result != receipt.checked_result_commit_id {
+    if current_result != receipt.result_commit_id {
         bail!("checked workspace revision changed");
     }
 
@@ -1409,7 +1424,7 @@ fn requeue_invalid_receipt(
         return Ok(false);
     }
     if !queue::queue_item_exists(receipt.sequence_id)? {
-        jj::bookmark_create_internal(
+        jj::bookmark_create(
             &queue_bookmark,
             &format!("bookmarks(exact:{})", running),
         )?;
@@ -1438,44 +1453,49 @@ fn discard_receipt_work(
     jj::workspace_forget(run_name)?;
     if requeued {
         preferr(&format!(
-            "validation receipt for item {} is stale ({}); item returned to queue",
+            "item {}: {}; item returned to queue",
             receipt.sequence_id, reason
         ));
     } else {
         preferr(&format!(
-            "validation receipt for item {} is stale ({}); claim changed or was removed, discarding result",
+            "item {}: {}; claim changed or was removed, discarding result",
             receipt.sequence_id, reason
         ));
     }
     Ok(())
 }
 
+/// Why a check that never ran sends its claim back to the queue.
+const NOT_STARTED_REASON: &str = "its check did not start before the start-gate deadline (another jjq command held the publication lock too long)";
+
 /// Process queue items.
-pub fn run(all: bool, stop_on_failure: bool, jobs: usize) -> Result<()> {
-    // Pin once for both initialization and RunConfig. This replaces the
-    // separate bookmark-existence probe without extending the snapshot past
-    // the receipt boundary: validate_receipt still pins metadata again after
-    // each successful check so concurrent config changes invalidate landing.
+pub fn run(all: bool, stop_on_failure: bool, jobs: usize, no_wait: bool) -> Result<()> {
+    // Running is idempotent, so by default a second runner waits for the
+    // active one and then drains whatever it left: this closes the window
+    // where a push lands just as a runner reads an empty queue and exits,
+    // stranding the item with nobody to run it.
+    let run_lock = match Lock::acquire("run")? {
+        Some(lock) => lock,
+        None if no_wait => {
+            return Err(
+                ExitError::new(exit_codes::CONFLICT, "another queue runner is active").into(),
+            );
+        }
+        None => Lock::acquire_blocking("run")?,
+    };
+    refuse_if_orphan_checks_live("starting a new run")?;
+
+    // Pin the metadata once, under the run lock, for both the initialization
+    // check and RunConfig, so a configuration change made while this runner
+    // waited governs its checks rather than being caught later as a stale
+    // receipt. validate_receipt still pins metadata again after each
+    // successful check so concurrent config changes invalidate landing.
     let snapshot = config::snapshot()?.ok_or_else(|| {
         ExitError::new(
             exit_codes::USAGE,
             "jjq is not initialized. Run 'jjq init' first.",
         )
     })?;
-
-    // Take the run lock after the same single metadata read that establishes
-    // initialization, so a concurrent runner still exits promptly instead of
-    // contending with the active one. Config file contents are loaded only
-    // after the lock is acquired.
-    let run_lock = match Lock::acquire("run")? {
-        Some(lock) => lock,
-        None => {
-            return Err(
-                ExitError::new(exit_codes::CONFLICT, "another queue runner is active").into(),
-            );
-        }
-    };
-    refuse_if_orphan_checks_live("starting a new run")?;
 
     // Read configuration once, right after taking the run lock, to materialize
     // each attempt consistently. A change while an item is checking invalidates
@@ -1530,7 +1550,7 @@ pub fn run(all: bool, stop_on_failure: bool, jobs: usize) -> Result<()> {
             RunResult::Empty => (Ok(()), 0),
             RunResult::Skipped => (Ok(()), 1),
             RunResult::Canceled => (Ok(()), 1),
-            RunResult::StaleReceipt => (
+            RunResult::StaleReceipt | RunResult::NotStarted => (
                 Err(ExitError::code_only(exit_codes::CONFLICT).into()),
                 1,
             ),
@@ -1567,9 +1587,34 @@ enum RunResult {
     /// queue, so this batch must stop rather than immediately retry its stale
     /// configuration generation.
     StaleReceipt,
+    /// The check supervisor gave up before the user command ran (the start
+    /// gate opened too late, typically because another jjq command held the
+    /// publication lock). The claim was returned to the head of the queue;
+    /// a batch retries it a bounded number of times.
+    NotStarted,
     /// The item failed (conflict or check failure). run_one reports the
     /// details; in single-run mode this maps to exit code CONFLICT.
     Failure,
+}
+
+/// How many consecutive not-started checks a batch tolerates before it stops
+/// and asks to be run again, so a wedged lock holder cannot spin the runner.
+const NOT_STARTED_RETRIES: u32 = 3;
+
+fn note_not_started(streak: &mut u32, result: &RunResult) -> Result<()> {
+    if !matches!(result, RunResult::NotStarted) {
+        *streak = 0;
+        return Ok(());
+    }
+    *streak += 1;
+    if *streak >= NOT_STARTED_RETRIES {
+        preferr(&format!(
+            "stopped after {} checks that did not start; run again",
+            streak
+        ));
+        return Err(ExitError::code_only(exit_codes::CONFLICT).into());
+    }
+    Ok(())
 }
 
 fn run_all(
@@ -1581,8 +1626,11 @@ fn run_all(
     let mut failed_count = 0u32;
     let mut skipped_count = 0u32;
     let mut canceled_count = 0u32;
+    let mut not_started_streak = 0u32;
     loop {
-        match run_one(run_lock, run_config)? {
+        let result = run_one(run_lock, run_config)?;
+        note_not_started(&mut not_started_streak, &result)?;
+        match result {
             RunResult::Success => {
                 merged_count += 1;
             }
@@ -1593,6 +1641,7 @@ fn run_all(
                 skipped_count += 1;
             }
             RunResult::Canceled => canceled_count += 1,
+            RunResult::NotStarted => {}
             RunResult::StaleReceipt => {
                 preferr(
                     "stopped after a stale validation receipt; run again to check the requeued item",
@@ -1683,20 +1732,13 @@ fn run_all_parallel_merge(
     let mut failed_count = 0u32;
     let mut skipped_count = 0u32;
     let mut canceled_count = 0u32;
+    let mut not_started_streak = 0u32;
 
     loop {
         // Recover once per scheduling window, before claims are made. This is
         // the same crash recovery as run_one and preserves FIFO by ID.
         for stale_id in queue::get_running()? {
-            cleanup_run_workspace(stale_id);
-            if recover_claim(stale_id)? {
-                prefout(&format!(
-                    "completed cancellation of interrupted item {}",
-                    stale_id
-                ));
-            } else {
-                prefout(&format!("recovered interrupted item {}", stale_id));
-            }
+            recover_stale_claim(stale_id)?;
         }
         // A prior runner's records were retained through stale workspace
         // recovery so a surviving check child was not disrupted. They cannot
@@ -1751,9 +1793,22 @@ fn run_all_parallel_merge(
                 break;
             }
 
-            match consume_speculative_merge(&mut attempts[index], run_config)? {
+            let result = consume_speculative_merge(&mut attempts[index], run_config)?;
+            note_not_started(&mut not_started_streak, &result)?;
+            match result {
                 RunResult::Success => merged_count += 1,
                 RunResult::Skipped => skipped_count += 1,
+                RunResult::NotStarted => {
+                    // The claim is back at the head of the queue; later
+                    // predictions built on it are discarded and the window
+                    // is rescheduled from the real trunk.
+                    let _publication_lock = Lock::acquire_blocking("publication")?;
+                    for later in attempts.iter_mut().skip(index + 1) {
+                        discard_speculative_attempt(later)?;
+                    }
+                    rescheduled = true;
+                    break;
+                }
                 RunResult::Canceled => {
                     canceled_count += 1;
                     let _publication_lock = Lock::acquire_blocking("publication")?;
@@ -1888,7 +1943,7 @@ fn prepare_speculative_merge(
         return Ok(Some(attempt));
     }
 
-    jj::workspace_add(
+    add_runner_workspace(
         workspace_path.to_str().unwrap(),
         &run_name,
         &[base_commit_id, &format!("bookmarks(exact:{})", running)],
@@ -2029,7 +2084,7 @@ fn discard_speculative_attempt(attempt: &mut SpeculativeAttempt) -> Result<()> {
     let running = queue::running_bookmark(attempt.id);
     if jj::bookmark_exists(&running)? {
         if !queue::queue_item_exists(attempt.id)? {
-            jj::bookmark_create_internal(
+            jj::bookmark_create(
                 &queue::queue_bookmark(attempt.id),
                 &format!("bookmarks(exact:{})", running),
             )?;
@@ -2092,7 +2147,7 @@ fn consume_speculative_merge(
                 workspace_path: &attempt.workspace_path,
                 strategy: &Strategy::Merge,
             };
-            jj::bookmark_create_internal(
+            jj::bookmark_create(
                 &queue::failed_bookmark(attempt.id),
                 &workspace_rev,
             )?;
@@ -2157,10 +2212,17 @@ fn consume_speculative_merge(
                 .ok_or_else(|| anyhow!("speculative check was not started"))?
                 .map_err(|error| anyhow!("speculative check failed to run: {}", error))?;
             let elapsed_ms = elapsed_ms.unwrap_or_default();
-            jj::snapshot_workspace(&attempt.workspace_path)?;
             crate::runlog::publish_attempt_log(&attempt.log_path)?;
             if status.cancelled || cancellation_requested(attempt.id) {
                 return cancel_speculative_attempt(attempt, elapsed_ms);
+            }
+            if status.not_started {
+                discard_speculative_attempt(attempt)?;
+                preferr(&format!(
+                    "item {}: {}; item returned to queue",
+                    attempt.id, NOT_STARTED_REASON
+                ));
+                return Ok(RunResult::NotStarted);
             }
             if !status.status.success() {
                 if let Ok(log_contents) = fs::read_to_string(&attempt.log_path) {
@@ -2179,7 +2241,7 @@ fn consume_speculative_merge(
                     workspace_path: &attempt.workspace_path,
                     strategy: &Strategy::Merge,
                 };
-                jj::bookmark_create_internal(
+                jj::bookmark_create(
                     &queue::failed_bookmark(attempt.id),
                     &workspace_rev,
                 )?;
@@ -2214,7 +2276,6 @@ fn consume_speculative_merge(
                 run_config.trunk_bookmark.clone(),
                 attempt.base_commit_id.clone(),
                 materialized_result_commit_id.clone(),
-                jj::get_commit_id(&workspace_rev)?,
                 Strategy::Merge,
                 &run_config.check_command,
             );
@@ -2228,11 +2289,11 @@ fn consume_speculative_merge(
                 ));
                 return Ok(RunResult::StaleReceipt);
             }
-            let landed_change_id = jj::resolve_revset(&receipt.checked_result_commit_id)?;
+            let landed_change_id = jj::resolve_revset(&receipt.result_commit_id)?;
             if let Err(error) = jj::bookmark_move(
                 &receipt.trunk_bookmark,
                 &receipt.trunk_commit_id,
-                &receipt.checked_result_commit_id,
+                &receipt.result_commit_id,
             ) {
                 drop(meta_lock);
                 discard_speculative_attempt(attempt)?;
@@ -2269,15 +2330,41 @@ fn consume_speculative_merge(
     }
 }
 
-/// Move a stale running claim back to its queue position (same ID). Callers
-/// must know the claim is orphaned: either they hold the run lock, or they
-/// verified the run lock is free.
-fn recover_claim(id: u32) -> Result<bool> {
+/// What recovery did with an orphaned claim.
+enum Recovery {
+    Requeued,
+    Canceled,
+    Landed,
+}
+
+/// Recover one orphaned claim, cleaning up its runner workspace, and report
+/// what became of it.
+fn recover_stale_claim(id: u32) -> Result<()> {
+    cleanup_run_workspace(id);
+    match recover_claim(id)? {
+        Recovery::Canceled => prefout(&format!(
+            "completed cancellation of interrupted item {}",
+            id
+        )),
+        Recovery::Landed => prefout(&format!(
+            "finalized landing of interrupted item {} (trunk had already moved)",
+            id
+        )),
+        Recovery::Requeued => prefout(&format!("recovered interrupted item {}", id)),
+    }
+    Ok(())
+}
+
+/// Resolve a stale running claim: complete an accepted cancellation, finish
+/// a landing whose runner died after the trunk CAS, or move the claim back
+/// to its queue position (same ID). Callers must know the claim is orphaned:
+/// either they hold the run lock, or they verified the run lock is free.
+fn recover_claim(id: u32) -> Result<Recovery> {
     let _publication_lock = Lock::acquire_blocking("publication")?;
     let running_bookmark = queue::running_bookmark(id);
+    let running_rev = format!("bookmarks(exact:{})", running_bookmark);
     if cancellation_requested(id) {
-        let (candidate_change_id, candidate_commit_id) =
-            jj::resolve_revset_full(&format!("bookmarks(exact:{})", running_bookmark))?;
+        let (candidate_change_id, candidate_commit_id) = jj::resolve_revset_full(&running_rev)?;
         let trunk_commit_id = config::get_trunk_bookmark()
             .ok()
             .and_then(|trunk| jj::get_commit_id(&format!("bookmarks(exact:{})", trunk)).ok());
@@ -2291,8 +2378,43 @@ fn recover_claim(id: u32) -> Result<bool> {
         )?;
         jj::bookmark_delete(&running_bookmark)?;
         remove_cancellation(id);
-        return Ok(true);
+        return Ok(Recovery::Canceled);
     }
+
+    // A claim whose target is already on trunk landed: the runner died
+    // between the trunk CAS and deleting its claim (under rebase the claim
+    // followed the rewrite onto trunk). Requeueing it would rerun a landed
+    // change and record it as skipped or rejected instead of landed.
+    let trunk = config::get_trunk_bookmark()?;
+    let trunk_rev = format!("bookmarks(exact:{})", trunk);
+    let already_landed = !jj::run_ok(&[
+        "log",
+        "-r",
+        &format!("({}) & ::({})", running_rev, trunk_rev),
+        "--no-graph",
+        "-T",
+        "\"x\"",
+    ])?
+    .trim()
+    .is_empty();
+    if already_landed {
+        let existing = history::read(id)?;
+        if !existing.iter().any(|event| event.kind == kind::LANDED) {
+            let (candidate_change_id, candidate_commit_id) =
+                jj::resolve_revset_full(&running_rev)?;
+            let (result_change_id, result_commit_id) = jj::resolve_revset_full(&trunk_rev)?;
+            let mut event = Event::new(id, kind::LANDED);
+            event.candidate_change_id = Some(candidate_change_id);
+            event.candidate_commit_id = Some(candidate_commit_id);
+            event.result_change_id = Some(result_change_id);
+            event.result_commit_id = Some(result_commit_id);
+            event.strategy = existing.iter().find_map(|event| event.strategy.clone());
+            record_history(event)?;
+        }
+        jj::bookmark_delete(&running_bookmark)?;
+        return Ok(Recovery::Landed);
+    }
+
     let event = history_for_revision(
         id,
         kind::RECOVERED,
@@ -2308,7 +2430,7 @@ fn recover_claim(id: u32) -> Result<bool> {
         jj::bookmark_rename(&running_bookmark, &queue_bookmark)?;
     }
     record_history(event)?;
-    Ok(false)
+    Ok(Recovery::Requeued)
 }
 
 /// Reject a claimed item for a landing-policy violation, using the same
@@ -2333,7 +2455,7 @@ fn reject_claimed_item(
     };
     let desc = reject_description(id, &entry, trunk_commit_id, strategy, reason);
     jj::describe(&marker, &desc)?;
-    jj::bookmark_create_internal(&queue::failed_bookmark(id), &marker)?;
+    jj::bookmark_create(&queue::failed_bookmark(id), &marker)?;
     jj::bookmark_delete(&queue::running_bookmark(id))?;
     let mut event = Event::new(id, kind::REJECTED);
     event.candidate_change_id = Some(candidate_change_id.to_string());
@@ -2401,7 +2523,7 @@ fn cleanup_residue_inner() -> Result<()> {
         r#"change_id.short() ++ "\x1f" ++ commit_id ++ "\x1f" ++"#,
         r#"description.first_line().escape_json() ++ "\x1e" ++ "\n""#,
     );
-    let output = jj::run_ok_ignore_working_copy(&[
+    let output = jj::run_ok(&[
         "log",
         "-r",
         &revset,
@@ -2458,15 +2580,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
     // The crashed runner also leaves its jjq-run-<id> workspace registered —
     // it must go now, or re-claiming the item dies on the name collision.
     for stale_id in queue::get_running()? {
-        cleanup_run_workspace(stale_id);
-        if recover_claim(stale_id)? {
-            prefout(&format!(
-                "completed cancellation of interrupted item {}",
-                stale_id
-            ));
-        } else {
-            prefout(&format!("recovered interrupted item {}", stale_id));
-        }
+        recover_stale_claim(stale_id)?;
     }
     prune_dead_attempt_state();
 
@@ -2568,7 +2682,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
 
     match strategy {
         config::Strategy::Merge => {
-            jj::workspace_add(
+            add_runner_workspace(
                 runner_workspace.path().to_str().unwrap(),
                 &run_name,
                 &[
@@ -2585,7 +2699,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             )?;
             // Create workspace on the tip duplicate (last in the list)
             let duplicate_tip = rebase_duplicate_ids.last().unwrap();
-            jj::workspace_add(
+            add_runner_workspace(
                 runner_workspace.path().to_str().unwrap(),
                 &run_name,
                 &[duplicate_tip.as_str()],
@@ -2631,7 +2745,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
         }
         // Create the failed entry before deleting the claim so a crash
         // between the two duplicates the item instead of losing it.
-        jj::bookmark_create_internal(&queue::failed_bookmark(id), &workspace_rev)?;
+        jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
         jj::bookmark_delete(&running_bookmark)?;
         jj::describe(
             &workspace_rev,
@@ -2712,8 +2826,27 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
         return Ok(RunResult::Skipped);
     }
 
-    jj::describe(&workspace_rev, &format!("WIP: attempting merge {}", id))?;
-    let materialized_result_commit_id = jj::get_commit_id(&workspace_rev)?;
+    // A merge commit gets its final description now, so the commit the check
+    // runs against is byte-for-byte the one that lands; a failure rewrites
+    // it with the failure trailers anyway. The rebase duplicate is disposable.
+    let description = match strategy {
+        config::Strategy::Merge => format!("Success: merge {}", id),
+        config::Strategy::Rebase => format!("WIP: attempting merge {}", id),
+    };
+    jj::describe(&workspace_rev, &description)?;
+    // Every fact a receipt binds is known before the check runs; a passing
+    // check turns this into permission to land only after validate_receipt
+    // confirms nothing changed.
+    let receipt = ValidationReceipt::new(
+        id,
+        candidate_change_id.clone(),
+        candidate_commit_id.clone(),
+        trunk_bookmark.clone(),
+        trunk_commit_id.clone(),
+        jj::get_commit_id(&workspace_rev)?,
+        strategy,
+        &run_config.check_command,
+    );
 
     // Run check command with the runner workspace as its working directory
     let mut check_started = Event::new(id, kind::CHECK_STARTED);
@@ -2780,10 +2913,9 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
     let check_elapsed_ms = check_started_at.elapsed().as_millis();
     crate::runlog::publish_attempt_log(&log_path)?;
 
-    // The check may have modified files in the runner workspace (build
-    // artifacts, formatters). Snapshot them into the workspace commit so the
-    // revset-based operations below see the post-check tree.
-    jj::snapshot_workspace(&workspace_path)?;
+    // Files the check wrote into the runner workspace are never snapshotted:
+    // the commit that lands is exactly the one the check ran against, and
+    // the kept workspace directory still holds the artifacts for forensics.
 
     if check_status.cancelled || cancellation_requested(id) {
         let _publication_lock = Lock::acquire_blocking("publication")?;
@@ -2800,6 +2932,20 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             check_elapsed_ms,
         )?;
         return Ok(RunResult::Canceled);
+    }
+
+    if check_status.not_started {
+        discard_receipt_work(
+            &receipt,
+            strategy,
+            &rebase_duplicate_ids,
+            &run_name,
+            NOT_STARTED_REASON,
+            false,
+        )?;
+        remove_active_check(&run_config.run_token, id);
+        remove_attempt_log(&log_path);
+        return Ok(RunResult::NotStarted);
     }
 
     if !check_status.status.success() {
@@ -2832,7 +2978,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
 
         // Failed entry before claim delete: a crash between the two
         // duplicates the item instead of losing it.
-        jj::bookmark_create_internal(&queue::failed_bookmark(id), &workspace_rev)?;
+        jj::bookmark_create(&queue::failed_bookmark(id), &workspace_rev)?;
         jj::bookmark_delete(&running_bookmark)?;
         jj::describe(
             &workspace_rev,
@@ -2859,22 +3005,6 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
         preferr(&format!("  jjq push {}", candidate_change_id));
         return Ok(RunResult::Failure);
     }
-
-    // A successful check becomes a receipt. Its checked revision is captured
-    // after snapshotting, so merge preserves the existing behavior of landing
-    // check-created artifacts. Rebase deliberately lands the original
-    // candidate rather than artifacts written into its disposable duplicate.
-    let receipt = ValidationReceipt::new(
-        id,
-        candidate_change_id.clone(),
-        candidate_commit_id.clone(),
-        trunk_bookmark.clone(),
-        trunk_commit_id.clone(),
-        materialized_result_commit_id,
-        jj::get_commit_id(&workspace_rev)?,
-        strategy,
-        &run_config.check_command,
-    );
 
     // Serialize the fresh config read and landing decision with all metadata
     // writers. Otherwise `config set` could win between validation and the
@@ -2910,7 +3040,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             strategy,
             &rebase_duplicate_ids,
             &run_name,
-            &error.to_string(),
+            &format!("validation receipt is stale ({})", error),
             false,
         )?;
         remove_active_check(&run_config.run_token, id);
@@ -2930,11 +3060,11 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
         config::Strategy::Merge => {
             // Land the exact workspace commit that the receipt checked, not a
             // workspace-qualified revset that another operation could rewrite.
-            let landed_change_id = jj::resolve_revset(&receipt.checked_result_commit_id)?;
+            let landed_change_id = jj::resolve_revset(&receipt.result_commit_id)?;
             if let Err(error) = jj::bookmark_move(
                 &receipt.trunk_bookmark,
                 &receipt.trunk_commit_id,
-                &receipt.checked_result_commit_id,
+                &receipt.result_commit_id,
             ) {
                 drop(meta_lock);
                 discard_receipt_work(
@@ -2942,7 +3072,10 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
                     strategy,
                     &rebase_duplicate_ids,
                     &run_name,
-                    &format!("trunk changed while landing: {}", error),
+                    &format!(
+                        "validation receipt is stale (trunk changed while landing: {})",
+                        error
+                    ),
                     false,
                 )?;
                 remove_active_check(&run_config.run_token, id);
@@ -2957,10 +3090,6 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
                 ));
             }
             jj::bookmark_delete(&running_bookmark)?;
-            jj::describe(
-                &receipt.checked_result_commit_id,
-                &format!("Success: merge {}", id),
-            )?;
             jj::workspace_forget(&run_name)?;
 
             prefout(&format!(
@@ -2979,15 +3108,14 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
             jj::rebase_branch_onto(&receipt.candidate_commit_id, &receipt.trunk_commit_id)?;
 
             // Resolve the rewritten candidate once, then pin that exact output
-            // for the remaining tree check and trunk CAS. Rebase intentionally
-            // ignores check-created artifacts, so compare it with the
-            // materialized pre-check tree rather than the post-check duplicate.
+            // for the remaining tree check and trunk CAS. The rebased original
+            // must reproduce the tree the check ran against.
             let (rebased_change_id, rebased_commit_id) = jj::resolve_revset_full(&format!(
                 "bookmarks(exact:{})",
                 queue::running_bookmark(receipt.sequence_id)
             ))?;
             if rebased_change_id != receipt.candidate_change_id
-                || !jj::trees_match(&receipt.materialized_result_commit_id, &rebased_commit_id)?
+                || !jj::trees_match(&receipt.result_commit_id, &rebased_commit_id)?
             {
                 drop(meta_lock);
                 discard_receipt_work(
@@ -2995,7 +3123,7 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
                     strategy,
                     &rebase_duplicate_ids,
                     &run_name,
-                    "rebased result no longer matches the receipt materialization",
+                    "validation receipt is stale (rebased result no longer matches the checked tree)",
                     true,
                 )?;
                 remove_active_check(&run_config.run_token, id);
@@ -3016,7 +3144,10 @@ fn run_one(_run_lock: &Lock, run_config: &RunConfig) -> Result<RunResult> {
                     strategy,
                     &rebase_duplicate_ids,
                     &run_name,
-                    &format!("trunk changed while landing: {}", error),
+                    &format!(
+                        "validation receipt is stale (trunk changed while landing: {})",
+                        error
+                    ),
                     true,
                 )?;
                 remove_active_check(&run_config.run_token, id);
@@ -3169,8 +3300,8 @@ fn failure_description(
 /// Run check command against a revision in a temporary workspace.
 pub fn check(revset: &str, verbose: bool) -> Result<()> {
     // Resolve the revision
-    let change_id =
-        jj::resolve_revset(revset).map_err(|e| ExitError::new(exit_codes::USAGE, e.to_string()))?;
+    let (change_id, _) = jj::resolve_revset_full_wc(revset)
+        .map_err(|e| ExitError::new(exit_codes::USAGE, e.to_string()))?;
 
     // Read check command
     let check_command = match config::get_check_command()? {
@@ -3213,6 +3344,7 @@ pub fn check(revset: &str, verbose: bool) -> Result<()> {
     let workspace_name = format!("jjq-check-{}", std::process::id());
 
     jj::workspace_add(
+        None,
         workspace_dir.path().to_str().unwrap(),
         &workspace_name,
         &[revset],
@@ -3539,141 +3671,140 @@ pub fn status(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()>
 }
 
 fn status_single(id: Option<&str>, json: bool, resolve: Option<&str>) -> Result<()> {
+    if let Some(target) = resolve {
+        return status_resolved(target, json);
+    }
     // Running is a reportable state like queued/failed: the USAGE(10) exit is
     // reserved for IDs that exist in no namespace.
-    enum ItemState {
-        Queued,
-        Failed,
-        Running,
+    let id = queue::parse_seq_id(id.expect("clap requires an ID or --resolve"))?;
+    match queue::state_snapshot()?.state_for(id)? {
+        Some((queue::State::Queued, entry)) => print_queue_item(entry, "queued", json),
+        Some((queue::State::Running, entry)) => print_queue_item(entry, "running", json),
+        Some((queue::State::Failed, entry)) => {
+            print_failed_item(build_failed_item_from_state(entry)?, json)
+        }
+        None => Err(ExitError::new(
+            exit_codes::USAGE,
+            format!("item {} not found in queue or failed", id),
+        )
+        .into()),
     }
-    let (state, entry) = if let Some(id_str) = id {
-        let id = queue::parse_seq_id(id_str)?;
-        match queue::state_snapshot()?.state_for(id)? {
-            Some((queue::State::Queued, entry)) => (ItemState::Queued, entry),
-            Some((queue::State::Failed, entry)) => (ItemState::Failed, entry),
-            Some((queue::State::Running, entry)) => (ItemState::Running, entry),
-            None => {
-                return Err(ExitError::new(
-                    exit_codes::USAGE,
-                    format!("item {} not found in queue or failed", id),
-                )
-                .into());
-            }
-        }
-    } else if let Some(change_id) = resolve {
-        let (found_state, entry) = find_by_change_id(change_id)?;
-        match found_state {
-            queue::State::Queued => (ItemState::Queued, entry),
-            queue::State::Running => (ItemState::Running, entry),
-            queue::State::Failed => (ItemState::Failed, entry),
-        }
-    } else {
-        unreachable!()
+}
+
+/// Report where a candidate change stands: the same verdict `jjq wait`
+/// polls for, answered once. `target` is any revset resolving to one change.
+fn status_resolved(target: &str, json: bool) -> Result<()> {
+    let trunk = config::get_trunk_bookmark()?;
+    let change_id = wait_resolve_target(target);
+    let verdict = match &change_id {
+        Some(change_id) => verdict(change_id, &trunk)?,
+        None => Verdict::Unknown,
     };
-
-    if !matches!(state, ItemState::Failed) {
-        let item = build_item_from_state(entry)?;
-        if json {
-            // The queue and running namespaces share this item shape; an
-            // explicit state field lets machine consumers tell them apart.
-            #[derive(Serialize)]
-            struct SingleItemStatus<'a> {
-                #[serde(flatten)]
-                item: &'a QueueItem,
-                state: &'a str,
-            }
-            let state_name = match state {
-                ItemState::Queued => "queued",
-                ItemState::Running => "running",
-                ItemState::Failed => unreachable!("failed handled below"),
-            };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&SingleItemStatus {
-                    item: &item,
-                    state: state_name,
-                })?
-            );
-        } else {
-            if matches!(state, ItemState::Running) {
-                println!("Queue item {} (running)", item.id);
+    let change_id = change_id.unwrap_or_else(|| target.to_string());
+    match verdict {
+        Verdict::Landed => {
+            if json {
+                let landed = serde_json::json!({ "change_id": change_id, "state": "landed" });
+                println!("{}", serde_json::to_string_pretty(&landed)?);
             } else {
-                println!("Queue item {}", item.id);
+                println!("Change {} landed on {}", change_id, trunk);
             }
-            println!("  Change ID:   {}", item.change_id);
-            println!("  Commit ID:   {}", item.commit_id);
-            println!("  Description: {}", item.description);
+            Ok(())
         }
-    } else {
-        let item = build_failed_item_from_state(entry)?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&item)?);
-        } else {
-            println!("Failed item {}", item.id);
-            println!(
-                "  Candidate:   {} ({})",
-                item.candidate_change_id, item.candidate_commit_id
-            );
-            println!("  Description: {}", item.description);
-            println!("  Failure:     {}", item.failure_reason);
-            if !item.reject_reason.is_empty() {
-                println!("  Rejected:    {}", item.reject_reason);
+        Verdict::Unknown => {
+            if json {
+                let unknown = serde_json::json!({ "change_id": change_id, "state": "unknown" });
+                println!("{}", serde_json::to_string_pretty(&unknown)?);
             }
-            if !item.conflict_paths.is_empty() {
-                println!("  Conflicts:   {}", item.conflict_paths.join(", "));
-            }
-            println!("  Trunk:       {}", item.trunk_commit_id);
-            println!();
-            let trunk_bookmark = config::get_trunk_bookmark().unwrap_or_else(|_| "main".into());
-            if item.failure_reason == "conflicts" {
-                println!("To resolve:");
-                println!(
-                    "  jj rebase -r {} -d {}",
-                    item.candidate_change_id, trunk_bookmark
-                );
-                println!("  # resolve conflicts in {}", item.candidate_change_id);
-                println!("  jjq push {}", item.candidate_change_id);
-            } else {
-                println!("To resolve:");
-                println!("  # fix the issue in {}", item.candidate_change_id);
-                println!("  jjq push {}", item.candidate_change_id);
-            }
+            Err(ExitError::new(
+                exit_codes::USAGE,
+                format!("no item found with candidate change ID '{}'", change_id),
+            )
+            .into())
         }
+        Verdict::Queued(entry) => print_queue_item(entry, "queued", json),
+        Verdict::Running(entry) => print_queue_item(entry, "running", json),
+        Verdict::Failed(item) | Verdict::Rejected(item) => print_failed_item(item, json),
     }
+}
 
+fn print_queue_item(entry: queue::StateEntry, state: &str, json: bool) -> Result<()> {
+    let item = build_item_from_state(entry)?;
+    if json {
+        // The queue and running namespaces share this item shape; an
+        // explicit state field lets machine consumers tell them apart.
+        #[derive(Serialize)]
+        struct SingleItemStatus<'a> {
+            #[serde(flatten)]
+            item: &'a QueueItem,
+            state: &'a str,
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&SingleItemStatus { item: &item, state })?
+        );
+    } else {
+        if state == "running" {
+            println!("Queue item {} (running)", item.id);
+        } else {
+            println!("Queue item {}", item.id);
+        }
+        println!("  Change ID:   {}", item.change_id);
+        println!("  Commit ID:   {}", item.commit_id);
+        println!("  Description: {}", item.description);
+    }
     Ok(())
 }
 
-/// Find a queue, running, or failed item by candidate change ID.
-/// Returns the concrete queue state so callers report claims accurately.
-fn find_by_change_id(change_id: &str) -> Result<(queue::State, queue::StateEntry)> {
-    let state = queue::state_snapshot()?;
-    for entry in state.queued()? {
-        if entry.change_id == change_id {
-            return Ok((queue::State::Queued, entry));
+fn print_failed_item(item: FailedItem, json: bool) -> Result<()> {
+    let state = if item.reject_reason.is_empty() {
+        "failed"
+    } else {
+        "rejected"
+    };
+    if json {
+        #[derive(Serialize)]
+        struct SingleFailedStatus<'a> {
+            #[serde(flatten)]
+            item: &'a FailedItem,
+            state: &'a str,
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&SingleFailedStatus { item: &item, state })?
+        );
+    } else {
+        println!("Failed item {}", item.id);
+        println!(
+            "  Candidate:   {} ({})",
+            item.candidate_change_id, item.candidate_commit_id
+        );
+        println!("  Description: {}", item.description);
+        println!("  Failure:     {}", item.failure_reason);
+        if !item.reject_reason.is_empty() {
+            println!("  Rejected:    {}", item.reject_reason);
+        }
+        if !item.conflict_paths.is_empty() {
+            println!("  Conflicts:   {}", item.conflict_paths.join(", "));
+        }
+        println!("  Trunk:       {}", item.trunk_commit_id);
+        println!();
+        let trunk_bookmark = config::get_trunk_bookmark().unwrap_or_else(|_| "main".into());
+        if item.failure_reason == "conflicts" {
+            println!("To resolve:");
+            println!(
+                "  jj rebase -r {} -d {}",
+                item.candidate_change_id, trunk_bookmark
+            );
+            println!("  # resolve conflicts in {}", item.candidate_change_id);
+            println!("  jjq push {}", item.candidate_change_id);
+        } else {
+            println!("To resolve:");
+            println!("  # fix the issue in {}", item.candidate_change_id);
+            println!("  jjq push {}", item.candidate_change_id);
         }
     }
-
-    // Match state_for's precedence (queued → failed → running): a crash
-    // during failure publication can leave both failed and running
-    // bookmarks, and reporting failed keeps --resolve consistent with
-    // status <id>.
-    for entry in state.failed()? {
-        let trailers = extract_trailers(&entry.description);
-        if trailers.get("candidate").map(|s| s.as_str()) == Some(change_id) {
-            return Ok((queue::State::Failed, entry));
-        }
-    }
-
-    // A running claim keeps the same candidate change ID as its queued
-    // predecessor; report it instead of pretending the item does not exist.
-    for entry in state.running()? {
-        if entry.change_id == change_id {
-            return Ok((queue::State::Running, entry));
-        }
-    }
-
-    bail!("no item found with candidate change ID '{}'", change_id)
+    Ok(())
 }
 
 /// Find a queued submission for a stable change ID. This is used to finish a
@@ -3767,18 +3898,7 @@ pub fn requeue(id_str: &str) -> Result<()> {
             };
             // Stale claim from a crashed runner: recover it to its queue
             // position, which is what requeue would achieve anyway.
-            cleanup_run_workspace(id);
-            if recover_claim(id)? {
-                prefout(&format!(
-                    "completed cancellation of interrupted item {}",
-                    id
-                ));
-            } else {
-                prefout(&format!(
-                    "recovered interrupted item {}; it is queued again",
-                    id
-                ));
-            }
+            recover_stale_claim(id)?;
             return Ok(());
         }
         return Err(
@@ -3839,7 +3959,7 @@ pub fn requeue(id_str: &str) -> Result<()> {
 
     // Resolve the candidate — it may have been rebased since the failure.
     let revset = candidate_change_id.as_str();
-    let (_change_id, commit_id) = jj::resolve_revset_full(revset)
+    let (_change_id, commit_id) = jj::resolve_revset_full_wc(revset)
         .map_err(|e| ExitError::new(exit_codes::USAGE, format!("candidate not found: {}", e)))?;
 
     // Pre-flight conflict check against current trunk. Test the pinned
@@ -3878,7 +3998,7 @@ pub fn requeue(id_str: &str) -> Result<()> {
     let publication_lock = Lock::acquire_blocking("publication")?;
     let new_id = queue::next_id()?;
     let new_bookmark = queue::queue_bookmark(new_id);
-    jj::bookmark_create_internal(&new_bookmark, &commit_id)?;
+    jj::bookmark_create(&new_bookmark, &commit_id)?;
     finish_requeue(
         id,
         new_id,
@@ -4198,7 +4318,7 @@ pub fn reject(id_str: &str, reason: &str) -> Result<()> {
             // Create-before-delete, the same crash ordering as the run
             // failure path: a crash here leaves both bookmarks and a retry
             // finds the failed entry first.
-            jj::bookmark_create_internal(&queue::failed_bookmark(id), &marker)?;
+            jj::bookmark_create(&queue::failed_bookmark(id), &marker)?;
             jj::bookmark_delete(&queue::queue_bookmark(id))?;
         }
         Some((queue::State::Failed, entry)) => {
@@ -4230,15 +4350,17 @@ pub fn reject(id_str: &str, reason: &str) -> Result<()> {
     Ok(())
 }
 
-/// The wait verdict for one candidate, checked in this order each poll:
-/// landed (handled inline in the poll loop, since it outranks everything),
-/// rejected, pending, unknown.
+/// Where one candidate change stands, in precedence order: landed outranks
+/// any stale queue entry or rejection; a failed entry with a recorded reject
+/// reason is terminal; queued, claimed, or failed without a reason means the
+/// fix loop may still be working it. `jjq wait` polls this and `jjq status
+/// --resolve` reports it once.
 enum Verdict {
-    /// A failed entry carries a recorded reject reason.
-    Rejected { id: u32, reason: String },
-    /// Queued, claimed, or failed without a reason: the fix loop may
-    /// still be working it.
-    Pending,
+    Landed,
+    Queued(queue::StateEntry),
+    Running(queue::StateEntry),
+    Failed(FailedItem),
+    Rejected(FailedItem),
     /// The candidate matches no queue state (and did not land).
     Unknown,
 }
@@ -4250,7 +4372,7 @@ enum Verdict {
 /// target; `wait` treats that as the Unknown verdict instead of crashing
 /// through the generic error path.
 fn wait_resolve_target(revset: &str) -> Option<String> {
-    let output = jj::run_ok_ignore_working_copy(&[
+    let output = jj::run_ok(&[
         "log",
         "-r",
         revset,
@@ -4274,7 +4396,7 @@ fn wait_resolve_target(revset: &str) -> Option<String> {
 /// proven landed", which the caller treats as fall-through.
 fn wait_is_landed(change_id: &str, trunk: &str) -> Result<bool> {
     let revset = format!("::bookmarks(exact:{}) & change_id({})", trunk, change_id);
-    let output = jj::run_ok_ignore_working_copy(&[
+    let output = jj::run_ok(&[
         "log",
         "-r",
         &revset,
@@ -4288,29 +4410,35 @@ fn wait_is_landed(change_id: &str, trunk: &str) -> Result<bool> {
     }
 }
 
-/// Classify one queue-state snapshot against the resolved candidate. Exact
-/// short-ID matching only: resolution already normalized the input.
-fn wait_classify(state: &queue::StateSnapshot, change_id: &str) -> Result<Verdict> {
-    for entry in state.queued()? {
-        if entry.change_id == change_id {
-            return Ok(Verdict::Pending);
-        }
+/// Classify one resolved candidate against trunk and one queue-state
+/// snapshot. Exact short-ID matching only: resolution already normalized the
+/// input.
+fn verdict(change_id: &str, trunk: &str) -> Result<Verdict> {
+    if wait_is_landed(change_id, trunk)? {
+        return Ok(Verdict::Landed);
     }
-    for entry in state.running()? {
-        if entry.change_id == change_id {
-            return Ok(Verdict::Pending);
-        }
+    let state = queue::state_snapshot()?;
+    if let Some(entry) = state
+        .queued()?
+        .into_iter()
+        .find(|entry| entry.change_id == change_id)
+    {
+        return Ok(Verdict::Queued(entry));
+    }
+    if let Some(entry) = state
+        .running()?
+        .into_iter()
+        .find(|entry| entry.change_id == change_id)
+    {
+        return Ok(Verdict::Running(entry));
     }
     for entry in state.failed()? {
-        let item = build_failed_item_from_state(entry.clone())?;
+        let item = build_failed_item_from_state(entry)?;
         if item.candidate_change_id == change_id {
             return Ok(if item.reject_reason.is_empty() {
-                Verdict::Pending
+                Verdict::Failed(item)
             } else {
-                Verdict::Rejected {
-                    id: entry.id,
-                    reason: item.reject_reason,
-                }
+                Verdict::Rejected(item)
             });
         }
     }
@@ -4347,20 +4475,21 @@ pub fn wait(revset: &str, interval_secs: u64, timeout_secs: Option<u64>) -> Resu
             continue;
         };
 
-        // 1. Landed outranks any stale queue entry or rejection.
-        if wait_is_landed(&change_id, &trunk)? {
-            prefout(&format!("landed: {}", change_id));
-            return Ok(());
-        }
-
-        // 2/3. Classify one snapshot: rejected, pending, or unknown.
-        let state = queue::state_snapshot()?;
-        match wait_classify(&state, &change_id)? {
-            Verdict::Rejected { id, reason } => {
-                prefout(&format!("rejected: item {}: {}", id, reason));
+        // 1. One verdict: landed outranks any stale queue entry or rejection,
+        //    a reject reason is terminal, everything else is pending.
+        match verdict(&change_id, &trunk)? {
+            Verdict::Landed => {
+                prefout(&format!("landed: {}", change_id));
+                return Ok(());
+            }
+            Verdict::Rejected(item) => {
+                prefout(&format!(
+                    "rejected: item {}: {}",
+                    item.id, item.reject_reason
+                ));
                 return Err(ExitError::code_only(1).into());
             }
-            Verdict::Pending => unknown_streak = 0,
+            Verdict::Queued(_) | Verdict::Running(_) | Verdict::Failed(_) => unknown_streak = 0,
             Verdict::Unknown => {
                 unknown_streak += 1;
                 if unknown_streak >= 2 {

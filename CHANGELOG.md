@@ -8,6 +8,27 @@ branch or the queue.
 
 ### Fixed
 
+- **A slow lock wait no longer fails an item** — The check supervisor gives
+  the runner a few seconds to open its start gate, and the runner opens it
+  under `publication.lock`. When a concurrent `push` held that lock past the
+  deadline, the user command never ran and the item was marked failed with an
+  empty log. A check that never started now returns its claim to the head of
+  the queue; a batch retries up to three times before exiting 1.
+- **Lost wakeup between runner exit and push** — `jjq run` now waits for an
+  active runner instead of refusing, then processes whatever that runner
+  left behind. A push that landed just as the previous runner read an empty
+  queue is no longer stranded. `--no-wait` keeps the old exit-1 refusal.
+- **Crash after the trunk CAS reran the landed item** — A claim whose target
+  is already on trunk is now finalized as landed by recovery (history gets
+  its `landed` event) instead of being requeued and rerun as skipped or
+  rejected.
+- **Runner snapshotted the invoking workspace** — jj is now invoked with
+  `--ignore-working-copy` by default; a queue run makes one working-copy
+  snapshot at most (the rebase landing) instead of dozens, and a stale or
+  dirty working copy in the workspace `jjq run` was launched from can no
+  longer fail the run or be amended by it. Runner workspaces are created
+  from jjq's metadata workspace, since jj refuses `workspace add` without a
+  writable working copy.
 - **Per-workspace lock bypass** — Locks and the run log now resolve through
   the shared repo `.jj` directory, so invocations from secondary workspaces
   contend on the same lock files instead of each getting private, useless
@@ -43,6 +64,16 @@ branch or the queue.
 
 ### Changed
 
+- **Merge lands the checked tree** — Files a check writes into the runner
+  workspace are no longer snapshotted and landed under the merge strategy;
+  both strategies now land exactly the tree the check ran against. Parallel
+  predictions stay exact across artifact-writing checks, so dependents are
+  no longer discarded and rechecked for that reason.
+- **Receipt-stale messages** — Runner messages now read "item N: <reason>;
+  item returned to queue" for stale receipts and checks that never started.
+- **Lock order is asserted** — Debug builds check the documented lock order
+  on every blocking acquire; any blocking wait longer than one second prints
+  what it is waiting for.
 - **No process chdir** — jjq never changes its own working directory; jj and
   check commands get their working directory set per child process, so
   concurrent operations cannot trample each other's cwd.
@@ -64,6 +95,13 @@ branch or the queue.
 
 ### Added
 
+- **`status --resolve` reports a verdict** — `jjq status --resolve <revset>`
+  now accepts any revset and answers with the same verdict `jjq wait` polls
+  for: `queued`, `running`, `failed`, `rejected`, `landed`, or `unknown`
+  (exit 10). JSON output carries a `state` field; single failed items in
+  JSON now include it too.
+- **`run --no-wait`** — Exit 1 immediately when another runner is active,
+  the former default.
 - **In-flight claim tickets** — The runner renames `jjq/queue/NNNNNN` to
   `jjq/running/NNNNNN` under the run lock. `delete`, `requeue`, and `push`
   refuse to touch a live claim (or recover a stale one from a crashed

@@ -6,9 +6,9 @@ NNAAMMEE
 SSYYNNOOPPSSIISS
        jjjjqq iinniitt [----ttrruunnkk _b_o_o_k_m_a_r_k] [----cchheecckk _c_o_m_m_a_n_d] [----ssttrraatteeggyy _s_t_r_a_t_e_g_y]
        jjjjqq ppuusshh _r_e_v_s_e_t
-       jjjjqq rruunn [----aallll] [----ssttoopp--oonn--ffaaiilluurree] [----jjoobbss _N]
+       jjjjqq rruunn [----aallll] [----ssttoopp--oonn--ffaaiilluurree] [----jjoobbss _N] [----nnoo--wwaaiitt]
        jjjjqq cchheecckk [----rreevv _r_e_v_s_e_t] [--vv]
-       jjjjqq ssttaattuuss [_i_d] [----jjssoonn] [----rreessoollvvee _c_h_a_n_g_e___i_d]
+       jjjjqq ssttaattuuss [_i_d] [----jjssoonn] [----rreessoollvvee _r_e_v_s_e_t]
        jjjjqq hhiissttoorryy [_i_d] [----jjssoonn]
        jjjjqq hhiissttoorryy ----cchhaannggee _c_h_a_n_g_e___i_d [----jjssoonn]
        jjjjqq rreeqquueeuuee _i_d
@@ -117,9 +117,24 @@ CCOOMMMMAANNDDSS
        exact commit-bound predicted base for the original candidate.
 
        Returns 0 if all processed items succeeded (or the queue was empty).
-       Returns 2 if any items failed. Returns 1 if another queue runner is
-       active, the check command is not configured, a conflict is detected, or
-       trunk moved during processing.
+       Returns 2 if any items failed. Returns 1 if the check command is not
+       configured, a conflict is detected, trunk moved during processing, a
+       check never started, or another queue runner is active and ----nnoo--wwaaiitt
+       was given.
+
+       If another queue runner is active, jjjjqq rruunn waits for it to finish and
+       then processes whatever it left behind; running is idempotent, and
+       waiting closes the window in which a push lands just as the previous
+       runner reads an empty queue and exits.  ----nnoo--wwaaiitt exits 1 immediately
+       instead.
+
+       Files the check command writes into the runner workspace are never
+       snapshotted: the commit that lands is exactly the commit the check ran
+       against (under rebase, the rebased original must reproduce that tree).
+       A check that never started, because the runner could not open its start
+       gate before the supervisor's deadline, is returned to the head of the
+       queue rather than marked failed; a batch retries it up to three times,
+       then exits 1.
 
        After processing at least one item, and again in jjjjqq cclleeaann, jjq
        abandons residue leaves: visible bookmark-less commits, no workspace's
@@ -160,7 +175,7 @@ CCOOMMMMAANNDDSS
        The temporary workspace is always cleaned up, regardless of outcome.
        Exits 0 if the check passes; 1 if it fails.
 
-   ssttaattuuss [_i_d] [----jjssoonn] [----rreessoollvvee _c_h_a_n_g_e___i_d]
+   ssttaattuuss [_i_d] [----jjssoonn] [----rreessoollvvee _r_e_v_s_e_t]
        Display the current queue state: queued items (ascending by sequence
        ID) and recent failures (descending by sequence ID).  Each entry shows
        its sequence ID, change ID prefix, and first line of the commit
@@ -186,8 +201,13 @@ CCOOMMMMAANNDDSS
        wwoorrkkssppaaccee__ppaatthh, and ffaaiilluurree__rreeaassoonn.
 
        With a positional _i_d, displays a single item's detail view (from either
-       queue or failed).  With ----rreessoollvvee, looks up an item by its candidate
-       change ID.  _i_d and ----rreessoollvvee are mutually exclusive.
+       queue or failed).  With ----rreessoollvvee, reports where one candidate change
+       stands, using the same verdict jjjjqq wwaaiitt polls for. The revset must
+       resolve to one change. The verdict is qquueeuueedd, rruunnnniinngg, ffaaiilleedd (no
+       reject reason recorded yet), rreejjeecctteedd, llaannddeedd (an ancestor of trunk,
+       which outranks any stale entry), or uunnkknnoowwnn (exit 10). With ----jjssoonn the
+       verdict is the ssttaattee field of the item's JSON.  _i_d and ----rreessoollvvee are
+       mutually exclusive.
 
    hhiissttoorryy [[iidd]] [[----jjssoonn]] || ----cchhaannggee cchhaannggee__iidd [[----jjssoonn]]
        Display the durable lifecycle history for a queue submission. Exactly
@@ -316,7 +336,8 @@ EEXXIITT CCOODDEESS
        00      Success.
 
        11      Conflict during push or run, check failure in single-run mode,
-              trunk moved, or another queue runner is active.
+              trunk moved, a check that never started, or another queue runner
+              is active with ----nnoo--wwaaiitt.
 
        22      Partial batch run: at least one item failed while processing jjjjqq
               rruunn ----aallll.
@@ -343,8 +364,9 @@ LLOOCCKKIINNGG
        holding process exits, so stale locks cannot occur.
 
        rruunn    Ensures only one jjjjqq rruunn processes the queue at a time.  A
-              second runner exits immediately with code 1 ("another queue
-              runner is active").
+              second runner waits for the first to finish, then processes what
+              it left; with ----nnoo--wwaaiitt it exits immediately with code 1
+              ("another queue runner is active").
 
        mmeettaa   Serializes all writes to the metadata branch: sequence ID
               allocation, configuration, and workspace records.  Writers wait

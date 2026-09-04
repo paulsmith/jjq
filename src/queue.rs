@@ -220,7 +220,7 @@ const SNAPSHOT_TEMPLATE: &str = r#""{\"name\":" ++ name.escape_json() ++ ",\"con
 /// Read queue, running, and failed bookmarks and their targets in one
 /// repository snapshot.
 pub fn state_snapshot() -> Result<StateSnapshot> {
-    let output = jj::run_ok_ignore_working_copy(&[
+    let output = jj::run_ok(&[
         "bookmark",
         "list",
         "-r",

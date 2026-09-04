@@ -20,6 +20,7 @@ jjq \- local merge queue for jj
 .RB [ \-\-stop-on-failure ]
 .RB [ \-\-jobs
 .IR N ]
+.RB [ \-\-no-wait ]
 .br
 .B jjq check
 .RB [ \-\-rev
@@ -30,7 +31,7 @@ jjq \- local merge queue for jj
 .RI [ id ]
 .RB [ \-\-json ]
 .RB [ \-\-resolve
-.IR change_id ]
+.IR revset ]
 .br
 .B jjq history
 .RI [ id ]
@@ -210,9 +211,26 @@ currently run serially: rebase's disposable duplicate cannot safely supply an
 exact commit-bound predicted base for the original candidate.
 .PP
 Returns 0 if all processed items succeeded (or the queue was empty). Returns 2
-if any items failed. Returns 1 if another queue runner is active, the check
-command is not configured, a conflict is detected, or trunk moved during
-processing.
+if any items failed. Returns 1 if the check command is not configured, a
+conflict is detected, trunk moved during processing, a check never started,
+or another queue runner is active and
+.B \-\-no-wait
+was given.
+.PP
+If another queue runner is active,
+.B jjq run
+waits for it to finish and then processes whatever it left behind; running
+is idempotent, and waiting closes the window in which a push lands just as
+the previous runner reads an empty queue and exits.
+.B \-\-no-wait
+exits 1 immediately instead.
+.PP
+Files the check command writes into the runner workspace are never
+snapshotted: the commit that lands is exactly the commit the check ran
+against (under rebase, the rebased original must reproduce that tree). A
+check that never started, because the runner could not open its start gate
+before the supervisor's deadline, is returned to the head of the queue rather
+than marked failed; a batch retries it up to three times, then exits 1.
 .PP
 After processing at least one item, and again in
 .BR "jjq clean" ,
@@ -256,7 +274,7 @@ Useful for diagnosing path or environment issues.
 .PP
 The temporary workspace is always cleaned up, regardless of outcome.
 Exits 0 if the check passes; 1 if it fails.
-.SS status \fR[\fIid\fR] [\fB\-\-json\fR] [\fB\-\-resolve \fIchange_id\fR]
+.SS status \fR[\fIid\fR] [\fB\-\-json\fR] [\fB\-\-resolve \fIrevset\fR]
 Display the current queue state: queued items (ascending by sequence ID)
 and recent failures (descending by sequence ID).
 Each entry shows its sequence ID, change ID prefix, and first line of
@@ -312,7 +330,22 @@ With a positional
 displays a single item's detail view (from either queue or failed).
 With
 .BR \-\-resolve ,
-looks up an item by its candidate change ID.
+reports where one candidate change stands, using the same verdict
+.B jjq wait
+polls for. The revset must resolve to one change. The verdict is
+.BR queued ,
+.BR running ,
+.B failed
+(no reject reason recorded yet),
+.BR rejected ,
+.B landed
+(an ancestor of trunk, which outranks any stale entry), or
+.B unknown
+(exit 10). With
+.B \-\-json
+the verdict is the
+.B state
+field of the item's JSON.
 .I id
 and
 .B \-\-resolve
@@ -491,8 +524,9 @@ Existing repositories initialized before strategy support default to
 Success.
 .TP
 .B 1
-Conflict during push or run, check failure in single-run mode, trunk moved, or
-another queue runner is active.
+Conflict during push or run, check failure in single-run mode, trunk moved, a
+check that never started, or another queue runner is active with
+.BR \-\-no-wait .
 .TP
 .B 2
 Partial batch run: at least one item failed while processing
@@ -537,7 +571,10 @@ exits, so stale locks cannot occur.
 Ensures only one
 .B jjq run
 processes the queue at a time.
-A second runner exits immediately with code 1
+A second runner waits for the first to finish, then processes what it left;
+with
+.B \-\-no-wait
+it exits immediately with code 1
 (\(lqanother queue runner is active\(rq).
 .TP
 .B meta

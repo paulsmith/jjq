@@ -199,6 +199,10 @@ where
 pub struct BackgroundCheckResult {
     pub status: ExitStatus,
     pub cancelled: bool,
+    /// The supervisor gave up waiting for its start gate (or its parent)
+    /// before the user command ran, so `status` is protocol noise, not a
+    /// verdict on the candidate.
+    pub not_started: bool,
 }
 
 fn run_check_command_with_mode(
@@ -222,12 +226,14 @@ fn run_check_command_with_mode(
 
     // Background checks start behind a gate. Gate path, parent PID, process
     // identity, and user command are positional arguments, never interpolated
-    // into supervisor shell source.
+    // into supervisor shell source. The supervisor drops a `<gate>.started`
+    // marker just before running the user command, which is how the parent
+    // tells a genuine exit status from a supervisor that gave up waiting.
     let mut child_command = Command::new("sh");
     if let Some(start) = &background_start {
         child_command
             .arg("-c")
-            .arg("gate=$1; parent=$2; identity=$3; user_command=$4; cancel=$5; deadline=$(($(date +%s) + 4)); while [ ! -f \"$gate\" ]; do [ -f \"$cancel\" ] && exit 77; kill -0 \"$parent\" 2>/dev/null || exit 75; [ \"$(date +%s)\" -lt \"$deadline\" ] || exit 76; sleep 0.02; done; [ -f \"$cancel\" ] && exit 77; : \"$identity\"; sh -c \"$user_command\" 2>&1 & check=$!; while kill -0 \"$check\" 2>/dev/null; do if [ -f \"$cancel\" ] || ! kill -0 \"$parent\" 2>/dev/null; then kill -TERM \"$check\" 2>/dev/null; sleep 1; kill -KILL -$$ 2>/dev/null; exit 77; fi; sleep 1; done; wait \"$check\"")
+            .arg("gate=$1; parent=$2; identity=$3; user_command=$4; cancel=$5; deadline=$(($(date +%s) + 4)); while [ ! -f \"$gate\" ]; do [ -f \"$cancel\" ] && exit 77; kill -0 \"$parent\" 2>/dev/null || exit 75; [ \"$(date +%s)\" -lt \"$deadline\" ] || exit 76; sleep 0.02; done; [ -f \"$cancel\" ] && exit 77; : \"$identity\"; : > \"$gate.started\"; sh -c \"$user_command\" 2>&1 & check=$!; while kill -0 \"$check\" 2>/dev/null; do if [ -f \"$cancel\" ] || ! kill -0 \"$parent\" 2>/dev/null; then kill -TERM \"$check\" 2>/dev/null; sleep 1; kill -KILL -$$ 2>/dev/null; exit 77; fi; sleep 1; done; wait \"$check\"")
             .arg("jjq-check-supervisor")
             .arg(&start.gate)
             .arg(start.parent_pid.to_string())
@@ -318,7 +324,7 @@ fn run_check_command_with_mode(
 
     // Wait loop: behaviour depends on whether stderr is a TTY.
     let cancel_marker = background_start.as_ref().map(|start| start.cancel_marker.as_path());
-    let result = if interactive {
+    let mut result = if interactive {
         wait_interactive(&mut child, log_path, cancel_marker)?
     } else if silent && let Some(start) = &background_start {
         wait_background(&mut child, &start.cancel_marker)?
@@ -326,11 +332,13 @@ fn run_check_command_with_mode(
         BackgroundCheckResult {
             status: child.wait().context("waiting for background check process")?,
             cancelled: false,
+            not_started: false,
         }
     } else {
         wait_non_interactive(&mut child, cancel_marker)?
     };
     if let Some(start) = &background_start {
+        result.not_started = !result.cancelled && !started_marker(&start.gate).exists();
         remove_start_gate(&start.gate);
     }
 
@@ -371,6 +379,7 @@ fn wait_background(
                 // otherwise free to return 77 as an ordinary check failure.
                 cancelled: status.code() == Some(77) && cancel_marker.exists(),
                 status,
+                not_started: false,
             });
         }
 
@@ -379,6 +388,7 @@ fn wait_background(
             return Ok(BackgroundCheckResult {
                 status,
                 cancelled: true,
+                not_started: false,
             });
         }
 
@@ -438,8 +448,14 @@ fn open_start_gate(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Marker the supervisor creates immediately before the user command runs.
+fn started_marker(gate: &Path) -> std::path::PathBuf {
+    gate.with_extension("started")
+}
+
 fn remove_start_gate(path: &Path) {
     let _ = fs::remove_file(path);
+    let _ = fs::remove_file(started_marker(path));
     if let Some(parent) = path.parent()
         && fs::read_dir(parent)
             .map(|mut entries| entries.next().is_none())
@@ -489,13 +505,14 @@ fn wait_non_interactive(
 
     loop {
         if let Some(status) = child.try_wait().context("polling child process")? {
-            return Ok(BackgroundCheckResult { status, cancelled: false });
+            return Ok(BackgroundCheckResult { status, cancelled: false, not_started: false });
         }
 
         if cancel_marker.is_some_and(Path::exists) {
             return Ok(BackgroundCheckResult {
                 status: terminate_process_group(child)?,
                 cancelled: true,
+                not_started: false,
             });
         }
 
@@ -553,7 +570,7 @@ fn wait_interactive(
                 // Clear spinner line.
                 eprint!("\r\x1b[2K");
             }
-            return Ok(BackgroundCheckResult { status, cancelled: false });
+            return Ok(BackgroundCheckResult { status, cancelled: false, not_started: false });
         }
 
         if cancel_marker.is_some_and(Path::exists) {
@@ -561,6 +578,7 @@ fn wait_interactive(
             return Ok(BackgroundCheckResult {
                 status: terminate_process_group(child)?,
                 cancelled: true,
+                not_started: false,
             });
         }
 

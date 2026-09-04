@@ -95,7 +95,11 @@ latest trunk after a successful merge.
 
 ### Running the queue
 
-A jjq queue run is started by the user via the CLI. `jjq run --all --jobs N`
+A jjq queue run is started by the user via the CLI. If another runner is
+active, `jjq run` waits for it and then processes whatever it left behind;
+running is idempotent, and waiting closes the window in which a push lands
+just as the previous runner reads an empty queue and exits. `--no-wait`
+restores the exit-1 refusal for scripts that want it. `jjq run --all --jobs N`
 can check up to `N` merge-strategy candidates concurrently while still landing
 only in FIFO order. `N` defaults to 1, preserving sequential behavior. A
 failed or tree-mutating predecessor invalidates dependent predictions; they are
@@ -125,7 +129,10 @@ is still configured. A stale receipt returns its unchanged claim to the same
 queue position for a fresh check; a removed or retargeted claim is never
 landed. If a runner crashes, its claim remains; the next run (or a `jjq
 delete`/`jjq requeue` issued while the run lock is free) recovers the orphaned
-claim back to its queue position under the same sequence ID.
+claim back to its queue position under the same sequence ID. A claim whose
+target is already an ancestor of trunk is the signature of a runner that died
+after its trunk compare-and-swap; recovery records the `landed` event and
+removes the claim instead of rerunning the change.
 `jjq cancel ID` removes queued work immediately or publishes a cooperative
 intent for a running item. Running checks terminate as one process group (TERM,
 then KILL after a grace period). Cancellation is not failure and does not make
@@ -159,7 +166,10 @@ the group from that commit, so a concurrent writer cannot skew a read group.
 Running the queue also takes a lock — only one merge can be attempted at a
 time. The `run` lock uses `.jj/jjq/locks/run.lock`. A runner may take the
 meta lock while holding the run lock, never the reverse, so the two locks
-cannot deadlock.
+cannot deadlock. Debug builds enforce the whole order (mutation, run,
+publication, check, meta) on every blocking acquire with a thread-local rank
+stack, so a future lock-order slip fails a test instead of deadlocking in the
+field. A blocking wait longer than one second prints what it is waiting for.
 
 Queue-state mutations (`jjq push`, `jjq requeue`, `jjq delete`, and `jjq cancel`) take the
 blocking `.jj/jjq/locks/mutation.lock` for their whole transition. This
@@ -216,6 +226,21 @@ that combines the trunk and the candidate revision.
 The check can be any command that can be executed by a POSIX shell. Its exit
 code, zero (success) or non-zero (failure), is determinative of the success of
 the check.
+
+Files a check writes into the runner workspace are never snapshotted. The
+commit that lands is exactly the commit the check ran against: under merge
+that materialized merge commit itself, under rebase the original candidate
+rebased onto trunk, which must reproduce the checked tree. A check is a gate,
+not a transformation; a formatter or build that wants its output landed must
+commit it before pushing. The kept workspace directory of a failed check
+still holds the artifacts for forensics.
+
+A queue check runs behind a start gate that the runner opens under
+`publication.lock` after publishing the check's process identity. The
+supervisor gives up if the gate has not opened within a few seconds, so a
+long lock wait cannot start an unowned command; a check that never started is
+not a verdict. The runner returns such a claim to the head of the queue, a
+batch retries it up to three times, and only then stops with exit 1.
 
 A successful queue check is not itself permission to move trunk. It produces
 an in-memory validation receipt bound to the sequence ID, candidate change and
@@ -300,8 +325,10 @@ Failed items display conflicting file paths when available, e.g.
 wrong.
 
 The status command supports a `--json` flag for machine-readable output.
-It also supports single-item lookup by sequence ID or candidate change ID via
-the `--resolve` flag.
+It also supports single-item lookup by sequence ID, and `--resolve <revset>`
+answers where one change stands with the same verdict `jjq wait` polls for:
+`queued`, `running`, `failed` (no reject reason yet), `rejected`, `landed`, or
+`unknown` (exit 10). JSON output carries it as a `state` field.
 
 Status is intended as a helpful tool for jjq users, not as a comprehensive
 history of jjq's operation.
@@ -375,7 +402,16 @@ jj bookmarks indicate queue and failed items and the metadata branch head:
 ### Using `jj`
 
 jjq uses the `jj` command for all of its operations that interact with the jj
-repository. There is no jj API used by jjq, other than that provided by the
+repository. It passes `--ignore-working-copy` by default: reads of pinned
+commit IDs, internal bookmarks, and metadata, and mutations of already
+resolved commits, never depend on the invoking workspace's files, so a queue
+run neither snapshots nor fails on the working copy it was launched from. The
+deliberate exceptions snapshot on purpose: resolving a user revset such as
+`@`, the working-copy move-off, `jjq check`'s workspace creation, and the
+rebase landing (so the invoking working copy follows a candidate it descends
+from). Because jj refuses `workspace add` without a writable working copy,
+the runner creates its temporary workspaces from inside jjq's own metadata
+workspace, under the `meta` lock. There is no jj API used by jjq, other than that provided by the
 output of the `jj` command. To that end, for commands that require querying jj
 for information, jjq commands use the templating option that most `jj`
 subcommands support, especially `jj log -T'...'`. This allows jjq to control

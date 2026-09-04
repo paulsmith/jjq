@@ -41,7 +41,7 @@ pub fn metadata_workspace_registration_owned() -> Result<bool> {
     }
 
     let registered =
-        jj::run_ok_ignore_working_copy(&["workspace", "root", "--name", META_WORKSPACE_NAME])?;
+        jj::run_ok(&["workspace", "root", "--name", META_WORKSPACE_NAME])?;
     let registered = PathBuf::from(registered.trim());
     let expected = metadata_workspace_path()?;
     let same_path = registered == expected
@@ -99,11 +99,18 @@ fn lock_timeout() -> Duration {
 /// `doctor --fix` can hold the same lock while repairing the metadata
 /// bookmark in place; everything else writes via a described metadata transaction.
 pub fn acquire() -> Result<Lock> {
+    crate::lock::assert_blocking_order("meta");
     let timeout = lock_timeout();
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut notified = false;
     loop {
         if let Some(lock) = Lock::acquire("meta")? {
             return Ok(lock);
+        }
+        if !notified && started.elapsed() >= crate::lock::SILENT_WAIT {
+            crate::lock::wait_notice("meta");
+            notified = true;
         }
         if Instant::now() >= deadline {
             return Err(ExitError::new(
@@ -188,7 +195,7 @@ fn with_meta_workspace_mode(
         match fs::read(workspace.join("last_id")) {
             Ok(_) => false,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let parent_is_root = jj::run_ok_ignore_working_copy(&[
+                let parent_is_root = jj::run_ok(&[
                     "log",
                     "-r",
                     &format!("parents({})", meta_parent),
@@ -277,7 +284,7 @@ fn prepare_metadata_workspace(meta_parent: &str, description: &str) -> Result<Pa
                 // merged from another process. Refresh registered state once
                 // before recreating this reserved, disposable workspace.
                 if jj::workspace_exists(META_WORKSPACE_NAME)? {
-                    let _ = jj::workspace_update_stale();
+                    let _ = jj::run_quiet_in(&path, &["workspace", "update-stale"]);
                     if new_metadata_child(&path, meta_parent, description).is_ok() {
                         return Ok(path);
                     }
@@ -338,7 +345,9 @@ fn recreate_metadata_workspace(path: &Path, meta_parent: &str, description: &str
     let path = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("metadata workspace path is not valid UTF-8"))?;
-    jj::run_quiet(&[
+    // jj refuses `workspace add` without a writable working copy, so this
+    // one metadata call snapshots the invoker.
+    jj::run_quiet_wc(&[
         "workspace",
         "add",
         "-r",

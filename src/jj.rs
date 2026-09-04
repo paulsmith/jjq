@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 /// Get a jj config value, returning None if not set.
 pub fn config_get(key: &str) -> Result<Option<String>> {
-    let output = run_ignore_working_copy(&["config", "get", key])?;
+    let output = run(&["config", "get", key])?;
     if output.status.success() {
         Ok(Some(
             String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -25,26 +25,35 @@ pub fn config_set_repo(key: &str, value: &str) -> Result<()> {
     run_quiet(&["config", "set", "--repo", key, value])
 }
 
-/// Execute a jj command from the process working directory.
+/// Execute a jj command from the process working directory without
+/// snapshotting or updating that workspace's working copy. This is the
+/// default: jjq reads pinned commit IDs, internal bookmarks, and metadata,
+/// and mutates commits it has already resolved, none of which depend on the
+/// invoking workspace's files. Skipping the snapshot keeps the runner
+/// independent of the workspace it was launched from (a stale or dirty
+/// working copy there cannot fail or be amended by a queue run) and avoids a
+/// stat walk of that working copy per jj call.
 pub fn run(args: &[&str]) -> Result<Output> {
+    let mut full = vec!["--ignore-working-copy"];
+    full.extend_from_slice(args);
+    run_from(None, &full)
+}
+
+/// Execute a jj command that snapshots, and may update, the invoking
+/// workspace's working copy. Only for operations that are about that working
+/// copy: resolving a user revset such as `@`, `jj new` to move it, `jj
+/// workspace add` (which jj refuses without a writable working copy), and
+/// `jj rebase` of a commit the working copy may descend from.
+pub fn run_wc(args: &[&str]) -> Result<Output> {
     run_from(None, args)
 }
 
-/// Execute a jj command without snapshotting or updating the current working
-/// copy. Use only for repository/config reads whose arguments are independent
-/// of working-copy contents (for example, pinned commit IDs and bookmark
-/// inventories). Candidate revsets such as `@` must continue through `run`.
-pub fn run_ignore_working_copy(args: &[&str]) -> Result<Output> {
-    let mut full = vec!["--ignore-working-copy"];
-    full.extend_from_slice(args);
-    run(&full)
-}
-
-/// Execute a jj command with `dir` as its working directory. jj snapshots
-/// the working copy of the workspace containing the command's cwd, so
-/// workspace-scoped operations must run through this rather than chdir'ing
-/// the process (a process-global chdir breaks concurrent work and strands
-/// the process if an error skips the chdir back).
+/// Execute a jj command with `dir` as its working directory, snapshotting
+/// and updating that workspace. jj only acts on the working copy of the
+/// workspace containing the command's cwd, so workspace-scoped operations
+/// must run through this rather than chdir'ing the process (a process-global
+/// chdir breaks concurrent work and strands the process if an error skips
+/// the chdir back).
 pub fn run_in(dir: &Path, args: &[&str]) -> Result<Output> {
     run_from(Some(dir), args)
 }
@@ -75,9 +84,9 @@ pub fn run_ok(args: &[&str]) -> Result<String> {
     expect_success(args, run(args)?)
 }
 
-/// `run_ok` for reads which are provably independent of working-copy state.
-pub fn run_ok_ignore_working_copy(args: &[&str]) -> Result<String> {
-    expect_success(args, run_ignore_working_copy(args)?)
+/// `run_ok` for a command that must see the invoking working copy.
+pub fn run_ok_wc(args: &[&str]) -> Result<String> {
+    expect_success(args, run_wc(args)?)
 }
 
 /// `run_ok` with `dir` as the command's working directory.
@@ -90,10 +99,9 @@ pub fn run_quiet(args: &[&str]) -> Result<()> {
     run_ok(args).map(|_| ())
 }
 
-/// `run_quiet` for mutations whose operands are independent of working-copy
-/// state and have already been resolved or name exact internal bookmarks.
-pub fn run_quiet_ignore_working_copy(args: &[&str]) -> Result<()> {
-    run_ok_ignore_working_copy(args).map(|_| ())
+/// `run_quiet` for a command that must see or move the invoking working copy.
+pub fn run_quiet_wc(args: &[&str]) -> Result<()> {
+    run_ok_wc(args).map(|_| ())
 }
 
 /// Per-invocation config override disabling jj's short-prefixes index. jj
@@ -119,14 +127,6 @@ pub fn run_quiet_with_config(config: &str, args: &[&str]) -> Result<()> {
 /// `run_quiet` with `dir` as the command's working directory.
 pub fn run_quiet_in(dir: &Path, args: &[&str]) -> Result<()> {
     run_ok_in(dir, args).map(|_| ())
-}
-
-/// Snapshot the working copy of the workspace at `dir` into its @ commit.
-/// jj only snapshots the workspace a command runs in; a cheap read-only
-/// command inside `dir` forces it, so revset-based operations run from other
-/// directories see the workspace's current files.
-pub fn snapshot_workspace(dir: &Path) -> Result<()> {
-    run_quiet_in(dir, &["file", "list", "-r", "@"])
 }
 
 /// Verify we're in a jj repository.
@@ -227,7 +227,7 @@ pub fn primary_workspace_root() -> Result<PathBuf> {
 
 /// Check if a bookmark exists.
 pub fn bookmark_exists(name: &str) -> Result<bool> {
-    let output = run_ok_ignore_working_copy(&[
+    let output = run_ok(&[
         "bookmark",
         "list",
         "-r",
@@ -238,32 +238,26 @@ pub fn bookmark_exists(name: &str) -> Result<bool> {
     Ok(!output.trim().is_empty())
 }
 
-/// Create a bookmark at a revision.
+/// Create a bookmark at an already resolved revision.
 pub fn bookmark_create(name: &str, rev: &str) -> Result<()> {
     run_quiet(&["bookmark", "create", "-r", rev, name])
 }
 
-/// Create an internal bookmark at an already resolved target without taking
-/// another snapshot of the user's working copy.
-pub fn bookmark_create_internal(name: &str, rev: &str) -> Result<()> {
-    run_quiet_ignore_working_copy(&["bookmark", "create", "-r", rev, name])
-}
-
 /// Delete an internal bookmark. Its target is irrelevant to the mutation.
 pub fn bookmark_delete(name: &str) -> Result<()> {
-    run_quiet_ignore_working_copy(&["bookmark", "delete", name])
+    run_quiet(&["bookmark", "delete", name])
 }
 
 /// Rename an internal bookmark without changing its target.
 pub fn bookmark_rename(old: &str, new: &str) -> Result<()> {
-    run_quiet_ignore_working_copy(&["bookmark", "rename", old, new])
+    run_quiet(&["bookmark", "rename", old, new])
 }
 
 /// Check if the jj binary supports --allow-protected on bookmark move.
 fn supports_allow_protected() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
-        let Ok(output) = run_ignore_working_copy(&["bookmark", "move", "-h"]) else {
+        let Ok(output) = run(&["bookmark", "move", "-h"]) else {
             return false;
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -293,7 +287,7 @@ pub fn bookmark_move(name: &str, from: &str, to: &str) -> Result<()> {
         args.push("--allow-protected");
     }
     args.extend_from_slice(&["--from", from, "--to", to, name]);
-    let output = run_ignore_working_copy(&args)?;
+    let output = run(&args)?;
     if !output.status.success() {
         bail!(
             "jj {} failed: {}",
@@ -305,7 +299,7 @@ pub fn bookmark_move(name: &str, from: &str, to: &str) -> Result<()> {
     if stderr.contains("Moved") {
         return Ok(());
     }
-    let current = run_ok_ignore_working_copy(&[
+    let current = run_ok(&[
         "log",
         "-r",
         &format!("bookmarks(exact:\"{}\")", name),
@@ -326,7 +320,7 @@ pub fn bookmark_move(name: &str, from: &str, to: &str) -> Result<()> {
 
 /// List bookmarks matching a glob pattern.
 pub fn bookmark_list_glob(pattern: &str) -> Result<Vec<String>> {
-    let output = run_ok_ignore_working_copy(&[
+    let output = run_ok(&[
         "bookmark",
         "list",
         "-r",
@@ -343,7 +337,7 @@ pub fn bookmark_list_glob(pattern: &str) -> Result<Vec<String>> {
 
 /// List all local bookmark names.
 pub fn list_bookmarks() -> Result<Vec<String>> {
-    let output = run_ok_ignore_working_copy(&["bookmark", "list", "-T", "name ++ \"\\n\""])?;
+    let output = run_ok(&["bookmark", "list", "-T", "name ++ \"\\n\""])?;
     Ok(output
         .lines()
         .filter(|s| !s.is_empty())
@@ -351,14 +345,21 @@ pub fn list_bookmarks() -> Result<Vec<String>> {
         .collect())
 }
 
-/// Resolve a revset to a single change ID.
+/// Resolve a pinned revset (an internal bookmark or commit ID) to a single
+/// change ID.
 pub fn resolve_revset(revset: &str) -> Result<String> {
-    let (change_id, _) = require_single_revset(revset, resolve_revset_state(revset, false)?)?;
+    let (change_id, _) = require_single_revset(revset, resolve_revset_state(revset, true)?)?;
     Ok(change_id)
 }
 
-/// Resolve a revset to both change ID and commit ID.
+/// Resolve a pinned revset to both change ID and commit ID.
 pub fn resolve_revset_full(revset: &str) -> Result<(String, String)> {
+    require_single_revset(revset, resolve_revset_state(revset, true)?)
+}
+
+/// Resolve a user-supplied revset, which may name the invoking working copy
+/// (`@`), to change ID and commit ID after snapshotting that working copy.
+pub fn resolve_revset_full_wc(revset: &str) -> Result<(String, String)> {
     require_single_revset(revset, resolve_revset_state(revset, false)?)
 }
 
@@ -391,9 +392,9 @@ fn resolve_revset_state(revset: &str, pinned: bool) -> Result<RevsetResolution> 
         "change_id.short() ++ \" \" ++ commit_id ++ \"\\n\"",
     ];
     let output = if pinned {
-        run_ignore_working_copy(&args)?
-    } else {
         run(&args)?
+    } else {
+        run_wc(&args)?
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -482,7 +483,7 @@ pub fn trees_match(from: &str, to: &str) -> Result<bool> {
 /// Move the invoking workspace's working copy to a new empty commit on top
 /// of the current working-copy commit (plain `jj new`).
 pub fn new_working_copy() -> Result<()> {
-    run_quiet(&["new"])
+    run_quiet_wc(&["new"])
 }
 
 /// Names of workspaces whose working-copy commit is in `revset`.
@@ -576,22 +577,25 @@ pub fn edit(dir: &Path, rev: &str) -> Result<()> {
 
 /// Rebase a revision and its ancestors (up to destination) onto the destination.
 /// Uses `jj rebase -b` which rebases the "branch" — all revisions in the
-/// range (destination..source) plus their descendants.
+/// range (destination..source) plus their descendants. Working-copy-aware
+/// on purpose: when the invoking workspace's @ descends from `source` (the
+/// usual shape after `jjq push @`), jj rebases it too and this keeps that
+/// working copy checked out on the rewrite instead of leaving it stale.
 pub fn rebase_branch_onto(source: &str, destination: &str) -> Result<()> {
-    run_quiet(&["rebase", "-b", source, "-d", destination])
+    run_quiet_wc(&["rebase", "-b", source, "-d", destination])
 }
 
 /// Show file contents from an exact, already-pinned commit without snapshotting
 /// the caller's working copy.
 pub fn file_show_pinned(path: &str, commit_id: &str) -> Result<String> {
-    run_ok_ignore_working_copy(&["file", "show", path, "-r", commit_id])
+    run_ok(&["file", "show", path, "-r", commit_id])
 }
 
 /// Whether any file exists under `path` in the pinned commit. `jj file list`
 /// exits successfully with empty output for an absent path, so existence
 /// needs no parsing of jj stderr wording.
 pub fn file_exists_pinned(path: &str, commit_id: &str) -> Result<bool> {
-    let output = run_ok_ignore_working_copy(&["file", "list", "-r", commit_id, path])?;
+    let output = run_ok(&["file", "list", "-r", commit_id, path])?;
     Ok(!output.trim().is_empty())
 }
 
@@ -614,7 +618,7 @@ pub fn file_show_many_pinned(fileset: &str, commit_id: &str) -> Result<Vec<(Stri
         FILE_SHOW_TEMPLATE,
         fileset,
     ];
-    let output = run_ignore_working_copy(&args)?;
+    let output = run(&args)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("jj {} failed: {}", args.join(" "), stderr.trim());
@@ -662,8 +666,12 @@ fn parse_file_show_many(output: &str) -> Result<Vec<(String, String)>> {
     Ok(files)
 }
 
-/// Create a workspace.
-pub fn workspace_add(path: &str, name: &str, parents: &[&str]) -> Result<()> {
+/// Create a workspace. jj refuses `workspace add` without a writable working
+/// copy, so it always snapshots the workspace the command runs in: the
+/// invoker's when `from` is None (`jjq check` wants that, its default revset
+/// is `@`), otherwise the workspace at `from` (the queue runner passes jjq's
+/// own metadata workspace so the invoker is left alone).
+pub fn workspace_add(from: Option<&Path>, path: &str, name: &str, parents: &[&str]) -> Result<()> {
     let mut args = vec!["workspace", "add"];
     for p in parents {
         args.push("-r");
@@ -672,7 +680,10 @@ pub fn workspace_add(path: &str, name: &str, parents: &[&str]) -> Result<()> {
     args.push("--name");
     args.push(name);
     args.push(path);
-    run_quiet(&args)
+    match from {
+        Some(dir) => run_quiet_in(dir, &args),
+        None => run_quiet_wc(&args),
+    }
 }
 
 /// Create and edit a fresh working-copy commit with its description already
@@ -698,29 +709,15 @@ pub fn workspace_exists(name: &str) -> Result<bool> {
     }))
 }
 
-/// Refresh workspace records whose operation is older than the repository's
-/// current operation.
-pub fn workspace_update_stale() -> Result<()> {
-    run_quiet(&["workspace", "update-stale"])
-}
-
-/// Forget a workspace, updating stale state first if needed.
+/// Forget a workspace. Pinned: forgetting a registration never needs the
+/// invoking working copy, so a stale invoker cannot make it fail.
 pub fn workspace_forget(name: &str) -> Result<()> {
-    let output = run(&["workspace", "forget", name])?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("stale") {
-        let _ = run(&["workspace", "update-stale"]);
-        return run_quiet(&["workspace", "forget", name]);
-    }
-    bail!("jj workspace forget {} failed: {}", name, stderr.trim())
+    run_quiet(&["workspace", "forget", name])
 }
 
 /// List all workspaces (raw output from jj workspace list).
 pub fn workspace_list() -> Result<String> {
-    run_ok_ignore_working_copy(&["workspace", "list"])
+    run_ok(&["workspace", "list"])
 }
 
 #[cfg(test)]
