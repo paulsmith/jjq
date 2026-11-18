@@ -269,9 +269,6 @@ cmd_run() {
             jj squash >/dev/null 2>&1
             popd >/dev/null
 
-            echo "  Re-pushing fixed revision..."
-            "$JJQ_BIN" push "jjq-fix-$$@"
-
             jj workspace forget "jjq-fix-$$" >/dev/null 2>&1
             rm -rf "$fix_dir"
             trap - EXIT

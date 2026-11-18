@@ -2,7 +2,7 @@ ci:
 	cargo check
 	cargo clippy
 	cargo test
-	./jjq-test
+	PATH="$(CURDIR)/target/debug:$$PATH" ./jjq-test
 
 release:
 	nix build .#tarball
